@@ -1,0 +1,3 @@
+type_body_length:
+  warning: 700
+  error: 1000

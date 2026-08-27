@@ -1,0 +1,61 @@
+# Xcode
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+*.xcworkspace/*
+!*.xcworkspace/contents.xcworkspacedata
+!*.xcworkspace/xcshareddata/
+xcuserdata/
+*.xccheckout
+*.moved-aside
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+build/
+
+# Rust / Cargo (shadowsocks-crypto submodule)
+target/
+**/target/
+Cargo.lock
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+
+# IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Secrets
+.env
+*.pem
+*.p12
+*.mobileprovision
+
+# Personal local utilities
+/info.js
+
+# Claude Code
+.claude/
+
+# Binaries
+*.o
+*.dylib
+*.so
+*.exe
+MagentX/App

@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MagentX Prototype</title>
+  <link rel="stylesheet" href="./prototype-assets/design-system.css">
+  <link rel="stylesheet" href="./prototype-assets/app.css">
+</head>
+<body>
+  <div class="app-window" id="app">
+    <main class="shell">
+      <aside class="sidebar">
+        <div class="sidebar-chrome">
+          <div class="traffic-lights" aria-hidden="true">
+            <span class="close"></span>
+            <span class="minimize"></span>
+            <span class="maximize"></span>
+          </div>
+        </div>
+
+        <div class="brand">
+          <div class="brand-mark">M</div>
+          <div>
+            <div class="brand-title">MagentX</div>
+            <div class="brand-subtitle">Native proxy console</div>
+          </div>
+        </div>
+
+        <nav class="nav" aria-label="主导航">
+          <button class="active" data-panel="dashboard">
+            <span class="nav-symbol">O</span>
+            <span>概览</span>
+            <span class="nav-count">2</span>
+          </button>
+          <button data-panel="nodes">
+            <span class="nav-symbol">N</span>
+            <span>节点</span>
+            <span class="nav-count">4</span>
+          </button>
+          <button data-panel="policy">
+            <span class="nav-symbol">P</span>
+            <span>策略</span>
+            <span class="nav-count">6</span>
+          </button>
+          <button data-panel="activity">
+            <span class="nav-symbol">A</span>
+            <span>活动</span>
+            <span class="nav-count">18</span>
+          </button>
+          <button data-panel="settings">
+            <span class="nav-symbol">S</span>
+            <span>设置</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-bottom">
+          <div class="health-card mx-glass">
+            <div class="health-line"><span><span class="mx-dot live" id="sidebarDot"></span> 服务</span><strong id="sidebarStatus">运行中</strong></div>
+            <div class="health-line"><span>节点</span><strong id="sidebarNode">Hong Kong 01</strong></div>
+            <div class="health-line"><span>模式</span><strong id="sidebarMode">Rule</strong></div>
+          </div>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <div class="page-header">
+          <div>
+            <div class="eyebrow" id="pageEyebrow">概览</div>
+            <h1 class="page-title" id="pageTitle">代理链路总览</h1>
+            <p class="page-copy" id="pageCopy">把连接状态、当前节点、本地端口和规则命中放在一个屏幕内，打开后 3 秒内判断代理是否可用。</p>
+          </div>
+          <div class="page-actions" id="pageActions">
+            <div class="mx-segment" aria-label="代理模式">
+              <button class="active" data-mode="Rule">Rule</button>
+              <button data-mode="Global">Global</button>
+              <button data-mode="Direct">Direct</button>
+            </div>
+            <button class="mx-button success" data-action="toggle-connect">断开连接</button>
+          </div>
+          <div class="finder-tools">
+            <input class="mx-input global-search" id="globalSearch" type="search" placeholder="搜索节点、规则、日志">
+            <button class="mx-button mx-icon-button" data-action="sync" title="同步订阅">R</button>
+            <button class="mx-button mx-icon-button" data-action="copy-endpoint" title="复制本地端点">C</button>
+            <button class="mx-button danger" data-action="stop-all">停止全部</button>
+          </div>
+        </div>
+
+        <div class="page-scroll">
+          <section class="panel active" id="dashboard">
+            <div class="dashboard-grid">
+              <div class="stack">
+                <article class="status-hero mx-card mx-glass" id="statusHero">
+                  <div class="status-top">
+                    <div class="status-lockup">
+                      <div class="signal" aria-hidden="true"></div>
+                      <div>
+                        <div class="status-title" id="statusTitle">代理已连接</div>
+                        <div class="status-meta" id="statusMeta">Rule 模式 · Hong Kong 01 · 34ms</div>
+                      </div>
+                    </div>
+                    <span class="mx-pill green" id="statusPill"><span class="mx-dot live"></span> Protected</span>
+                  </div>
+
+                  <div class="metric-strip">
+                    <div class="metric"><div class="metric-label">SOCKS5</div><div class="metric-value mx-mono">127.0.0.1:1080</div></div>
+                    <div class="metric"><div class="metric-label">HTTP</div><div class="metric-value mx-mono">127.0.0.1:7890</div></div>
+                    <div class="metric"><div class="metric-label">下载</div><div class="metric-value" id="downloadRate">12.8 MB/s</div></div>
+                    <div class="metric"><div class="metric-label">上传</div><div class="metric-value" id="uploadRate">2.1 MB/s</div></div>
+                  </div>
+
+                  <div class="route-rail">
+                    <div class="route-map">
+                      <div class="route-step"><strong>Local Apps</strong><span>Safari, Terminal, Chrome</span></div>
+                      <div class="route-arrow">></div>
+                      <div class="route-step"><strong>MagentX</strong><span>Rule engine + local proxy</span></div>
+                      <div class="route-arrow">></div>
+                      <div class="route-step"><strong id="routeNode">Hong Kong 01</strong><span>Shadowsocks AEAD</span></div>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="mx-card mx-glass">
+                  <div class="section-head">
+                    <div>
+                      <div class="section-title">最近分流</div>
+                      <div class="section-subtitle">展示用户最关心的“这个请求走哪儿了”</div>
+                    </div>
+                    <button class="mx-button" data-action="open-policy">管理规则</button>
+                  </div>
+                  <div class="flow-list">
+                    <div class="flow-row">
+                      <div class="app-symbol">S</div>
+                      <div class="row-main">
+                        <div class="row-title">Safari · developer.apple.com</div>
+                        <div class="row-subtitle">Apple Services · Domain Keyword</div>
+                      </div>
+                      <span class="mx-pill blue">DIRECT</span>
+                    </div>
+                    <div class="flow-row">
+                      <div class="app-symbol">T</div>
+                      <div class="row-main">
+                        <div class="row-title">Terminal · github.com</div>
+                        <div class="row-subtitle">Developer Tools · Domain Suffix</div>
+                      </div>
+                      <span class="mx-pill green">HK 01</span>
+                    </div>
+                    <div class="flow-row">
+                      <div class="app-symbol">C</div>
+                      <div class="row-main">
+                        <div class="row-title">Chrome · openai.com</div>
+                        <div class="row-subtitle">Final Rule</div>
+                      </div>
+                      <span class="mx-pill violet">PROXY</span>
+                    </div>
+                  </div>
+                </article>
+              </div>
+
+              <div class="stack">
+                <article class="mx-card mx-glass">
+                  <div class="section-head">
+                    <div>
+                      <div class="section-title">本地服务</div>
+                      <div class="section-subtitle">启动服务时使用当前节点</div>
+                    </div>
+                    <span class="mx-pill green" id="serviceSummary">2/2 运行</span>
+                  </div>
+                  <div class="service-list">
+                    <div class="service-row">
+                      <div class="row-main"><div class="row-title">SOCKS5 代理</div><div class="row-subtitle mx-mono">127.0.0.1:1080</div></div>
+                      <button class="mx-switch on" data-service="socks" aria-label="SOCKS5 开关"><span></span></button>
+                    </div>
+                    <div class="service-row">
+                      <div class="row-main"><div class="row-title">HTTP 代理</div><div class="row-subtitle mx-mono">127.0.0.1:7890</div></div>
+                      <button class="mx-switch on" data-service="http" aria-label="HTTP 开关"><span></span></button>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="mx-card mx-glass">
+                  <div class="section-head">
+                    <div>
+                      <div class="section-title">节点选择</div>
+                      <div class="section-subtitle">点击即可切换代理出口</div>
+                    </div>
+                    <button class="mx-button mx-icon-button" data-action="test-current" title="测速当前节点">T</button>
+                  </div>
+                  <div class="node-list">
+                    <div class="node-card selected" data-node="Hong Kong 01" data-latency="34ms">
+                      <div><div class="node-name"><span class="mx-dot live"></span>Hong Kong 01</div><div class="node-meta">hk1.magent.example:443 · chacha20-poly1305</div></div>
+                      <span class="mx-pill green latency">34ms</span>
+                    </div>
+                    <div class="node-card" data-node="Tokyo Edge" data-latency="61ms">
+                      <div><div class="node-name"><span class="mx-dot"></span>Tokyo Edge</div><div class="node-meta">tyo-edge.example:8443 · aes-256-gcm</div></div>
+                      <span class="mx-pill blue latency">61ms</span>
+                    </div>
+                    <div class="node-card" data-node="Singapore Relay" data-latency="94ms">
+                      <div><div class="node-name"><span class="mx-dot"></span>Singapore Relay</div><div class="node-meta">sg-relay.example:443 · chacha20-poly1305</div></div>
+                      <span class="mx-pill amber latency">94ms</span>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="mx-card mx-glass">
+                  <div class="section-head">
+                    <div>
+                      <div class="section-title">订阅</div>
+                      <div class="section-subtitle">4 个节点 · 6 条规则</div>
+                    </div>
+                    <span class="mx-pill">12:41</span>
+                  </div>
+                  <div class="info-row">
+                    <div class="row-main"><div class="row-title">Magent Lab Subscription</div><div class="row-subtitle">下次自动同步：明天 09:00</div></div>
+                    <button class="mx-button" data-action="sync">同步</button>
+                  </div>
+                </article>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel" id="nodes">
+            <div class="two-column">
+              <article class="mx-card mx-glass">
+                <div class="section-head">
+                  <div>
+                    <div class="section-title">节点列表</div>
+                    <div class="section-subtitle">当前节点会同步到 Dashboard 和策略测试</div>
+                  </div>
+                  <div class="page-actions">
+                    <button class="mx-button" data-action="test-all">全部测速</button>
+                    <button class="mx-button primary" data-action="new-node">新增节点</button>
+                  </div>
+                </div>
+                <div class="mx-table-wrap">
+                  <table class="mx-table">
+                    <thead>
+                      <tr><th>节点</th><th>服务器</th><th>加密</th><th>延迟</th><th>状态</th><th>操作</th></tr>
+                    </thead>
+                    <tbody id="nodesTable">
+                      <tr data-node-row="Hong Kong 01"><td><span class="mx-dot live"></span> Hong Kong 01</td><td class="mx-mono truncate">hk1.magent.example:443</td><td>chacha20-poly1305</td><td><span class="mx-pill green latency">34ms</span></td><td><span class="mx-pill blue">当前</span></td><td><button class="mx-button mx-icon-button" data-action="edit-node" title="编辑">E</button></td></tr>
+                      <tr data-node-row="Tokyo Edge"><td><span class="mx-dot"></span> Tokyo Edge</td><td class="mx-mono truncate">tyo-edge.example:8443</td><td>aes-256-gcm</td><td><span class="mx-pill blue latency">61ms</span></td><td><span class="mx-pill">可用</span></td><td><button class="mx-button mx-icon-button" data-action="edit-node" title="编辑">E</button></td></tr>
+                      <tr data-node-row="Singapore Relay"><td><span class="mx-dot"></span> Singapore Relay</td><td class="mx-mono truncate">sg-relay.example:443</td><td>chacha20-poly1305</td><td><span class="mx-pill amber latency">94ms</span></td><td><span class="mx-pill">可用</span></td><td><button class="mx-button mx-icon-button" data-action="edit-node" title="编辑">E</button></td></tr>
+                      <tr data-node-row="Los Angeles Lab"><td><span class="mx-dot warn"></span> Los Angeles Lab</td><td class="mx-mono truncate">lax-lab.example:10086</td><td>xchacha20-poly1305</td><td><span class="mx-pill">未测速</span></td><td><span class="mx-pill amber">需检查</span></td><td><button class="mx-button mx-icon-button" data-action="edit-node" title="编辑">E</button></td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article class="mx-card mx-glass">
+                <div class="section-head">
+                  <div><div class="section-title">节点详情</div><div class="section-subtitle">保存后立即进入可用闭环</div></div>
+                </div>
+                <div class="sheet-body">
+                  <div class="form-grid">
+                    <div class="metric"><div class="metric-label">当前选择</div><div class="metric-value" id="detailNode">Hong Kong 01</div></div>
+                    <div class="metric"><div class="metric-label">最近延迟</div><div class="metric-value" id="detailLatency">34ms</div></div>
+                  </div>
+                  <div class="mx-field"><label>服务器地址</label><input class="mx-input" type="text" value="hk1.magent.example"></div>
+                  <div class="form-grid">
+                    <div class="mx-field"><label>端口</label><input class="mx-input" type="number" value="443"></div>
+                    <div class="mx-field"><label>加密方式</label><select class="mx-select"><option>chacha20-poly1305</option><option>aes-256-gcm</option><option>xchacha20-poly1305</option></select></div>
+                  </div>
+                  <div class="mx-field"><label>密码</label><input class="mx-input" type="text" value="••••••••••••"></div>
+                  <button class="mx-button primary" data-action="save-node">保存节点配置</button>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="panel" id="policy">
+            <div class="stack">
+              <article class="mx-card mx-glass">
+                <div class="section-head">
+                  <div>
+                    <div class="section-title">转发规则</div>
+                    <div class="section-subtitle">自上而下匹配，最后一条规则兜底</div>
+                  </div>
+                  <button class="mx-button primary" data-action="new-rule">新增规则</button>
+                </div>
+                <div class="mx-table-wrap">
+                  <table class="mx-table" id="policyTable">
+                    <thead>
+                      <tr><th>顺序</th><th>名称</th><th>匹配类型</th><th>匹配内容</th><th>动作</th><th>操作</th></tr>
+                    </thead>
+                    <tbody>
+                      <tr><td>01</td><td>LAN Bypass</td><td>IP-CIDR</td><td class="mx-mono truncate">192.168.0.0/16</td><td><span class="mx-pill blue">DIRECT</span></td><td><button class="mx-button mx-icon-button" data-action="delete-rule" title="删除">D</button></td></tr>
+                      <tr><td>02</td><td>Apple Services</td><td>Domain Keyword</td><td class="mx-mono truncate">apple</td><td><span class="mx-pill blue">DIRECT</span></td><td><button class="mx-button mx-icon-button" data-action="delete-rule" title="删除">D</button></td></tr>
+                      <tr><td>03</td><td>Developer Tools</td><td>Domain Suffix</td><td class="mx-mono truncate">github.com</td><td><span class="mx-pill green">Hong Kong 01</span></td><td><button class="mx-button mx-icon-button" data-action="delete-rule" title="删除">D</button></td></tr>
+                      <tr><td>04</td><td>AI Services</td><td>Domain Suffix</td><td class="mx-mono truncate">openai.com</td><td><span class="mx-pill violet">PROXY</span></td><td><button class="mx-button mx-icon-button" data-action="delete-rule" title="删除">D</button></td></tr>
+                      <tr><td>05</td><td>Final Rule</td><td>Match All</td><td class="mx-mono truncate">*</td><td><span class="mx-pill violet">PROXY</span></td><td><button class="mx-button mx-icon-button" data-action="delete-rule" title="删除">D</button></td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article class="mx-card mx-glass">
+                <div class="section-head">
+                  <div><div class="section-title">连通性测试</div><div class="section-subtitle">用当前节点和服务状态发起检查</div></div>
+                  <span class="mx-pill green" id="testResult">204 · 34ms</span>
+                </div>
+                <div class="sheet-body">
+                  <div class="form-grid" style="grid-template-columns: 1fr auto;">
+                    <input class="mx-input" id="testUrl" type="text" value="https://www.gstatic.com/generate_204">
+                    <button class="mx-button primary" data-action="run-test">测试</button>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="panel" id="activity">
+            <article class="mx-card mx-glass">
+              <div class="section-head">
+                <div><div class="section-title">连接活动</div><div class="section-subtitle">请求、命中规则、路由动作与流量摘要</div></div>
+                <div class="mx-segment" aria-label="日志筛选">
+                  <button class="active" data-filter="all">全部</button>
+                  <button data-filter="proxy">代理</button>
+                  <button data-filter="direct">直连</button>
+                </div>
+              </div>
+              <div class="log-list" id="logList">
+                <div class="log-row" data-kind="proxy"><span>12:44:18</span><span>PROXY</span><span>openai.com via Hong Kong 01</span><span>1.2 MB</span></div>
+                <div class="log-row" data-kind="direct"><span>12:44:15</span><span>DIRECT</span><span>developer.apple.com matched Apple Services</span><span>82 KB</span></div>
+                <div class="log-row" data-kind="proxy"><span>12:44:10</span><span>NODE</span><span>github.com via Hong Kong 01</span><span>460 KB</span></div>
+                <div class="log-row" data-kind="proxy"><span>12:43:58</span><span>PROXY</span><span>api.anthropic.com via Final Rule</span><span>774 KB</span></div>
+                <div class="log-row" data-kind="direct"><span>12:43:41</span><span>DIRECT</span><span>192.168.1.12 matched LAN Bypass</span><span>18 KB</span></div>
+                <div class="log-row" data-kind="proxy"><span>12:43:32</span><span>PROXY</span><span>registry.npmjs.org via Tokyo Edge</span><span>2.8 MB</span></div>
+              </div>
+            </article>
+          </section>
+
+          <section class="panel" id="settings">
+            <div class="two-column">
+              <article class="mx-card mx-glass">
+                <div class="section-head"><div><div class="section-title">本地代理</div><div class="section-subtitle">端口冲突时在这里调整</div></div></div>
+                <div class="sheet-body">
+                  <div class="form-grid">
+                    <div class="mx-field"><label>SOCKS5 地址</label><input class="mx-input" type="text" value="127.0.0.1"></div>
+                    <div class="mx-field"><label>SOCKS5 端口</label><input class="mx-input" type="number" value="1080"></div>
+                    <div class="mx-field"><label>HTTP 地址</label><input class="mx-input" type="text" value="127.0.0.1"></div>
+                    <div class="mx-field"><label>HTTP 端口</label><input class="mx-input" type="number" value="7890"></div>
+                  </div>
+                  <button class="mx-button primary" data-action="save-settings">保存设置</button>
+                </div>
+              </article>
+
+              <article class="mx-card mx-glass">
+                <div class="section-head"><div><div class="section-title">常规</div><div class="section-subtitle">低频偏好，不直接启动代理</div></div></div>
+                <div class="service-list">
+                  <div class="service-row"><div class="row-main"><div class="row-title">开机自动启动</div><div class="row-subtitle">登录后保持菜单栏可用</div></div><button class="mx-switch"><span></span></button></div>
+                  <div class="service-row"><div class="row-main"><div class="row-title">静默启动</div><div class="row-subtitle">启动时隐藏主窗口</div></div><button class="mx-switch on"><span></span></button></div>
+                  <div class="service-row"><div class="row-main"><div class="row-title">自动同步订阅</div><div class="row-subtitle">每天 09:00 拉取节点和规则</div></div><button class="mx-switch on"><span></span></button></div>
+                  <div class="info-row"><div class="row-main"><div class="row-title">版本</div><div class="row-subtitle">MagentX v1.0.0 · SwiftUI + SwiftNIO</div></div><span class="mx-pill">Beta</span></div>
+                </div>
+              </article>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <aside class="inspector">
+        <div class="inspector-header">
+          <div class="inspector-title">运行洞察</div>
+          <div class="inspector-copy">右侧 inspector 保持和当前任务相关，减少弹窗和页面跳转。</div>
+        </div>
+        <div class="inspector-body">
+          <article class="mx-card mx-glass">
+            <div class="section-head">
+              <div><div class="section-title">吞吐趋势</div><div class="section-subtitle">最近 60 秒</div></div>
+            </div>
+            <div class="mini-chart" id="miniChart">
+              <span class="mini-bar" style="--height: 28%"></span>
+              <span class="mini-bar" style="--height: 48%"></span>
+              <span class="mini-bar" style="--height: 36%"></span>
+              <span class="mini-bar" style="--height: 66%"></span>
+              <span class="mini-bar" style="--height: 54%"></span>
+              <span class="mini-bar" style="--height: 82%"></span>
+              <span class="mini-bar" style="--height: 62%"></span>
+              <span class="mini-bar" style="--height: 74%"></span>
+              <span class="mini-bar" style="--height: 58%"></span>
+              <span class="mini-bar" style="--height: 88%"></span>
+            </div>
+          </article>
+
+          <article class="mx-card mx-glass">
+            <div class="section-head">
+              <div><div class="section-title">诊断摘要</div><div class="section-subtitle">定位失败路径</div></div>
+            </div>
+            <div class="row-list">
+              <div class="info-row"><div class="row-main"><div class="row-title">本地端口</div><div class="row-subtitle">SOCKS5 与 HTTP 均已监听</div></div><span class="mx-pill green">通过</span></div>
+              <div class="info-row"><div class="row-main"><div class="row-title">节点连通</div><div class="row-subtitle">Hong Kong 01 · 34ms</div></div><span class="mx-pill green">通过</span></div>
+              <div class="info-row"><div class="row-main"><div class="row-title">规则命中</div><div class="row-subtitle">Final Rule 兜底正常</div></div><span class="mx-pill green">通过</span></div>
+              <div class="info-row"><div class="row-main"><div class="row-title">系统代理</div><div class="row-subtitle">未检测自动配置文件</div></div><span class="mx-pill amber">建议</span></div>
+            </div>
+          </article>
+        </div>
+      </aside>
+    </main>
+
+    <div class="sheet" id="nodeSheet" role="dialog" aria-modal="true">
+      <div class="sheet-panel">
+        <div class="section-head">
+          <div><div class="section-title" id="sheetTitle">新增节点</div><div class="section-subtitle">保存后自动设为当前节点</div></div>
+        </div>
+        <div class="sheet-body">
+          <div class="mx-field"><label>节点别名</label><input class="mx-input" id="sheetName" type="text" value="Seoul Transit"></div>
+          <div class="mx-field"><label>服务器地址</label><input class="mx-input" type="text" value="sel-transit.example"></div>
+          <div class="form-grid">
+            <div class="mx-field"><label>端口</label><input class="mx-input" type="number" value="443"></div>
+            <div class="mx-field"><label>加密方式</label><select class="mx-select"><option>chacha20-poly1305</option><option>aes-256-gcm</option><option>xchacha20-poly1305</option></select></div>
+          </div>
+          <div class="mx-field"><label>密码</label><input class="mx-input" type="text" value="magent-secret"></div>
+        </div>
+        <div class="sheet-actions">
+          <button class="mx-button" data-action="close-sheet">取消</button>
+          <button class="mx-button primary" data-action="confirm-sheet">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"><span class="mx-dot live"></span><span id="toastText">已更新</span></div>
+  </div>
+
+  <script src="./prototype-assets/app.js"></script>
+</body>
+</html>
