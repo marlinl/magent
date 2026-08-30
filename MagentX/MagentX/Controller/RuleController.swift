@@ -125,7 +125,7 @@ final class RuleController: ObservableObject {
     /// 创建一条手工访问规则，校验通过后写入 SwiftData。
     @discardableResult
     func addAccessControl(
-        matchType: Magent.MatchType,
+        matchType: MatchType,
         matchValue: String,
         decision: String,
         order: Int = 0,
@@ -169,7 +169,7 @@ final class RuleController: ObservableObject {
     /// 批量创建手工访问规则，所有匹配值共享同一个匹配类型和命中动作。
     @discardableResult
     func addAccessControls(
-        matchType: Magent.MatchType,
+        matchType: MatchType,
         matchValues: [String],
         decision: String,
         order: Int = 0,
@@ -266,7 +266,7 @@ final class RuleController: ObservableObject {
     @discardableResult
     func updateAccessControl(
         _ accessControlRule: AccessControlRule,
-        matchType: Magent.MatchType,
+        matchType: MatchType,
         matchValue: String,
         decision: String,
         order: Int,
@@ -479,7 +479,7 @@ final class RuleController: ObservableObject {
     }
 
     private func existingAccessControlRule(
-        matchType: Magent.MatchType,
+        matchType: MatchType,
         matchValue: String,
         excludingID: UUID? = nil,
         in modelContext: ModelContext
@@ -531,7 +531,7 @@ final class RuleController: ObservableObject {
 
     private func rollback(
         _ accessControlRule: AccessControlRule,
-        matchType: Magent.MatchType,
+        matchType: MatchType,
         matchValue: String,
         decision: String,
         order: Int,

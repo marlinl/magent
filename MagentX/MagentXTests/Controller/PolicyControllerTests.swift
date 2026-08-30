@@ -67,7 +67,7 @@ struct PolicyControllerTests {
         #expect(policies[0].id == policyID)
         #expect(policies[0].name == "Default Proxy")
         #expect(policies[0].suffixDomain == "google.com")
-        #expect(policies[0].magentNode?.id == magentNode.id)
+        #expect(policies[0].magentNodeID == magentNode.id)
         #expect(Set(policyRules.map(\.id)) == [policyID])
         #expect(Set(policyRules.map(\.ruleID)) == Set(rules.map(\.id)))
     }
@@ -93,7 +93,6 @@ struct PolicyControllerTests {
 
         #expect(policies.count == 1)
         #expect(policies[0].magentNodeID == nil)
-        #expect(policies[0].magentNode == nil)
         #expect(policyRules.count == 1)
         #expect(policyRules[0].id == policyID)
     }
@@ -191,36 +190,12 @@ struct PolicyControllerTests {
         #expect(policyRules[0].ruleID == rules[1].id)
     }
 
-    /// 验证删除代理节点时对应策略组和策略规则关联会被清理。
-    @Test func deletingMagentNodeDeletesProxyPoliciesAndPolicyRules() throws {
-        let container = try makeContainer()
-        let context = ModelContext(container)
-        let policyID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
-        let (rules, magentNode) = try makeReferencedModels(in: context)
-
-        #expect(PolicyController().upsertProxyPolicy(
-            id: policyID,
-            name: "Default Proxy",
-            magentNodeID: magentNode.id,
-            ruleIDs: rules.map(\.id),
-            in: context
-        ))
-
-        NodeController().deleteNode(magentNode, from: context)
-
-        let policies = try context.fetch(FetchDescriptor<ProxyPolicy>())
-        let policyRules = try context.fetch(FetchDescriptor<ProxyPolicyRule>())
-
-        #expect(policies.isEmpty)
-        #expect(policyRules.isEmpty)
-    }
-
     private func makeContainer() throws -> ModelContainer {
         try ModelContainer(
             for: ProxyPolicy.self,
             ProxyPolicyRule.self,
             AccessControlRule.self,
-            MagentNode.self,
+            MagentProxyNode.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true)
         )
     }
@@ -230,7 +205,7 @@ struct PolicyControllerTests {
             .appendingPathComponent("PolicyControllerTests-\(UUID().uuidString)", isDirectory: true)
     }
 
-    private func makeReferencedModels(in context: ModelContext) throws -> ([AccessControlRule], MagentNode) {
+    private func makeReferencedModels(in context: ModelContext) throws -> ([AccessControlRule], MagentProxyNode) {
         let firstRule = AccessControlRule(
             matchType: .domainSuffix,
             matchValue: "google.com",
@@ -241,11 +216,12 @@ struct PolicyControllerTests {
             matchValue: "youtube.com",
             decision: "proxy"
         )
-        let magentNode = MagentNode(
+        let magentNode = MagentProxyNode(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000003")!,
             name: "Test Node",
             address: "127.0.0.1",
             port: 8388,
+            cipher: .chacha20IetfPoly1305,
             password: "password"
         )
 

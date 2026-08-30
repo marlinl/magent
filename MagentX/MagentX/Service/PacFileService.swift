@@ -196,7 +196,7 @@ final class PacFileService {
 /// PAC 文件中的轻量规则快照。
 extension PacFileService {
     struct Rule: Equatable, Sendable {
-        let matchType: Magent.MatchType
+        let matchType: MatchType
         let matchValue: String
         let decision: String
         let order: Int
@@ -211,7 +211,7 @@ extension PacFileService {
 
         /// 创建可跨线程传递的 PAC 规则快照。
         init(
-            matchType: Magent.MatchType,
+            matchType: MatchType,
             matchValue: String,
             decision: String,
             order: Int

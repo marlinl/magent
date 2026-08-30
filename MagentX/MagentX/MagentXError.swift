@@ -10,11 +10,14 @@ import Foundation
 
 /// MagentX 应用层统一错误定义，约束 Controller、Service 和 Model 抛出的异常。
 enum MagentXError: LocalizedError, Equatable {
+    case anotherInstanceRunning
+    case singleInstanceLockFailed(String)
     case invalidAclBase64Data
     case invalidAclDecodedText
     case duplicateAccessControlRule
     case missingAccessControlRule(UUID)
-    case missingMagentNode(UUID)
+    case missingMagentProxyNode(UUID)
+    case proxyNodeInUse(UUID)
     case missingGeneralSettings
     case missingRulesURL
     case invalidRulesURL(String)
@@ -35,6 +38,10 @@ enum MagentXError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
+        case .anotherInstanceRunning:
+            return String(localized: "MagentX is already running")
+        case .singleInstanceLockFailed(let reason):
+            return String(localized: "Failed to acquire the single-instance lock: \(reason)")
         case .invalidAclBase64Data:
             return String(localized: "Downloaded rules data is not valid Base64")
         case .invalidAclDecodedText:
@@ -43,8 +50,10 @@ enum MagentXError: LocalizedError, Equatable {
             return String(localized: "Access control rule already exists")
         case .missingAccessControlRule(let id):
             return String(format: String(localized: "Access control rule does not exist: %@"), id.uuidString)
-        case .missingMagentNode(let id):
-            return String(format: String(localized: "Magent node does not exist: %@"), id.uuidString)
+        case .missingMagentProxyNode(let id):
+            return String(format: String(localized: "Proxy node does not exist: %@"), id.uuidString)
+        case .proxyNodeInUse(let id):
+            return String(format: String(localized: "Proxy node is referenced by a policy: %@"), id.uuidString)
         case .missingGeneralSettings:
             return String(localized: "GeneralSettings is required before refreshing rules")
         case .missingRulesURL:

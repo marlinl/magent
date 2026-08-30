@@ -55,15 +55,10 @@ final class PolicyController: ObservableObject {
         }
 
         do {
-            let magentNode: MagentNode?
-            if let magentNodeID {
-                guard let fetchedMagentNode = try self.magentNode(id: magentNodeID, in: modelContext) else {
-                    loadError = MagentXError.missingMagentNode(magentNodeID).localizedDescription
-                    return false
-                }
-                magentNode = fetchedMagentNode
-            } else {
-                magentNode = nil
+            if let magentNodeID,
+               try magentProxyNode(id: magentNodeID, in: modelContext) == nil {
+                loadError = MagentXError.missingMagentProxyNode(magentNodeID).localizedDescription
+                return false
             }
 
             let accessControlRules = try loadAccessControlRules(ids: Self.uniqueIDs(ruleIDs), in: modelContext)
@@ -72,15 +67,13 @@ final class PolicyController: ObservableObject {
                 existingPolicy.name = normalizedName
                 existingPolicy.suffixDomain = suffixDomain.trimmingCharacters(in: .whitespacesAndNewlines)
                 existingPolicy.magentNodeID = magentNodeID
-                existingPolicy.magentNode = magentNode
                 proxyPolicy = existingPolicy
             } else {
                 let newPolicy = ProxyPolicy(
                     id: id,
                     name: normalizedName,
                     suffixDomain: suffixDomain,
-                    magentNodeID: magentNodeID,
-                    magentNode: magentNode
+                    magentNodeID: magentNodeID
                 )
                 modelContext.insert(newPolicy)
                 proxyPolicy = newPolicy
@@ -127,10 +120,10 @@ final class PolicyController: ObservableObject {
         return try modelContext.fetch(descriptor).first
     }
 
-    private func magentNode(id: UUID, in modelContext: ModelContext) throws -> MagentNode? {
-        let descriptor = FetchDescriptor<MagentNode>(
-            predicate: #Predicate<MagentNode> { magentNode in
-                magentNode.id == id
+    private func magentProxyNode(id: UUID, in modelContext: ModelContext) throws -> MagentProxyNode? {
+        let descriptor = FetchDescriptor<MagentProxyNode>(
+            predicate: #Predicate<MagentProxyNode> { magentProxyNode in
+                magentProxyNode.id == id
             }
         )
         return try modelContext.fetch(descriptor).first

@@ -16,7 +16,6 @@ import Foundation
 actor MagentProxyService {
     private var configuration: Configuration
     private var eventLoopGroup: MultiThreadedEventLoopGroup
-    private var magentClient: MagentClient
     private var proxyService: ProxyService
     private var pacService: PacService
     private var isProxyServerRunning = false
@@ -31,15 +30,13 @@ actor MagentProxyService {
 
     private init(configuration: Configuration) throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: configuration.proxyThreadNumber)
-        let magentClient = MagentClient(eventLoopGroup: eventLoopGroup)
 
         self.configuration = configuration
         self.eventLoopGroup = eventLoopGroup
-        self.magentClient = magentClient
         self.proxyService = ProxyService(
             endpoint: configuration.proxyEndpoint,
             eventLoopGroup: eventLoopGroup,
-            magentClient: magentClient
+            threadNumber: configuration.proxyThreadNumber
         )
         self.pacService = PacService(
             endpoint: configuration.pacEndpoint,
@@ -148,15 +145,13 @@ actor MagentProxyService {
         try eventLoopGroup.syncShutdownGracefully()
 
         let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: configuration.proxyThreadNumber)
-        let magentClient = MagentClient(eventLoopGroup: eventLoopGroup)
 
         self.configuration = configuration
         self.eventLoopGroup = eventLoopGroup
-        self.magentClient = magentClient
         proxyService = ProxyService(
             endpoint: configuration.proxyEndpoint,
             eventLoopGroup: eventLoopGroup,
-            magentClient: magentClient
+            threadNumber: configuration.proxyThreadNumber
         )
         pacService = PacService(
             endpoint: configuration.pacEndpoint,
@@ -206,169 +201,45 @@ actor MagentProxyService {
     }
 }
 
-/// 本地代理监听服务，只负责打开和关闭 TCP proxy 端口。
+/// 本地代理监听服务，负责准备启动配置并委托 `MagentService` 管理核心生命周期。
 private final class ProxyService {
     private let endpoint: MagentProxyService.ListenEndpoint
     private let eventLoopGroup: EventLoopGroup
-    private let magentClient: MagentClient
-    private var channel: Channel?
+    private let magentService: MagentService
 
     init(
         endpoint: MagentProxyService.ListenEndpoint,
         eventLoopGroup: EventLoopGroup,
-        magentClient: MagentClient
+        threadNumber: Int
     ) {
         self.endpoint = endpoint
         self.eventLoopGroup = eventLoopGroup
-        self.magentClient = magentClient
+        self.magentService = MagentService(threadNumber: threadNumber)
     }
 
     /// 打开本地 HTTP/SOCKS 代理监听端口；重复调用保持幂等。
     func start() async throws {
-        guard channel == nil else { return }
-        let endpoint = endpoint
-
         try await ListenPortAvailabilityProbe(endpoint: endpoint, eventLoopGroup: eventLoopGroup).validate()
 
-        let magentClient = magentClient
+        let placeholderNode = try ProxyNode(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000000")!,
+            address: SocketAddress(ipAddress: "127.0.0.1", port: 9),
+            cipher: .chacha20IetfPoly1305,
+            password: "unused-direct-route"
+        )
+        let config = MagentConfig(
+            address: .domain(endpoint.address, port: endpoint.port),
+            defaultDecision: .direct,
+            defaultProxyNode: placeholderNode,
+            enableMatchTable: false
+        )
 
-        do {
-            channel = try await ServerBootstrap(group: eventLoopGroup)
-                .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-                .childChannelInitializer { channel in
-                    channel.pipeline.addHandler(ChannelHandler(magentClient: magentClient))
-                }
-                .bind(host: endpoint.address, port: endpoint.port)
-                .get()
-        } catch {
-            throw ListenPortAvailabilityProbe.normalizedBindError(error, endpoint: endpoint)
-        }
+        try await magentService.start(config)
     }
 
     /// 关闭本地代理监听端口；未启动时保持幂等。
     func stop() async throws {
-        guard let channel else { return }
-        self.channel = nil
-        try await channel.close().get()
-    }
-
-    /// 本地代理 TCP 连接的 NIO 入站处理器。
-    private final class ChannelHandler: ChannelInboundHandler {
-        typealias InboundIn = ByteBuffer
-        typealias OutboundOut = ByteBuffer
-
-        private let session: ConnectionSession
-
-        init(magentClient: MagentClient) {
-            self.session = ConnectionSession(magentClient: magentClient)
-        }
-
-        /// 将本地入站字节转交给 Magent 核心连接会话。
-        func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-            var buffer = unwrapInboundIn(data)
-            guard let bytes = buffer.readBytes(length: buffer.readableBytes), bytes.isEmpty == false else {
-                return
-            }
-
-            let payload = Data(bytes)
-            Task {
-                await session.receiveLocalData(payload, context: context)
-            }
-        }
-
-        /// 本地连接断开时释放对应的 Magent 核心连接。
-        func channelInactive(context: ChannelHandlerContext) {
-            Task {
-                await session.close()
-            }
-        }
-
-        /// NIO 报错时关闭本地连接并释放核心连接。
-        func errorCaught(context: ChannelHandlerContext, error: Error) {
-            MagentXLogger.error(
-                error,
-                category: .network,
-                message: "Local proxy channel failed"
-            )
-            Task {
-                await session.close()
-            }
-            context.close(promise: nil)
-        }
-    }
-
-    /// 单条本地代理连接到 Magent 核心连接的会话桥。
-    private actor ConnectionSession {
-        private let magentClient: MagentClient
-        private var connection: MagentConnection?
-        private var receiveTask: Task<Void, Never>?
-
-        init(magentClient: MagentClient) {
-            self.magentClient = magentClient
-        }
-
-        /// 接收本地代理字节；首包建立 Magent 连接，后续包直接转发。
-        func receiveLocalData(_ data: Data, context: ChannelHandlerContext) async {
-            do {
-                if let connection {
-                    try await connection.send(data)
-                    return
-                }
-
-                let (connection, response) = try await magentClient.getConnection(data)
-                self.connection = connection
-                if response.isEmpty == false {
-                    write(response, to: context)
-                }
-                startRemoteReceiveLoop(connection, context: context)
-            } catch {
-                MagentXLogger.error(
-                    error,
-                    category: .network,
-                    message: "Failed to bridge local proxy payload"
-                )
-                context.close(promise: nil)
-            }
-        }
-
-        /// 关闭核心连接并停止远端读取循环。
-        func close() async {
-            receiveTask?.cancel()
-            receiveTask = nil
-            await connection?.close()
-            connection = nil
-        }
-
-        private func startRemoteReceiveLoop(_ connection: MagentConnection, context: ChannelHandlerContext) {
-            guard receiveTask == nil else { return }
-
-            receiveTask = Task {
-                while Task.isCancelled == false {
-                    do {
-                        let data = try await connection.receive()
-                        if data.isEmpty == false {
-                            write(data, to: context)
-                        }
-                    } catch {
-                        MagentXLogger.error(
-                            error,
-                            category: .network,
-                            message: "Failed to receive remote proxy data"
-                        )
-                        context.close(promise: nil)
-                        break
-                    }
-                }
-            }
-        }
-
-        private func write(_ data: Data, to context: ChannelHandlerContext) {
-            context.eventLoop.execute {
-                var buffer = context.channel.allocator.buffer(capacity: data.count)
-                buffer.writeBytes(data)
-                context.writeAndFlush(NIOAny(buffer), promise: nil)
-            }
-        }
+        try await magentService.stop()
     }
 }
 

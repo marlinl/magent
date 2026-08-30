@@ -18,7 +18,7 @@
 "添加代理节点" = "Add Proxy Node";
 "节点读取失败" = "Failed to Load Nodes";
 "暂无代理节点" = "No Proxy Nodes";
-"添加 MagentNode 后会显示在这里" = "MagentNode entries will appear here after you add them.";
+"添加代理节点后会显示在这里" = "Proxy nodes will appear here after you add them.";
 "节点详情" = "Node Details";
 "选择节点后可在这里展示连通性、延迟和出口信息。" = "Select a node to show connectivity, latency, and exit information here.";
 "添加节点" = "Add Node";

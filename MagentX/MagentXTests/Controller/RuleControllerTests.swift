@@ -18,7 +18,7 @@ struct RuleControllerTests {
     /// 验证解析后的访问控制规则会被导入到 SwiftData。
     @Test func importRuleListInsertsAccessControlRules() throws {
         let container = try ModelContainer(
-            for: MagentNode.self,
+            for: MagentProxyNode.self,
             AccessControlRule.self,
             ProxyPolicy.self,
             ProxyPolicyRule.self,
@@ -63,7 +63,7 @@ struct RuleControllerTests {
     /// 验证 GFWList 规则会刷新，手工规则冲突会被跳过。
     @Test func importRuleListRefreshesGfwlistRulesAndSkipsManualConflicts() throws {
         let container = try ModelContainer(
-            for: MagentNode.self,
+            for: MagentProxyNode.self,
             AccessControlRule.self,
             ProxyPolicy.self,
             ProxyPolicyRule.self,
@@ -117,7 +117,7 @@ struct RuleControllerTests {
     /// 验证修改访问规则后会重写 proxy host PAC 文件。
     @Test func updateDecisionRewritesProxyHostPACFile() throws {
         let container = try ModelContainer(
-            for: MagentNode.self,
+            for: MagentProxyNode.self,
             AccessControlRule.self,
             ProxyPolicy.self,
             ProxyPolicyRule.self,

@@ -146,7 +146,7 @@ private struct AddAccessControlRulesSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
     @ObservedObject var controller: RuleController
-    @State private var matchType = Magent.MatchType.domainSuffix
+    @State private var matchType = MatchType.domainSuffix
     @State private var decision = "proxy"
     @State private var matchValuesText = ""
 
@@ -165,7 +165,7 @@ private struct AddAccessControlRulesSheet: View {
         Form {
             Section {
                 Picker("匹配类型", selection: $matchType) {
-                    ForEach(Magent.MatchType.allCases, id: \.rawValue) { matchType in
+                    ForEach(MatchType.allCases, id: \.rawValue) { matchType in
                         Text(matchType.rawValue)
                             .tag(matchType)
                     }

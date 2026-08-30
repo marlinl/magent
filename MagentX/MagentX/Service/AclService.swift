@@ -12,7 +12,7 @@ import SwiftData
 
 /// 订阅列表解析出的轻量访问规则导入项，供控制器写入 SwiftData。
 struct AccessControlRuleImport: Equatable, Sendable {
-    let matchType: Magent.MatchType
+    let matchType: MatchType
     let matchValue: String
     let decision: String
     let order: Int

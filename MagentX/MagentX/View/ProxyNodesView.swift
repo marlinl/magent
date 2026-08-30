@@ -3,24 +3,30 @@
 //  MagentX
 //
 //  Author: MarlinL
-//  Responsibility: Provides the proxy node list, add/edit sheets, and node CRUD UI.
+//  Responsibility: Provides the proxy node list, direct SwiftData pagination, and node CRUD UI.
 //
 
 import Magent
-import SwiftUI
 import SwiftData
+import SwiftUI
 
-/// 代理节点管理页面，负责节点列表、选择持久化和新增/编辑入口。
+/// 代理节点管理页面，直接通过 SwiftData 完成分页查询、选择和增删改。
 struct ProxyNodesView: View {
     @Environment(\.modelContext) private var modelContext
-    @StateObject private var controller = NodeController()
+    @Binding var toolbarButtons: [ContentToolbarButton]
+    @State private var nodes: [MagentProxyNode] = []
+    @State private var selectedNodeID: UUID?
+    @State private var loadError: String?
+    @State private var canLoadMore = true
+    @State private var isLoading = false
     @State private var isAddingNode = false
     @State private var editingNodeID: UUID?
-    @Binding var toolbarButtons: [ContentToolbarButton]
 
-    private var editingNode: MagentNode? {
+    private static let pageSize = 50
+
+    private var editingNode: MagentProxyNode? {
         guard let editingNodeID else { return nil }
-        return controller.nodes.first { $0.id == editingNodeID }
+        return nodes.first { $0.id == editingNodeID }
     }
 
     var body: some View {
@@ -34,11 +40,12 @@ struct ProxyNodesView: View {
                 ]
             }
             .task {
-                controller.loadFirstPage(from: modelContext)
+                loadFirstPage()
             }
             .sheet(isPresented: $isAddingNode) {
-                NodeFormSheet(controller: controller)
-                    .environment(\.modelContext, modelContext)
+                NodeFormSheet { nodeID in
+                    loadFirstPage(preferredSelectedNodeID: nodeID)
+                }
             }
             .sheet(
                 isPresented: Binding(
@@ -51,68 +58,137 @@ struct ProxyNodesView: View {
                 )
             ) {
                 if let editingNode {
-                    NodeFormSheet(controller: controller, node: editingNode)
-                        .environment(\.modelContext, modelContext)
+                    NodeFormSheet(node: editingNode) { nodeID in
+                        editingNodeID = nil
+                        loadFirstPage(preferredSelectedNodeID: nodeID)
+                    }
                 }
             }
     }
 
     @ViewBuilder
     private var nodeList: some View {
-        if let loadError = controller.loadError {
+        if let loadError {
             ContentUnavailableView(
                 "节点读取失败",
                 systemImage: "exclamationmark.triangle",
                 description: Text(loadError)
             )
-        } else if controller.nodes.isEmpty {
+        } else if nodes.isEmpty {
             ContentUnavailableView(
                 "暂无代理节点",
                 systemImage: "server.rack",
-                description: Text("添加 MagentNode 后会显示在这里")
+                description: Text("添加代理节点后会显示在这里")
             )
         } else {
-            List(selection: $controller.selectedNodeID) {
-                ForEach(controller.nodes, id: \.id) { node in
+            List(selection: $selectedNodeID) {
+                ForEach(nodes, id: \.id) { node in
                     NodeListRow(
                         node: node,
                         onEdit: {
                             editingNodeID = node.id
                         },
                         onDelete: {
-                            controller.deleteNode(node, from: modelContext)
+                            deleteNode(node)
                         }
                     )
-                        .tag(node.id)
-                        .onAppear {
-                            loadMoreNodesIfNeeded(currentNode: node)
-                        }
+                    .tag(node.id)
+                    .onAppear {
+                        loadMoreNodesIfNeeded(currentNode: node)
+                    }
                 }
             }
             .listStyle(.inset)
         }
     }
 
-    private func loadMoreNodesIfNeeded(currentNode node: MagentNode) {
-        guard node.id == controller.nodes.last?.id else { return }
-        controller.loadNextPage(from: modelContext)
+    private func loadFirstPage(preferredSelectedNodeID: UUID? = nil) {
+        nodes = []
+        canLoadMore = true
+        loadNextPage(preferredSelectedNodeID: preferredSelectedNodeID)
+    }
+
+    private func loadNextPage(preferredSelectedNodeID: UUID? = nil) {
+        guard canLoadMore, isLoading == false else { return }
+
+        isLoading = true
+        defer { isLoading = false }
+
+        var descriptor = FetchDescriptor<MagentProxyNode>(
+            sortBy: [
+                SortDescriptor(\.updatedAt, order: .reverse),
+                SortDescriptor(\.createdAt, order: .reverse),
+                SortDescriptor(\.address)
+            ]
+        )
+        descriptor.fetchOffset = nodes.count
+        descriptor.fetchLimit = Self.pageSize + 1
+
+        do {
+            let fetchedNodes = try modelContext.fetch(descriptor)
+            nodes.append(contentsOf: fetchedNodes.prefix(Self.pageSize))
+            canLoadMore = fetchedNodes.count > Self.pageSize
+            loadError = nil
+
+            let desiredNodeID = preferredSelectedNodeID ?? selectedNodeID
+            if let desiredNodeID, nodes.contains(where: { $0.id == desiredNodeID }) {
+                selectedNodeID = desiredNodeID
+            } else if selectedNodeID == nil || nodes.contains(where: { $0.id == selectedNodeID }) == false {
+                selectedNodeID = nodes.first?.id
+            }
+        } catch {
+            canLoadMore = false
+            loadError = error.localizedDescription
+        }
+    }
+
+    private func loadMoreNodesIfNeeded(currentNode node: MagentProxyNode) {
+        guard node.id == nodes.last?.id else { return }
+        loadNextPage()
+    }
+
+    private func deleteNode(_ node: MagentProxyNode) {
+        let targetNodeID: UUID? = node.id
+        let policyDescriptor = FetchDescriptor<ProxyPolicy>(
+            predicate: #Predicate<ProxyPolicy> { policy in
+                policy.magentNodeID == targetNodeID
+            }
+        )
+
+        do {
+            guard try modelContext.fetchCount(policyDescriptor) == 0 else {
+                loadError = MagentXError.proxyNodeInUse(node.id).localizedDescription
+                return
+            }
+
+            modelContext.delete(node)
+            try modelContext.save()
+            if selectedNodeID == node.id {
+                selectedNodeID = nil
+            }
+            loadFirstPage()
+        } catch {
+            modelContext.rollback()
+            loadError = error.localizedDescription
+        }
     }
 }
 
-/// 节点新增和编辑表单 sheet。
+/// 节点新增和编辑表单 sheet，直接将 `MagentProxyNode` 写入 SwiftData。
 private struct NodeFormSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
-    @ObservedObject var controller: NodeController
-    private let node: MagentNode?
+    private let node: MagentProxyNode?
+    private let onSave: (UUID) -> Void
     @State private var name: String
-    @State private var type: Magent.ProxyNodeType
+    @State private var type: ProxyNodeType
     @State private var address: String
     @State private var port: Int
-    @State private var cipher: Magent.ProxyCipher
+    @State private var cipher: ProxyCipher
     @State private var password: String
     @State private var timeout: Int
-    @State private var dnsPolicy: Magent.ProxyDNSPolicy
+    @State private var saveError: String?
+
     private static let portRange = 1...65535
     private static let portFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
@@ -131,9 +207,9 @@ private struct NodeFormSheet: View {
     }()
 
     /// 创建节点新增或编辑表单，并用已有节点填充默认值。
-    init(controller: NodeController, node: MagentNode? = nil) {
-        self.controller = controller
+    init(node: MagentProxyNode? = nil, onSave: @escaping (UUID) -> Void) {
         self.node = node
+        self.onSave = onSave
         _name = State(initialValue: node?.name ?? "")
         _type = State(initialValue: node?.type ?? .shadowsocks)
         _address = State(initialValue: node?.address ?? "")
@@ -141,7 +217,6 @@ private struct NodeFormSheet: View {
         _cipher = State(initialValue: node?.cipher ?? .chacha20IetfPoly1305)
         _password = State(initialValue: node?.password ?? "")
         _timeout = State(initialValue: node.map { max(1, Int($0.timeout.rounded())) } ?? 30)
-        _dnsPolicy = State(initialValue: node?.dnsPolicy ?? .remote)
     }
 
     private var title: LocalizedStringKey {
@@ -152,11 +227,13 @@ private struct NodeFormSheet: View {
         LocalizedStringKey(node == nil ? "添加" : "保存")
     }
 
-    private var canAdd: Bool {
-        address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            && password.isEmpty == false
-            && Self.portRange.contains(port)
-            && timeout > 0
+    private var canSave: Bool {
+        MagentProxyNode.validationErrors(
+            address: address,
+            port: port,
+            password: password,
+            timeout: TimeInterval(timeout)
+        ).isEmpty
     }
 
     var body: some View {
@@ -165,7 +242,7 @@ private struct NodeFormSheet: View {
                 TextField("名称（可选）", text: $name)
 
                 Picker("类型", selection: $type) {
-                    ForEach(Magent.ProxyNodeType.allCases, id: \.rawValue) { type in
+                    ForEach(ProxyNodeType.allCases, id: \.rawValue) { type in
                         Text(type.rawValue)
                             .tag(type)
                     }
@@ -176,7 +253,7 @@ private struct NodeFormSheet: View {
                 TextField("端口", value: $port, formatter: Self.portFormatter)
 
                 Picker("加密", selection: $cipher) {
-                    ForEach(Magent.ProxyCipher.allCases, id: \.rawValue) { cipher in
+                    ForEach(ProxyCipher.allCases, id: \.rawValue) { cipher in
                         Text(cipher.rawValue)
                             .tag(cipher)
                     }
@@ -185,17 +262,16 @@ private struct NodeFormSheet: View {
 
                 SecureField("密码", text: $password)
                 TextField("超时", value: $timeout, formatter: Self.timeoutFormatter)
-
-                Picker("DNS", selection: $dnsPolicy) {
-                    ForEach(Magent.ProxyDNSPolicy.allCases, id: \.rawValue) { policy in
-                        Text(policy.rawValue)
-                            .tag(policy)
-                    }
-                }
-                .pickerStyle(.menu)
             } header: {
                 Text(title)
                     .font(.title3.weight(.semibold))
+            }
+
+            if let saveError {
+                Section {
+                    Text(saveError)
+                        .foregroundStyle(.red)
+                }
             }
 
             Section {
@@ -212,7 +288,7 @@ private struct NodeFormSheet: View {
                         Text(actionTitle)
                     }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(canAdd == false)
+                    .disabled(canSave == false)
                 }
             }
         }
@@ -229,47 +305,48 @@ private struct NodeFormSheet: View {
     }
 
     private func saveNode() {
-        guard canAdd else {
-            return
-        }
+        guard canSave else { return }
 
-        let didSave: Bool
+        let savedNode: MagentProxyNode
         if let node {
-            didSave = controller.updateNode(
-                node,
+            node.update(
                 name: name,
                 type: type,
                 address: address,
                 port: port,
                 cipher: cipher,
                 password: password,
-                timeout: TimeInterval(timeout),
-                dnsPolicy: dnsPolicy,
-                in: modelContext
+                timeout: TimeInterval(timeout)
             )
+            savedNode = node
         } else {
-            didSave = controller.addNode(
+            let newNode = MagentProxyNode(
                 name: name,
                 type: type,
                 address: address,
                 port: port,
                 cipher: cipher,
                 password: password,
-                timeout: TimeInterval(timeout),
-                dnsPolicy: dnsPolicy,
-                in: modelContext
+                timeout: TimeInterval(timeout)
             )
+            modelContext.insert(newNode)
+            savedNode = newNode
         }
 
-        if didSave {
+        do {
+            try modelContext.save()
+            onSave(savedNode.id)
             dismiss()
+        } catch {
+            modelContext.rollback()
+            saveError = error.localizedDescription
         }
     }
 }
 
 /// 节点列表中的单行展示和操作按钮。
 private struct NodeListRow: View {
-    let node: MagentNode
+    let node: MagentProxyNode
     let onEdit: () -> Void
     let onDelete: () -> Void
 
@@ -278,12 +355,7 @@ private struct NodeListRow: View {
     }
 
     private var metadata: String {
-        let type = node.type.rawValue
-        let region = node.region.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard region.isEmpty == false, region != node.address else {
-            return "\(endpoint) - \(type)"
-        }
-        return "\(endpoint) - \(region) - \(type)"
+        "\(endpoint) - \(node.type.rawValue)"
     }
 
     var body: some View {
@@ -294,7 +366,7 @@ private struct NodeListRow: View {
                 .frame(width: 22, alignment: .center)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(node.name)
+                Text(node.displayName)
                     .font(.body.weight(.medium))
                     .lineLimit(1)
 

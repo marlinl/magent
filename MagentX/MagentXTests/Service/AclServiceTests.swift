@@ -28,7 +28,7 @@ struct AclServiceTests {
         #expect(accessControlRules.filter { $0.matchType == .domainKeyword }.count == 14)
         #expect(accessControlRules.allSatisfy { $0.source == AclService.source })
 
-        let expectedRules: [(index: Int, matchType: Magent.MatchType, matchValue: String, decision: String)] = [
+        let expectedRules: [(index: Int, matchType: MatchType, matchValue: String, decision: String)] = [
             (0, .urlRegex, #"^https:\/\/fbcdn.*\.akamaihd\.net\/"#, "proxy"),
             (13, .domainSuffix, "facebook.com", "proxy"),
             (71, .domainSuffix, "google.com", "proxy"),
@@ -182,20 +182,17 @@ struct AclServiceTests {
         let firstPolicy = ProxyPolicy(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000201")!,
             name: "bbc.co.uk",
-            magentNodeID: firstNode.id,
-            magentNode: firstNode
+            magentNodeID: firstNode.id
         )
         let secondPolicy = ProxyPolicy(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000202")!,
             name: "  BBC.CO.UK  ",
-            magentNodeID: secondNode.id,
-            magentNode: secondNode
+            magentNodeID: secondNode.id
         )
         let unrelatedPolicy = ProxyPolicy(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000203")!,
             name: "google.com",
-            magentNodeID: unrelatedNode.id,
-            magentNode: unrelatedNode
+            magentNodeID: unrelatedNode.id
         )
 
         context.insert(rule)
@@ -238,17 +235,18 @@ struct AclServiceTests {
             for: AccessControlRule.self,
             ProxyPolicy.self,
             ProxyPolicyRule.self,
-            MagentNode.self,
+            MagentProxyNode.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true)
         )
     }
 
-    private func makeNode(id: UUID, port: Int) -> MagentNode {
-        MagentNode(
+    private func makeNode(id: UUID, port: Int) -> MagentProxyNode {
+        MagentProxyNode(
             id: id,
             name: "Node \(port)",
             address: "127.0.0.1",
             port: port,
+            cipher: .chacha20IetfPoly1305,
             password: "password"
         )
     }

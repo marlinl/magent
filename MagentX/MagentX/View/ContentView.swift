@@ -12,9 +12,9 @@ import SwiftUI
 /// 主导航中的页面分区。
 enum AppSection: String, CaseIterable, Identifiable {
     case dashboard
+    case proxyPolicy
     case proxyNodes
     case proxyRules
-    case proxyPolicy
     case settings
 
     var id: String { rawValue }
@@ -83,6 +83,8 @@ struct ContentToolbarButton: Identifiable {
 /// 主窗口布局常量。
 private enum ContentMetrics {
     static let sidebarWidth: CGFloat = 220
+    static let detailMinimumWidth: CGFloat = 360
+    static let detailIdealWidth: CGFloat = 600
 }
 
 /// MagentX 主窗口导航壳，负责侧边栏选择、页面路由和页面级工具栏。
@@ -103,6 +105,10 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(ContentMetrics.sidebarWidth)
         } detail: {
             detail
+                .navigationSplitViewColumnWidth(
+                    min: ContentMetrics.detailMinimumWidth,
+                    ideal: ContentMetrics.detailIdealWidth
+                )
         }
         .navigationTitle(currentSection.title)
         .toolbarBackground(.visible, for: .windowToolbar)
@@ -176,7 +182,7 @@ struct ContentView: View {
 #Preview {
     ContentView(isMenuBarInserted: .constant(true))
         .modelContainer(for: [
-            MagentNode.self,
+            MagentProxyNode.self,
             AccessControlRule.self,
             ProxyPolicy.self,
             ProxyPolicyRule.self

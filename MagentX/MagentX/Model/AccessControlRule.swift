@@ -13,13 +13,13 @@ import SwiftData
 
 /// MagentX 持久化访问控制规则。
 ///
-/// 字段参考 `Magent.AccessControlPolicy`，但 `decision` 只保存动作字符串；
+/// 字段参考 Magent 核心库的 `ProxyRule`，但 `decision` 只保存动作字符串；
 /// 具体代理节点 id 在转换为 Magent 策略时由调用方提供。
 @Model
 final class AccessControlRule {
     @Attribute(.unique)
     var id: UUID
-    var matchType: Magent.MatchType
+    var matchType: MatchType
     var matchValue: String
     var decision: String
     var order: Int
@@ -31,7 +31,7 @@ final class AccessControlRule {
 
     /// 创建一条可持久化的访问控制规则。
     init(
-        matchType: Magent.MatchType,
+        matchType: MatchType,
         matchValue: String,
         decision: String,
         order: Int = 0,
@@ -50,14 +50,14 @@ final class AccessControlRule {
     }
 
     /// 更新规则匹配身份，并同步刷新由 `matchType + matchValue` 派生的稳定 id。
-    func updateIdentity(matchType: Magent.MatchType, matchValue: String) {
+    func updateIdentity(matchType: MatchType, matchValue: String) {
         self.id = Self.makeID(matchType: matchType, matchValue: matchValue)
         self.matchType = matchType
         self.matchValue = matchValue
     }
 
     /// 根据匹配类型和匹配值生成稳定 UUID，保证相同规则身份得到相同 id。
-    static func makeID(matchType: Magent.MatchType, matchValue: String) -> UUID {
+    static func makeID(matchType: MatchType, matchValue: String) -> UUID {
         let identity = "\(matchType.rawValue):\(matchValue)"
         let digest = SHA256.hash(data: Data(identity.utf8))
         var bytes = Array(digest.prefix(16))
@@ -72,12 +72,12 @@ final class AccessControlRule {
         ))
     }
 
-    /// 转换为 Magent 核心库使用的访问控制策略。
-    func magentAccessControlPolicy(proxyNodeID: UUID) -> Magent.AccessControlPolicy? {
+    /// 转换为 Magent 核心库使用的代理规则；无效规则返回 nil。
+    func magentProxyRule(proxyNodeID: UUID) -> ProxyRule? {
         let value = matchValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard value.isEmpty == false else { return nil }
 
-        let magentDecision: Magent.Decision
+        let magentDecision: Decision
         switch decision {
         case "direct":
             magentDecision = .direct
@@ -87,7 +87,7 @@ final class AccessControlRule {
             return nil
         }
 
-        return Magent.AccessControlPolicy(
+        return try? ProxyRule(
             matchType: matchType,
             matchValue: value,
             decision: magentDecision,

@@ -9,7 +9,7 @@
 import Foundation
 import SwiftData
 
-/// 代理策略组，保存组身份、展示名称、后缀域名以及可选的代理节点。
+/// 代理策略组，保存组身份、展示名称、后缀域名以及可选的代理节点 ID。
 @Model
 final class ProxyPolicy {
     @Attribute(.unique)
@@ -17,7 +17,6 @@ final class ProxyPolicy {
     var name: String
     var suffixDomain: String = ""
     var magentNodeID: UUID?
-    var magentNode: MagentNode?
     @Relationship(deleteRule: .cascade, inverse: \ProxyPolicyRule.proxyPolicy)
     var proxyPolicyRules: [ProxyPolicyRule] = []
 
@@ -26,13 +25,11 @@ final class ProxyPolicy {
         id: UUID = UUID(),
         name: String,
         suffixDomain: String = "",
-        magentNodeID: UUID? = nil,
-        magentNode: MagentNode? = nil
+        magentNodeID: UUID? = nil
     ) {
         self.id = id
         self.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         self.suffixDomain = suffixDomain.trimmingCharacters(in: .whitespacesAndNewlines)
         self.magentNodeID = magentNodeID
-        self.magentNode = magentNode
     }
 }

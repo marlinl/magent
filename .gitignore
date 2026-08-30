@@ -50,6 +50,13 @@ Cargo.lock
 # Personal local utilities
 /info.js
 
+# Local SQLite databases
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
 # Claude Code
 .claude/
 
