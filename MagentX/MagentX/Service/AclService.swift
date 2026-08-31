@@ -10,7 +10,7 @@ import Foundation
 import Magent
 import SwiftData
 
-/// 订阅列表解析出的轻量访问规则导入项，供控制器写入 SwiftData。
+/// 订阅列表解析出的轻量访问规则导入项，供规则订阅服务写入 SwiftData。
 struct AccessControlRuleImport: Equatable, Sendable {
     let matchType: MatchType
     let matchValue: String
@@ -25,6 +25,12 @@ struct AccessControlRuleImport: Equatable, Sendable {
 
 /// 访问控制列表服务，负责下载 GFWList 风格订阅并解析为导入项。
 actor AclService {
+    /// 订阅规则的匹配身份，用于合并刷新时识别同一条代理规则。
+    private struct ProxyRuleIdentity: Hashable, Sendable {
+        let matchType: MatchType
+        let matchValue: String
+    }
+
     static let shared = AclService()
     nonisolated static let source = "rulesUrl"
     nonisolated static let defaultStorageDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
@@ -62,6 +68,91 @@ actor AclService {
         let (temporaryURL, _) = try await URLSession.shared.download(from: url)
         let fileURL = try replaceStoredFile(at: gfwlistFileURL, with: temporaryURL, shouldMoveSource: true)
         return try parseListFile(fileURL)
+    }
+
+    /// 下载订阅并在后台上下文合并为 `MagentProxyRule`，返回生成 PAC 所需的规则快照。
+    func downloadAndImportMagentProxyRules(
+        from url: URL,
+        into modelContainer: ModelContainer,
+        now: Date
+    ) async throws -> [PacFileService.Rule] {
+        let downloadedRules = try await downloadAndParse(from: url)
+        return try await Task.detached(priority: .userInitiated) {
+            let modelContext = ModelContext(modelContainer)
+            return try Self.importMagentProxyRules(
+                downloadedRules,
+                into: modelContext,
+                now: now
+            )
+        }.value
+    }
+
+    /// 把订阅规则合并到 `MagentProxyRule`，同来源规则会刷新，手工冲突规则会跳过。
+    nonisolated static func importMagentProxyRules(
+        _ downloadedRules: [AccessControlRuleImport],
+        into modelContext: ModelContext,
+        now: Date
+    ) throws -> [PacFileService.Rule] {
+        let existingRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
+        var rulesByIdentity: [ProxyRuleIdentity: MagentProxyRule] = [:]
+        for existingRule in existingRules {
+            let identity = ProxyRuleIdentity(
+                matchType: existingRule.matchType,
+                matchValue: existingRule.matchValue
+            )
+            rulesByIdentity[identity] = existingRule
+        }
+
+        var usedIDs = Set(existingRules.map(\.id))
+        var nextIDCandidate = 0
+        for downloadedRule in downloadedRules {
+            guard let decision = RuleDecision(rawValue: downloadedRule.decision) else { continue }
+            let identity = ProxyRuleIdentity(
+                matchType: downloadedRule.matchType,
+                matchValue: downloadedRule.matchValue
+            )
+
+            if let existingRule = rulesByIdentity[identity] {
+                guard existingRule.source == downloadedRule.source else { continue }
+                existingRule.matchType = downloadedRule.matchType
+                existingRule.matchValue = downloadedRule.matchValue
+                existingRule.decision = decision
+                existingRule.order = downloadedRule.order
+                existingRule.source = downloadedRule.source
+                existingRule.updatedAt = now
+                continue
+            }
+
+            while usedIDs.contains(nextIDCandidate) {
+                nextIDCandidate += 1
+            }
+            let id = nextIDCandidate
+            usedIDs.insert(id)
+            nextIDCandidate += 1
+
+            let proxyRule = MagentProxyRule(
+                id: id,
+                matchType: downloadedRule.matchType,
+                matchValue: downloadedRule.matchValue,
+                decision: decision,
+                order: downloadedRule.order,
+                source: downloadedRule.source,
+                createdAt: now,
+                updatedAt: now
+            )
+            modelContext.insert(proxyRule)
+            rulesByIdentity[identity] = proxyRule
+        }
+
+        try modelContext.save()
+        return rulesByIdentity.values.map { proxyRule in
+            PacFileService.Rule(
+                matchType: proxyRule.matchType,
+                matchValue: proxyRule.matchValue,
+                decision: proxyRule.decision.rawValue,
+                order: proxyRule.order
+            )
+        }
     }
 
     /// 下载 Public Suffix List，并保存为 `~/.MagentX/PSL.dat` 供后续规则解析使用。

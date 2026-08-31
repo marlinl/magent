@@ -183,6 +183,7 @@ struct ContentView: View {
     ContentView(isMenuBarInserted: .constant(true))
         .modelContainer(for: [
             MagentProxyNode.self,
+            MagentProxyRule.self,
             AccessControlRule.self,
             ProxyPolicy.self,
             ProxyPolicyRule.self

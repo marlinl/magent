@@ -164,7 +164,13 @@ struct MagentXApp: App {
     }
 
     private static func makeModelContainer() throws -> ModelContainer {
-        let schema = Schema([MagentProxyNode.self, AccessControlRule.self, ProxyPolicy.self, ProxyPolicyRule.self])
+        let schema = Schema([
+            MagentProxyNode.self,
+            MagentProxyRule.self,
+            AccessControlRule.self,
+            ProxyPolicy.self,
+            ProxyPolicyRule.self
+        ])
         let fileManager = FileManager.default
         let directoryURL = try fileManager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             .appendingPathComponent(Bundle.main.bundleIdentifier ?? "MagentX", isDirectory: true)

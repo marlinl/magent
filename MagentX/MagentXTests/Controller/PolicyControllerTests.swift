@@ -172,15 +172,8 @@ struct PolicyControllerTests {
             in: context
         ))
 
-        let directoryURL = temporaryDirectoryURL()
-        defer { try? FileManager.default.removeItem(at: directoryURL) }
-        RuleController(
-            pacFileService: PacFileService(directoryURL: directoryURL),
-            generalSettingsProvider: {
-                GeneralSettings(proxyListenAddress: "127.0.0.1", proxyListenPort: 1086)
-            }
-        )
-        .deleteAccessControl(rules[0], from: context)
+        context.delete(rules[0])
+        try context.save()
 
         let policies = try context.fetch(FetchDescriptor<ProxyPolicy>())
         let policyRules = try context.fetch(FetchDescriptor<ProxyPolicyRule>())
@@ -198,11 +191,6 @@ struct PolicyControllerTests {
             MagentProxyNode.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true)
         )
-    }
-
-    private func temporaryDirectoryURL() -> URL {
-        FileManager.default.temporaryDirectory
-            .appendingPathComponent("PolicyControllerTests-\(UUID().uuidString)", isDirectory: true)
     }
 
     private func makeReferencedModels(in context: ModelContext) throws -> ([AccessControlRule], MagentProxyNode) {

@@ -38,7 +38,8 @@
 "刷新规则" = "刷新规则";
 "规则读取失败" = "规则读取失败";
 "暂无规则" = "暂无规则";
-"AccessControlRule 会显示在这里" = "AccessControlRule 会显示在这里";
+"MagentProxyRule 会显示在这里" = "MagentProxyRule 会显示在这里";
+"Proxy rule already exists" = "代理规则已存在";
 "加载更多" = "加载更多";
 "Action" = "动作";
 "Decision" = "动作";
@@ -89,7 +90,6 @@
 "Name is required" = "名称不能为空。";
 "Downloaded rules data is not valid Base64" = "下载的规则数据不是有效的 Base64。";
 "Decoded rules data is not valid UTF-8 text" = "解码后的规则数据不是有效的 UTF-8 文本。";
-"Access control rule already exists" = "访问控制规则已存在。";
 "Match value is required" = "匹配值不能为空。";
 "Decision must be direct or proxy" = "动作必须是 direct 或 proxy。";
 "Address is required" = "地址不能为空。";

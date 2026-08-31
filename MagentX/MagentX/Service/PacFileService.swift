@@ -3,14 +3,13 @@
 //  MagentX
 //
 //  Author: MarlinL
-//  Responsibility: Generates and persists PAC files from access-control rules.
+//  Responsibility: Generates and persists PAC files from proxy rule snapshots.
 //
 
 import Foundation
 import Magent
-import SwiftData
 
-/// PAC 文件服务，负责把访问控制规则编译为本地代理使用的 host PAC 文件。
+/// PAC 文件服务，负责把代理规则快照编译为本地代理使用的 host PAC 文件。
 final class PacFileService {
     static let shared = PacFileService()
     static let fileName = "proxy.pac"
@@ -25,21 +24,6 @@ final class PacFileService {
     /// 当前服务负责维护的 PAC 文件路径。
     var proxyHostPACURL: URL {
         Self.proxyHostPACURL(in: directoryURL)
-    }
-
-    /// 从 SwiftData 读取完整访问规则，并原子覆盖 proxy host PAC 文件。
-    @discardableResult
-    func rewriteProxyHostPAC(
-        from modelContext: ModelContext,
-        generalSettings: GeneralSettings
-    ) throws -> URL {
-        let proxyEndpoint = try ProxyEndpoint(generalSettings: generalSettings)
-        let rules = try Self.fetchPACRules(from: modelContext)
-        return try Self.writeProxyHostPAC(
-            rules: rules,
-            proxyEndpoint: proxyEndpoint,
-            directoryURL: directoryURL
-        )
     }
 
     /// 用轻量规则快照原子覆盖 proxy host PAC 文件。
@@ -72,7 +56,10 @@ final class PacFileService {
             }
             return leftRule.matchValue.localizedStandardCompare(rightRule.matchValue) == .orderedAscending
         }
-        let ruleLines = sortedRules.compactMap(ruleLiteral)
+        let ruleLines = sortedRules
+            .compactMap { rule in
+                ruleLiteral(rule)
+            }
             .map { "        \($0)" }
             .joined(separator: ",\n")
         let proxyValue = "SOCKS5 \(proxyEndpoint.address):\(proxyEndpoint.port); DIRECT"
@@ -139,16 +126,6 @@ final class PacFileService {
             .appendingPathComponent(".MagentX", isDirectory: true)
     }
 
-    private static func fetchPACRules(from modelContext: ModelContext) throws -> [Rule] {
-        let descriptor = FetchDescriptor<AccessControlRule>(
-            sortBy: [
-                SortDescriptor(\.order),
-                SortDescriptor(\.matchValue)
-            ]
-        )
-        return try modelContext.fetch(descriptor).map(Rule.init(accessControlRule:))
-    }
-
     private static func ruleLiteral(_ rule: Rule) -> String? {
         let type = javaScriptStringLiteral(rule.matchType.rawValue)
         let normalizedValue = rule.matchType == .urlRegex ? rule.matchValue : rule.matchValue.lowercased()
@@ -195,22 +172,14 @@ final class PacFileService {
 
 /// PAC 文件中的轻量规则快照。
 extension PacFileService {
-    struct Rule: Equatable, Sendable {
+    nonisolated struct Rule: Equatable, Sendable {
         let matchType: MatchType
         let matchValue: String
         let decision: String
         let order: Int
 
-        /// 从 SwiftData 访问规则创建 PAC 规则快照。
-        init(accessControlRule: AccessControlRule) {
-            self.matchType = accessControlRule.matchType
-            self.matchValue = accessControlRule.matchValue
-            self.decision = accessControlRule.decision
-            self.order = accessControlRule.order
-        }
-
         /// 创建可跨线程传递的 PAC 规则快照。
-        init(
+        nonisolated init(
             matchType: MatchType,
             matchValue: String,
             decision: String,

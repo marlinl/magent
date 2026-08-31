@@ -14,7 +14,7 @@ enum MagentXError: LocalizedError, Equatable {
     case singleInstanceLockFailed(String)
     case invalidAclBase64Data
     case invalidAclDecodedText
-    case duplicateAccessControlRule
+    case duplicateMagentProxyRule
     case missingAccessControlRule(UUID)
     case missingMagentProxyNode(UUID)
     case proxyNodeInUse(UUID)
@@ -46,8 +46,8 @@ enum MagentXError: LocalizedError, Equatable {
             return String(localized: "Downloaded rules data is not valid Base64")
         case .invalidAclDecodedText:
             return String(localized: "Decoded rules data is not valid UTF-8 text")
-        case .duplicateAccessControlRule:
-            return String(localized: "Access control rule already exists")
+        case .duplicateMagentProxyRule:
+            return String(localized: "Proxy rule already exists")
         case .missingAccessControlRule(let id):
             return String(format: String(localized: "Access control rule does not exist: %@"), id.uuidString)
         case .missingMagentProxyNode(let id):

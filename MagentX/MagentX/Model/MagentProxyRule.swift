@@ -11,7 +11,7 @@ import Magent
 import SwiftData
 
 /// MagentX 代理规则动作，以字符串形式持久化。
-enum RuleDecision: String, Codable, Sendable, Equatable, Hashable, CaseIterable {
+nonisolated enum RuleDecision: String, Codable, Sendable, Equatable, Hashable, CaseIterable {
     /// 使用代理转发。
     case proxy
 

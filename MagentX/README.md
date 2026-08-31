@@ -23,6 +23,7 @@ MagentX/MagentX/
 │   ├── CurrentSelection.swift
 │   ├── GeneralSettings.swift
 │   ├── MagentNode.swift
+│   ├── MagentProxyRule.swift
 │   ├── ProxyPolicy.swift
 │   └── ProxyPolicyRule.swift
 ├── Service/
@@ -32,7 +33,6 @@ MagentX/MagentX/
 │   └── SystemNetworkProxyService.swift
 ├── Controller/
 │   ├── NodeController.swift
-│   ├── RuleController.swift
 │   ├── PolicyController.swift
 │   └── SettingsController.swift
 ├── View/
@@ -49,7 +49,7 @@ MagentX/MagentX/
 
 ```text
 SwiftUI Views
-    ↓ user actions / bindings
+    ↓ direct model actions or controller coordination
 Controllers
     ↓ CRUD and refresh orchestration
 SwiftData Models
@@ -67,19 +67,19 @@ Network
 - `GeneralSettings`: persisted global app configuration, including launch-at-login, menu bar behavior, local proxy listening, optional iCloud sync preference, the rules subscription URL, and the PSL download URL.
 - `CurrentSelection`: persisted selection state for the active proxy node.
 - `AccessControlRule`: persisted access-control rule. The rule-list refresh path stores imported rules with `source = "rulesUrl"`.
+- `MagentProxyRule`: persisted proxy rule used directly by `ProxyRulesView`, including typed direct/proxy decisions.
 - `ProxyPolicy`: persisted policy group with its own id, display name, suffix domain text, and optional selected Magent node id.
 - `ProxyPolicyRule`: persisted join between a `ProxyPolicy` id and an `AccessControlRule` id.
 
 ## Services
 
-`AclService` downloads and parses an access-control subscription list. It stores downloaded GFWList data as `~/.MagentX/gfwlist.txt`, stores Public Suffix List data as `~/.MagentX/PSL.dat`, and its `downloadAndParse(from:)` API returns lightweight `AccessControlRuleImport` records tagged with `source = "rulesUrl"`; `RuleController` owns writing those records into SwiftData on a background model context.
+`AclService` downloads and parses an access-control subscription list. It stores downloaded GFWList data as `~/.MagentX/gfwlist.txt`, stores Public Suffix List data as `~/.MagentX/PSL.dat`, and imports lightweight `AccessControlRuleImport` records tagged with `source = "rulesUrl"` as `MagentProxyRule` values on a background model context.
 
-`PacFileService` compiles the complete persisted access-control rule set into `~/.MagentX/proxy.pac`. `RuleController` rewrites that file after rule-list refreshes and successful rule mutations, and `MagentProxyService` serves the latest file through the local PAC HTTP endpoint.
+`PacFileService` compiles the complete persisted proxy rule set into `~/.MagentX/proxy.pac`. `ProxyRulesView` rewrites that file after subscription refreshes, and `MagentProxyService` serves the latest file through the local PAC HTTP endpoint.
 
 ## Controllers
 
 - `NodeController`: manages `ProxyNode` CRUD through SwiftData.
-- `RuleController`: manages access rule business operations through SwiftData, including `refreshRuleList(from:)` for waiting on `AclService` and importing downloaded rules.
 - `PolicyController`: manages proxy policy business operations through SwiftData.
 - `SettingsController`: manages default settings records and menu bar background behavior.
 
@@ -107,10 +107,10 @@ xcodebuild -project MagentX/MagentX.xcodeproj -scheme MagentX \
   -destination 'platform=macOS' test
 ```
 
-To run only the rule controller tests:
+To run only the Magent proxy rule subscription-import tests:
 
 ```bash
 xcodebuild -project MagentX/MagentX.xcodeproj -scheme MagentX \
   -destination 'platform=macOS' \
-  -only-testing:MagentXTests/RuleControllerTests test
+  -only-testing:MagentXTests/AclServiceMagentProxyRuleTests test
 ```

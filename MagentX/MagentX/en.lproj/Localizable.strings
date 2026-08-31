@@ -38,7 +38,8 @@
 "刷新规则" = "Refresh Rules";
 "规则读取失败" = "Failed to Load Rules";
 "暂无规则" = "No Rules";
-"AccessControlRule 会显示在这里" = "AccessControlRule entries will appear here.";
+"MagentProxyRule 会显示在这里" = "MagentProxyRule entries will appear here.";
+"Proxy rule already exists" = "Proxy rule already exists";
 "加载更多" = "Load More";
 "Action" = "Action";
 "Decision" = "Decision";
@@ -89,7 +90,6 @@
 "Name is required" = "Name is required.";
 "Downloaded rules data is not valid Base64" = "Downloaded rules data is not valid Base64.";
 "Decoded rules data is not valid UTF-8 text" = "Decoded rules data is not valid UTF-8 text.";
-"Access control rule already exists" = "Access control rule already exists.";
 "Match value is required" = "Match value is required.";
 "Decision must be direct or proxy" = "Decision must be direct or proxy.";
 "Address is required" = "Address is required.";
