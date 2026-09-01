@@ -14,12 +14,13 @@ struct GeneralSettings {
     static let defaultProxyListenPort = 1086
     static let defaultPacListenPort = 10080
     static let defaultProxyThreadNumber = 2
+    static let defaultRulesURL = "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt"
     static let defaultPublicSuffixListURL = "https://publicsuffix.org/list/public_suffix_list.dat"
 
     var launchAtLogin: Bool = false
     var enableMenuBar: Bool = true
     var iCloudSyncEnabled: Bool = false
-    var rulesURL: String = ""
+    var rulesURL: String = GeneralSettings.defaultRulesURL
     var publicSuffixListURL: String = GeneralSettings.defaultPublicSuffixListURL
     var proxyListenAddress: String = GeneralSettings.localhostAddress
     var proxyListenPort: Int = GeneralSettings.defaultProxyListenPort
@@ -33,7 +34,7 @@ struct GeneralSettings {
         launchAtLogin: Bool = false,
         enableMenuBar: Bool = true,
         iCloudSyncEnabled: Bool = false,
-        rulesURL: String = "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt",
+        rulesURL: String = GeneralSettings.defaultRulesURL,
         publicSuffixListURL: String = GeneralSettings.defaultPublicSuffixListURL,
         proxyListenAddress: String = GeneralSettings.localhostAddress,
         proxyListenPort: Int = GeneralSettings.defaultProxyListenPort,
@@ -61,7 +62,7 @@ struct GeneralSettings {
             launchAtLogin: userDefaults.object(forKey: "general.launchAtLogin") as? Bool ?? false,
             enableMenuBar: userDefaults.object(forKey: "general.enableMenuBar") as? Bool ?? true,
             iCloudSyncEnabled: userDefaults.object(forKey: "general.iCloudSyncEnabled") as? Bool ?? false,
-            rulesURL: userDefaults.string(forKey: "general.rulesURL") ?? "",
+            rulesURL: userDefaults.string(forKey: "general.rulesURL") ?? defaultRulesURL,
             publicSuffixListURL: userDefaults.string(forKey: "general.publicSuffixListURL") ?? defaultPublicSuffixListURL,
             proxyListenAddress: userDefaults.string(forKey: "general.proxyListenAddress") ?? localhostAddress,
             proxyListenPort: userDefaults.object(forKey: "general.proxyListenPort") as? Int ?? defaultProxyListenPort,

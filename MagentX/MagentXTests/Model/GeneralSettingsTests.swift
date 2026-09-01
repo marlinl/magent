@@ -40,6 +40,19 @@ struct GeneralSettingsTests {
         #expect(loadedSettings.proxyThreadNumber == 4)
     }
 
+    /// 验证规则订阅地址在未保存设置时默认使用 GFWList 官方地址。
+    @Test func loadUsesDefaultRulesURL() {
+        let suiteName = "GeneralSettingsTests.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            userDefaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let settings = GeneralSettings.load(userDefaults: userDefaults)
+
+        #expect(settings.rulesURL == "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt")
+    }
+
     /// 验证 PSL 下载地址缺省使用 publicsuffix.org，并可随设置保存和读取。
     @Test func savePersistsPublicSuffixListURL() {
         let suiteName = "GeneralSettingsTests.\(UUID().uuidString)"

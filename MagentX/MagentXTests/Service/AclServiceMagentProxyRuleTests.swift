@@ -65,7 +65,7 @@ struct AclServiceMagentProxyRuleTests {
             matchValue: "example.com",
             decision: .direct,
             order: 0,
-            source: "manual",
+            source: "user",
             createdAt: oldDate,
             updatedAt: oldDate
         )
@@ -87,6 +87,7 @@ struct AclServiceMagentProxyRuleTests {
         #expect(subscriptionRule.order == 100)
         #expect(subscriptionRule.updatedAt > oldDate)
         #expect(manualRule.decision == .direct)
+        #expect(manualRule.source == "user")
         #expect(manualRule.updatedAt == oldDate)
         #expect(appleRule?.decision == .proxy)
         #expect(appleRule?.source == AclService.source)
