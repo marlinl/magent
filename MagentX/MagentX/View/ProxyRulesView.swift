@@ -17,6 +17,9 @@ struct ProxyRulesView: View {
     @Environment(\.modelContext) private var modelContext
     @State private var proxyRules: [MagentProxyRule] = []
     @State private var searchText = ""
+    @State private var submittedSearchText = ""
+    @State private var isSearchPresented = false
+    @FocusState private var isSearchFocused: Bool
     @State private var loadError: String?
     @State private var canLoadMore = false
     @State private var isRefreshing = false
@@ -35,7 +38,7 @@ struct ProxyRulesView: View {
 
     /// 去除首尾空白后的搜索关键字。
     private var trimmedSearchText: String {
-        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        submittedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// 把新增表单中的非空行转换为匹配值。
@@ -70,7 +73,34 @@ struct ProxyRulesView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .searchable(text: $searchText, placement: .toolbar, prompt: "搜索 matchValue")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                if isSearchPresented {
+                    TextField("搜索 matchValue", text: $searchText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 220)
+                        .focused($isSearchFocused)
+                        .onAppear {
+                            isSearchFocused = true
+                        }
+                        .onSubmit {
+                            submittedSearchText = searchText
+                            fetchLimit = Self.pageSize
+                            search()
+                        }
+                } else {
+                    Button {
+                        isSearchPresented = true
+                    } label: {
+                        Label("搜索规则", systemImage: "magnifyingglass")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.circle)
+                    .help("搜索规则")
+                }
+            }
+        }
         .sheet(isPresented: $isAddingRules) {
             addRulesSheet
         }
@@ -89,10 +119,6 @@ struct ProxyRulesView: View {
                     sync()
                 }
             ]
-        }
-        .onChange(of: searchText) { _, _ in
-            fetchLimit = Self.pageSize
-            search()
         }
         .task {
             search()

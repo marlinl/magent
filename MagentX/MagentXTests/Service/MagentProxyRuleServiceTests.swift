@@ -16,6 +16,33 @@ import Testing
 @MainActor
 @Suite(.serialized)
 struct MagentProxyRuleServiceTests {
+    /// 验证下载入口返回未裁剪、未做 Base64 解码的完整响应正文。
+    @Test func downloadFromRuleURLReturnsCompleteResponseBody() async throws {
+        let container = try makeContainer()
+        let responseBody = "W3J1bGVzXFxuXQ==\nsecond-line\n"
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rules-response-\(UUID().uuidString).txt", isDirectory: false)
+        try Data(responseBody.utf8).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let defaults = UserDefaults.standard
+        let rulesURLKey = "general.rulesURL"
+        let originalRulesURL = defaults.object(forKey: rulesURLKey)
+        defaults.set(fileURL.absoluteString, forKey: rulesURLKey)
+        defer {
+            if let originalRulesURL {
+                defaults.set(originalRulesURL, forKey: rulesURLKey)
+            } else {
+                defaults.removeObject(forKey: rulesURLKey)
+            }
+        }
+
+        let service = MagentProxyRuleService(modelContainer: container)
+        let response = try await service.downloadFromRuleUrl()
+
+        #expect(response == responseBody)
+    }
+
     /// 验证同步会覆盖同来源规则、保留冲突的用户规则，并给新增规则分配未占用 id。
     @Test func syncRuleFromURLMergesDownloadedRules() async throws {
         let container = try makeContainer()

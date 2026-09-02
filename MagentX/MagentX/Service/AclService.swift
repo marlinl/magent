@@ -174,7 +174,15 @@ actor AclService {
         guard let text = String(data: decodedData, encoding: .utf8) else {
             throw MagentXError.invalidAclDecodedText
         }
-        return Self.parseRulesText(text)
+        return AdblockUtil.parse(text).map { rule in
+            AccessControlRuleImport(
+                matchType: rule.matchType,
+                matchValue: rule.matchValue,
+                decision: rule.isException ? "direct" : "proxy",
+                order: Self.defaultImportedRuleOrder,
+                source: Self.source
+            )
+        }
     }
 
     /// 解析一条访问控制规则的可注册 suffix domain，并补齐命中策略组的 `ProxyPolicyRule` 关联。
@@ -192,7 +200,7 @@ actor AclService {
 
         let proxyPolicies = try modelContext.fetch(FetchDescriptor<ProxyPolicy>())
             .filter { proxyPolicy in
-                AclService.normalizedDomain(proxyPolicy.name) == suffixDomain
+                AdblockUtil.normalizedDomain(proxyPolicy.name) == suffixDomain
             }
         guard proxyPolicies.isEmpty == false else { return [] }
 
@@ -256,7 +264,7 @@ actor AclService {
         publicSuffixListFileURL: URL
     ) throws -> String? {
         guard accessControlRule.matchType == .exactDomain || accessControlRule.matchType == .domainSuffix,
-              let domain = AclService.normalizedDomain(accessControlRule.matchValue)
+              let domain = AdblockUtil.normalizedDomain(accessControlRule.matchValue)
         else {
             return nil
         }
@@ -313,13 +321,13 @@ actor AclService {
                 guard line.isEmpty == false, line.hasPrefix("//") == false else { continue }
 
                 if line.hasPrefix("!") {
-                    guard let normalizedRule = AclService.normalizedDomain(String(line.dropFirst())) else { continue }
+                    guard let normalizedRule = AdblockUtil.normalizedDomain(String(line.dropFirst())) else { continue }
                     exceptionRules.insert(normalizedRule)
                 } else if line.hasPrefix("*.") {
-                    guard let wildcardSuffix = AclService.normalizedDomain(String(line.dropFirst(2))) else { continue }
+                    guard let wildcardSuffix = AdblockUtil.normalizedDomain(String(line.dropFirst(2))) else { continue }
                     wildcardRules.insert(wildcardSuffix)
                 } else {
-                    guard let normalizedRule = AclService.normalizedDomain(line) else { continue }
+                    guard let normalizedRule = AdblockUtil.normalizedDomain(line) else { continue }
                     exactRules.insert(normalizedRule)
                 }
             }
@@ -330,7 +338,7 @@ actor AclService {
         }
 
         private func registrableDomain(for domain: String) -> String? {
-            guard let normalizedDomain = AclService.normalizedDomain(domain) else { return nil }
+            guard let normalizedDomain = AdblockUtil.normalizedDomain(domain) else { return nil }
             let labels = normalizedDomain.split(separator: ".").map(String.init)
             guard labels.count > 1 else { return nil }
 
@@ -382,203 +390,4 @@ actor AclService {
         }
     }
 
-    // MARK: - Line Parsing
-
-    private nonisolated static func parseRulesText(_ text: String) -> [AccessControlRuleImport] {
-        var rules: [AccessControlRuleImport] = []
-        var indexesByMatchValue: [String: Int] = [:]
-
-        for rawLine in text.split(whereSeparator: \.isNewline) {
-            guard let rule = parseRulesLine(String(rawLine), order: defaultImportedRuleOrder) else { continue }
-
-            if let existingIndex = indexesByMatchValue[rule.matchValue] {
-                if rule.decision == "direct" && rules[existingIndex].decision != "direct" {
-                    rules[existingIndex] = rule
-                }
-                continue
-            }
-
-            indexesByMatchValue[rule.matchValue] = rules.count
-            rules.append(rule)
-        }
-
-        return rules
-    }
-
-    private nonisolated static func parseRulesLine(_ rawLine: String, order: Int) -> AccessControlRuleImport? {
-        var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard line.isEmpty == false else { return nil }
-        guard line.hasPrefix("!") == false,
-              line.hasPrefix("[") == false,
-              line.hasPrefix("#") == false,
-              line.contains("##") == false,
-              line.contains("#@#") == false
-        else {
-            return nil
-        }
-
-        let decision: String
-        if line.hasPrefix("@@") {
-            decision = "direct"
-            line.removeFirst(2)
-            line = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        } else {
-            decision = "proxy"
-        }
-
-        if let optionIndex = line.firstIndex(of: "$") {
-            line = String(line[..<optionIndex])
-        }
-
-        if let cidrRule = makeCIDRRule(line, decision: decision, order: order) {
-            return cidrRule
-        }
-
-        if line.hasPrefix("||"),
-           let domain = domainAfterDoublePipe(line) {
-            return AccessControlRuleImport(
-                matchType: .domainSuffix,
-                matchValue: domain,
-                decision: decision,
-                order: order,
-                source: source
-            )
-        }
-
-        if line.hasPrefix("."),
-           let domain = normalizedDomain(String(line.dropFirst())) {
-            return AccessControlRuleImport(
-                matchType: .domainSuffix,
-                matchValue: domain,
-                decision: decision,
-                order: order,
-                source: source
-            )
-        }
-
-        if line.hasPrefix("/"),
-           line.hasSuffix("/"),
-           line.count > 2 {
-            return AccessControlRuleImport(
-                matchType: .urlRegex,
-                matchValue: String(line.dropFirst().dropLast()),
-                decision: decision,
-                order: order,
-                source: source
-            )
-        }
-
-        if line.hasPrefix("|") || line.contains("*") || line.contains("^") || line.contains("://") {
-            return AccessControlRuleImport(
-                matchType: .urlRegex,
-                matchValue: wildcardURLRegex(from: line),
-                decision: decision,
-                order: order,
-                source: source
-            )
-        }
-
-        if let domain = normalizedDomain(line), domain.contains(".") {
-            return AccessControlRuleImport(
-                matchType: .domainSuffix,
-                matchValue: domain,
-                decision: decision,
-                order: order,
-                source: source
-            )
-        }
-
-        let keyword = line.lowercased()
-        guard keyword.isEmpty == false else { return nil }
-        return AccessControlRuleImport(
-            matchType: .domainKeyword,
-            matchValue: keyword,
-            decision: decision,
-            order: order,
-            source: source
-        )
-    }
-
-    // MARK: - Rule Helpers
-
-    private nonisolated static func makeCIDRRule(
-        _ value: String,
-        decision: String,
-        order: Int
-    ) -> AccessControlRuleImport? {
-        let parts = value.split(separator: "/")
-        guard parts.count == 2,
-              isIPv4Address(String(parts[0])),
-              let prefixLength = Int(parts[1]),
-              (0...32).contains(prefixLength)
-        else {
-            return nil
-        }
-
-        return AccessControlRuleImport(
-            matchType: .ipCIDR,
-            matchValue: value,
-            decision: decision,
-            order: order,
-            source: source
-        )
-    }
-
-    private nonisolated static func domainAfterDoublePipe(_ value: String) -> String? {
-        let domainCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-")
-        let startIndex = value.index(value.startIndex, offsetBy: 2)
-        var endIndex = startIndex
-
-        while endIndex < value.endIndex {
-            let character = value[endIndex]
-            guard String(character).rangeOfCharacter(from: domainCharacters) != nil else {
-                break
-            }
-            endIndex = value.index(after: endIndex)
-        }
-
-        guard endIndex > startIndex else { return nil }
-        return normalizedDomain(String(value[startIndex..<endIndex]))
-    }
-
-    private nonisolated static func normalizedDomain(_ value: String) -> String? {
-        let normalized = value
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
-
-        guard normalized.isEmpty == false,
-              normalized.range(of: #"^[a-z0-9.-]+$"#, options: .regularExpression) != nil,
-              normalized.contains("..") == false
-        else {
-            return nil
-        }
-
-        return normalized
-    }
-
-    private nonisolated static func isIPv4Address(_ value: String) -> Bool {
-        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count == 4 else { return false }
-        return parts.allSatisfy { UInt8($0) != nil }
-    }
-
-    private nonisolated static func wildcardURLRegex(from value: String) -> String {
-        var pattern = ""
-
-        for character in value {
-            switch character {
-            case "*":
-                pattern += ".*"
-            case "^":
-                pattern += #"[^A-Za-z0-9_\-.%]"#
-            case "|":
-                pattern += "^"
-            default:
-                pattern += NSRegularExpression.escapedPattern(for: String(character))
-            }
-        }
-
-        return pattern
-    }
 }

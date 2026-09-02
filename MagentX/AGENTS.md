@@ -8,6 +8,14 @@ Swift 类型声明必须写 `///` 文档注释，说明该类型承担的业务�
 
 MagentX app 层异常错误统一定义在 `MagentX/MagentXError.swift` 的 `MagentXError` 中。不要在 Controller、Service、Model 或 View 中新增局部 `Error`/`LocalizedError` enum；需要新错误时给 `MagentXError` 增加 case。
 
+## Libraries & Custom Implementations
+
+实现编解码、文件格式、协议、规则语法、加密、网络传输或数据库等通用能力前，必须先检查 Apple 系统框架、已有项目依赖和社区主流成熟库。只要它们能正确覆盖业务语义，优先使用现成 API 或库，不要重新手写解析器、编解码器或协议实现。例如 Base64 应直接使用 Foundation 的 `Data` Base64 API。
+
+选择第三方库时，优先考虑使用广泛、持续维护、文档和测试完整、许可证与本项目兼容、支持当前 Apple 平台和 Swift 版本的库，并避免为小功能引入体量或传递依赖明显过大的库。新增依赖前应说明候选方案、选择理由、许可证和维护状态。
+
+只有在系统 API、已有依赖和合适的主流库都无法满足需求，或引入依赖的成本明显高于有限的自定义实现时，才允许手写。手写前必须向用户说明未采用现成库的原因、支持的语法边界和关键边界情况，并为这些行为添加针对性测试。不得在多个 Service 中复制同一套自定义解析逻辑。
+
 ## MagentX UI Native Components
 
 MagentX View 默认使用 macOS 原生 SwiftUI 组件表达界面和交互，例如 `NavigationSplitView`、`List`、`Table`、`Form`、`ToolbarItem`、`Picker`、`Toggle`、`Button`、`Menu`、`ContentUnavailableView` 和 `.searchable`。不要先用 `HStack`、`VStack`、`ZStack` 或自定义 row/container 去手动画系统已有的表单、工具栏、表格、列表和状态按钮。
