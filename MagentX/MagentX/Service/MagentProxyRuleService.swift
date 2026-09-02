@@ -49,12 +49,9 @@ actor MagentProxyRuleService {
         return String(decoding: responseData, as: UTF8.self)
     }
 
-    /// 启动规则订阅同步并返回可等待的任务；任务完成值是生成 PAC 所需的规则快照。
-    ///
-    /// 网络等待、Base64 解码、规则解析和 SwiftData 合并都在服务执行器上完成，调用方可等待
-    /// `Task.value`，并在恢复到主执行器后更新界面。
-    func syncRuleFromUrl() -> Task<[PacFileService.Rule], Error> {
-        Task(priority: .userInitiated) {
+    /// 异步下载、解析并合并规则订阅；全部操作成功时返回 `true`，失败时回滚并返回 `false`。
+    func syncRuleFromUrl() async -> Bool {
+        do {
             let response = try await downloadFromRuleUrl()
             guard let decodedData = Data(base64Encoded: response, options: [.ignoreUnknownCharacters]) else {
                 throw MagentXError.invalidAclBase64Data
@@ -114,14 +111,15 @@ actor MagentProxyRuleService {
             }
 
             try modelContext.save()
-            return rulesByIdentity.values.map { proxyRule in
-                PacFileService.Rule(
-                    matchType: proxyRule.matchType,
-                    matchValue: proxyRule.matchValue,
-                    decision: proxyRule.decision.rawValue,
-                    order: proxyRule.order
-                )
-            }
+            return true
+        } catch {
+            modelContext.rollback()
+            MagentXLogger.error(
+                error,
+                category: .service,
+                message: "Failed to synchronize proxy rules"
+            )
+            return false
         }
     }
 

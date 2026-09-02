@@ -3,191 +3,35 @@
 //  MagentX
 //
 //  Author: MarlinL
-//  Responsibility: Provides the proxy node list, direct SwiftData pagination, and node CRUD UI.
+//  Responsibility: Provides the proxy node list and direct SwiftData CRUD UI.
 //
 
 import Magent
 import SwiftData
 import SwiftUI
 
-/// 代理节点管理页面，直接通过 SwiftData 完成分页查询、选择和增删改。
+/// 代理节点管理页面，通过 `body`、`add`、`update` 和 `delete` 管理节点。
+@MainActor
 struct ProxyNodesView: View {
     @Environment(\.modelContext) private var modelContext
+    @Query(sort: [
+        SortDescriptor(\MagentProxyNode.updatedAt, order: .reverse),
+        SortDescriptor(\MagentProxyNode.createdAt, order: .reverse),
+        SortDescriptor(\MagentProxyNode.address)
+    ]) private var nodes: [MagentProxyNode]
     @Binding var toolbarButtons: [ContentToolbarButton]
-    @State private var nodes: [MagentProxyNode] = []
     @State private var selectedNodeID: UUID?
-    @State private var loadError: String?
-    @State private var canLoadMore = true
-    @State private var isLoading = false
-    @State private var isAddingNode = false
+    @State private var isEditorPresented = false
     @State private var editingNodeID: UUID?
-
-    private static let pageSize = 50
-
-    private var editingNode: MagentProxyNode? {
-        guard let editingNodeID else { return nil }
-        return nodes.first { $0.id == editingNodeID }
-    }
-
-    var body: some View {
-        nodeList
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .onAppear {
-                toolbarButtons = [
-                    ContentToolbarButton(title: "添加代理节点", systemImage: "plus") {
-                        isAddingNode = true
-                    }
-                ]
-            }
-            .task {
-                loadFirstPage()
-            }
-            .sheet(isPresented: $isAddingNode) {
-                NodeFormSheet { nodeID in
-                    loadFirstPage(preferredSelectedNodeID: nodeID)
-                }
-            }
-            .sheet(
-                isPresented: Binding(
-                    get: { editingNodeID != nil },
-                    set: { isPresented in
-                        if isPresented == false {
-                            editingNodeID = nil
-                        }
-                    }
-                )
-            ) {
-                if let editingNode {
-                    NodeFormSheet(node: editingNode) { nodeID in
-                        editingNodeID = nil
-                        loadFirstPage(preferredSelectedNodeID: nodeID)
-                    }
-                }
-            }
-    }
-
-    @ViewBuilder
-    private var nodeList: some View {
-        if let loadError {
-            ContentUnavailableView(
-                "节点读取失败",
-                systemImage: "exclamationmark.triangle",
-                description: Text(loadError)
-            )
-        } else if nodes.isEmpty {
-            ContentUnavailableView(
-                "暂无代理节点",
-                systemImage: "server.rack",
-                description: Text("添加代理节点后会显示在这里")
-            )
-        } else {
-            List(selection: $selectedNodeID) {
-                ForEach(nodes, id: \.id) { node in
-                    NodeListRow(
-                        node: node,
-                        onEdit: {
-                            editingNodeID = node.id
-                        },
-                        onDelete: {
-                            deleteNode(node)
-                        }
-                    )
-                    .tag(node.id)
-                    .onAppear {
-                        loadMoreNodesIfNeeded(currentNode: node)
-                    }
-                }
-            }
-            .listStyle(.inset)
-        }
-    }
-
-    private func loadFirstPage(preferredSelectedNodeID: UUID? = nil) {
-        nodes = []
-        canLoadMore = true
-        loadNextPage(preferredSelectedNodeID: preferredSelectedNodeID)
-    }
-
-    private func loadNextPage(preferredSelectedNodeID: UUID? = nil) {
-        guard canLoadMore, isLoading == false else { return }
-
-        isLoading = true
-        defer { isLoading = false }
-
-        var descriptor = FetchDescriptor<MagentProxyNode>(
-            sortBy: [
-                SortDescriptor(\.updatedAt, order: .reverse),
-                SortDescriptor(\.createdAt, order: .reverse),
-                SortDescriptor(\.address)
-            ]
-        )
-        descriptor.fetchOffset = nodes.count
-        descriptor.fetchLimit = Self.pageSize + 1
-
-        do {
-            let fetchedNodes = try modelContext.fetch(descriptor)
-            nodes.append(contentsOf: fetchedNodes.prefix(Self.pageSize))
-            canLoadMore = fetchedNodes.count > Self.pageSize
-            loadError = nil
-
-            let desiredNodeID = preferredSelectedNodeID ?? selectedNodeID
-            if let desiredNodeID, nodes.contains(where: { $0.id == desiredNodeID }) {
-                selectedNodeID = desiredNodeID
-            } else if selectedNodeID == nil || nodes.contains(where: { $0.id == selectedNodeID }) == false {
-                selectedNodeID = nodes.first?.id
-            }
-        } catch {
-            canLoadMore = false
-            loadError = error.localizedDescription
-        }
-    }
-
-    private func loadMoreNodesIfNeeded(currentNode node: MagentProxyNode) {
-        guard node.id == nodes.last?.id else { return }
-        loadNextPage()
-    }
-
-    private func deleteNode(_ node: MagentProxyNode) {
-        let targetNodeID: UUID? = node.id
-        let policyDescriptor = FetchDescriptor<ProxyPolicy>(
-            predicate: #Predicate<ProxyPolicy> { policy in
-                policy.magentNodeID == targetNodeID
-            }
-        )
-
-        do {
-            guard try modelContext.fetchCount(policyDescriptor) == 0 else {
-                loadError = MagentXError.proxyNodeInUse(node.id).localizedDescription
-                return
-            }
-
-            modelContext.delete(node)
-            try modelContext.save()
-            if selectedNodeID == node.id {
-                selectedNodeID = nil
-            }
-            loadFirstPage()
-        } catch {
-            modelContext.rollback()
-            loadError = error.localizedDescription
-        }
-    }
-}
-
-/// 节点新增和编辑表单 sheet，直接将 `MagentProxyNode` 写入 SwiftData。
-private struct NodeFormSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.modelContext) private var modelContext
-    private let node: MagentProxyNode?
-    private let onSave: (UUID) -> Void
-    @State private var name: String
-    @State private var type: ProxyNodeType
-    @State private var address: String
-    @State private var port: Int
-    @State private var cipher: ProxyCipher
-    @State private var password: String
-    @State private var timeout: Int
-    @State private var saveError: String?
+    @State private var editorName = ""
+    @State private var editorType = ProxyNodeType.shadowsocks
+    @State private var editorAddress = ""
+    @State private var editorPort = 8388
+    @State private var editorCipher = ProxyCipher.chacha20IetfPoly1305
+    @State private var editorPassword = ""
+    @State private var editorTimeout = 30
+    @State private var editorError: String?
+    @State private var deleteError: String?
 
     private static let portRange = 1...65535
     private static let portFormatter: NumberFormatter = {
@@ -206,193 +50,291 @@ private struct NodeFormSheet: View {
         return formatter
     }()
 
-    /// 创建节点新增或编辑表单，并用已有节点填充默认值。
-    init(node: MagentProxyNode? = nil, onSave: @escaping (UUID) -> Void) {
-        self.node = node
-        self.onSave = onSave
-        _name = State(initialValue: node?.name ?? "")
-        _type = State(initialValue: node?.type ?? .shadowsocks)
-        _address = State(initialValue: node?.address ?? "")
-        _port = State(initialValue: node?.port ?? 8388)
-        _cipher = State(initialValue: node?.cipher ?? .chacha20IetfPoly1305)
-        _password = State(initialValue: node?.password ?? "")
-        _timeout = State(initialValue: node.map { max(1, Int($0.timeout.rounded())) } ?? 30)
-    }
-
-    private var title: LocalizedStringKey {
-        LocalizedStringKey(node == nil ? "添加节点" : "修改节点")
-    }
-
-    private var actionTitle: LocalizedStringKey {
-        LocalizedStringKey(node == nil ? "添加" : "保存")
-    }
-
-    private var canSave: Bool {
-        MagentProxyNode.validationErrors(
-            address: address,
-            port: port,
-            password: password,
-            timeout: TimeInterval(timeout)
-        ).isEmpty
-    }
-
     var body: some View {
-        Form {
-            Section {
-                TextField("名称（可选）", text: $name)
+        Group {
+            if nodes.isEmpty {
+                ContentUnavailableView(
+                    "暂无代理节点",
+                    systemImage: "server.rack",
+                    description: Text("添加代理节点后会显示在这里")
+                )
+            } else {
+                List(selection: $selectedNodeID) {
+                    ForEach(nodes, id: \.id) { node in
+                        HStack(alignment: .center, spacing: 12) {
+                            Image(systemName: "server.rack")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 22, alignment: .center)
 
-                Picker("类型", selection: $type) {
-                    ForEach(ProxyNodeType.allCases, id: \.rawValue) { type in
-                        Text(type.rawValue)
-                            .tag(type)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(node.displayName)
+                                    .font(.body.weight(.medium))
+                                    .lineLimit(1)
+
+                                Text("\(node.address):\(node.port) - \(node.type.rawValue)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+
+                            Spacer()
+
+                            Button {
+                                editingNodeID = node.id
+                                editorName = node.name ?? ""
+                                editorType = node.type
+                                editorAddress = node.address
+                                editorPort = node.port
+                                editorCipher = node.cipher
+                                editorPassword = node.password
+                                editorTimeout = max(1, Int(node.timeout.rounded()))
+                                editorError = nil
+                                isEditorPresented = true
+                            } label: {
+                                Image(systemName: "pencil")
+                                    .frame(width: 24, height: 24)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("修改节点")
+
+                            Button(role: .destructive) {
+                                delete(node)
+                            } label: {
+                                Image(systemName: "trash")
+                                    .frame(width: 24, height: 24)
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundStyle(.red)
+                            .help("删除节点")
+                        }
+                        .padding(.vertical, 4)
+                        .tag(node.id)
                     }
                 }
-                .pickerStyle(.menu)
-
-                TextField("地址", text: $address)
-                TextField("端口", value: $port, formatter: Self.portFormatter)
-
-                Picker("加密", selection: $cipher) {
-                    ForEach(ProxyCipher.allCases, id: \.rawValue) { cipher in
-                        Text(cipher.rawValue)
-                            .tag(cipher)
-                    }
-                }
-                .pickerStyle(.menu)
-
-                SecureField("密码", text: $password)
-                TextField("超时", value: $timeout, formatter: Self.timeoutFormatter)
-            } header: {
-                Text(title)
-                    .font(.title3.weight(.semibold))
+                .listStyle(.inset)
             }
-
-            if let saveError {
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            toolbarButtons = [
+                ContentToolbarButton(title: "添加代理节点", systemImage: "plus") {
+                    editingNodeID = nil
+                    editorName = ""
+                    editorType = .shadowsocks
+                    editorAddress = ""
+                    editorPort = 8388
+                    editorCipher = .chacha20IetfPoly1305
+                    editorPassword = ""
+                    editorTimeout = 30
+                    editorError = nil
+                    isEditorPresented = true
+                }
+            ]
+        }
+        .sheet(isPresented: $isEditorPresented) {
+            Form {
                 Section {
-                    Text(saveError)
-                        .foregroundStyle(.red)
+                    TextField("名称（可选）", text: $editorName)
+
+                    Picker("类型", selection: $editorType) {
+                        ForEach(ProxyNodeType.allCases, id: \.rawValue) { type in
+                            Text(type.rawValue)
+                                .tag(type)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    TextField("地址", text: $editorAddress)
+                    TextField("端口", value: $editorPort, formatter: Self.portFormatter)
+
+                    Picker("加密", selection: $editorCipher) {
+                        ForEach(ProxyCipher.allCases, id: \.rawValue) { cipher in
+                            Text(cipher.rawValue)
+                                .tag(cipher)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    SecureField("密码", text: $editorPassword)
+                    TextField("超时", value: $editorTimeout, formatter: Self.timeoutFormatter)
+                } header: {
+                    Text(LocalizedStringKey(editingNodeID == nil ? "添加节点" : "修改节点"))
+                        .font(.title3.weight(.semibold))
+                }
+
+                if let editorError {
+                    Section {
+                        Text(editorError)
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                Section {
+                    ControlGroup {
+                        Button("取消", role: .cancel) {
+                            isEditorPresented = false
+                        }
+                        .buttonStyle(.glass)
+
+                        Button {
+                            let didSave = editingNodeID == nil ? add() : update()
+                            if didSave {
+                                isEditorPresented = false
+                            }
+                        } label: {
+                            Text(LocalizedStringKey(editingNodeID == nil ? "添加" : "保存"))
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(MagentProxyNode.validationErrors(
+                            address: editorAddress,
+                            port: editorPort,
+                            password: editorPassword,
+                            timeout: TimeInterval(editorTimeout)
+                        ).isEmpty == false)
+                        .buttonStyle(.glassProminent)
+                    }
                 }
             }
-
-            Section {
-                HStack {
-                    Spacer()
-
-                    Button("取消") {
-                        dismiss()
-                    }
-
-                    Button {
-                        saveNode()
-                    } label: {
-                        Text(actionTitle)
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(canSave == false)
-                }
+            .formStyle(.grouped)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+            .frame(width: 360)
+            .onChange(of: editorPort) { _, newValue in
+                editorPort = min(max(newValue, Self.portRange.lowerBound), Self.portRange.upperBound)
+            }
+            .onChange(of: editorTimeout) { _, newValue in
+                editorTimeout = max(1, newValue)
             }
         }
-        .formStyle(.grouped)
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
-        .frame(width: 360)
-        .onChange(of: port) { _, newValue in
-            port = min(max(newValue, Self.portRange.lowerBound), Self.portRange.upperBound)
-        }
-        .onChange(of: timeout) { _, newValue in
-            timeout = max(1, newValue)
+        .alert(
+            "代理节点",
+            isPresented: Binding(
+                get: { deleteError != nil },
+                set: { isPresented in
+                    if isPresented == false {
+                        deleteError = nil
+                    }
+                }
+            )
+        ) {
+            Button("好", role: .cancel) {
+                deleteError = nil
+            }
+        } message: {
+            Text(deleteError ?? "")
         }
     }
 
-    private func saveNode() {
-        guard canSave else { return }
+    /// 新增表单当前填写的代理节点，保存成功后选择新节点。
+    ///
+    /// - Returns: 节点通过校验并成功写入 SwiftData 时返回 `true`。
+    private func add() -> Bool {
+        let validationErrors = MagentProxyNode.validationErrors(
+            address: editorAddress,
+            port: editorPort,
+            password: editorPassword,
+            timeout: TimeInterval(editorTimeout)
+        )
+        guard let validationError = validationErrors.first else {
+            let node = MagentProxyNode(
+                name: editorName,
+                type: editorType,
+                address: editorAddress,
+                port: editorPort,
+                cipher: editorCipher,
+                password: editorPassword,
+                timeout: TimeInterval(editorTimeout)
+            )
+            modelContext.insert(node)
 
-        let savedNode: MagentProxyNode
-        if let node {
-            node.update(
-                name: name,
-                type: type,
-                address: address,
-                port: port,
-                cipher: cipher,
-                password: password,
-                timeout: TimeInterval(timeout)
-            )
-            savedNode = node
-        } else {
-            let newNode = MagentProxyNode(
-                name: name,
-                type: type,
-                address: address,
-                port: port,
-                cipher: cipher,
-                password: password,
-                timeout: TimeInterval(timeout)
-            )
-            modelContext.insert(newNode)
-            savedNode = newNode
+            do {
+                try modelContext.save()
+                selectedNodeID = node.id
+                editorError = nil
+                return true
+            } catch {
+                modelContext.rollback()
+                editorError = error.localizedDescription
+                return false
+            }
         }
+
+        editorError = validationError.localizedDescription
+        return false
+    }
+
+    /// 按业务 id 更新表单对应节点的可编辑字段，保存成功后保持该节点选中。
+    ///
+    /// - Returns: 找到节点、通过校验并成功写入 SwiftData 时返回 `true`。
+    private func update() -> Bool {
+        guard let editingNodeID,
+              let node = nodes.first(where: { $0.id == editingNodeID }) else {
+            if let editingNodeID {
+                editorError = MagentXError.missingMagentProxyNode(editingNodeID).localizedDescription
+            }
+            return false
+        }
+
+        let validationErrors = MagentProxyNode.validationErrors(
+            address: editorAddress,
+            port: editorPort,
+            password: editorPassword,
+            timeout: TimeInterval(editorTimeout)
+        )
+        guard let validationError = validationErrors.first else {
+            node.update(
+                name: editorName,
+                type: editorType,
+                address: editorAddress,
+                port: editorPort,
+                cipher: editorCipher,
+                password: editorPassword,
+                timeout: TimeInterval(editorTimeout)
+            )
+
+            do {
+                try modelContext.save()
+                selectedNodeID = node.id
+                editorError = nil
+                return true
+            } catch {
+                modelContext.rollback()
+                editorError = error.localizedDescription
+                return false
+            }
+        }
+
+        editorError = validationError.localizedDescription
+        return false
+    }
+
+    /// 删除指定节点；节点仍被策略引用时拒绝删除并保留原数据。
+    ///
+    /// - Parameter node: 准备从 SwiftData 删除的代理节点。
+    private func delete(_ node: MagentProxyNode) {
+        let targetNodeID: UUID? = node.id
+        let policyDescriptor = FetchDescriptor<ProxyPolicy>(
+            predicate: #Predicate<ProxyPolicy> { policy in
+                policy.magentNodeID == targetNodeID
+            }
+        )
 
         do {
+            guard try modelContext.fetchCount(policyDescriptor) == 0 else {
+                deleteError = MagentXError.proxyNodeInUse(node.id).localizedDescription
+                return
+            }
+
+            modelContext.delete(node)
             try modelContext.save()
-            onSave(savedNode.id)
-            dismiss()
+            if selectedNodeID == node.id {
+                selectedNodeID = nil
+            }
+            deleteError = nil
         } catch {
             modelContext.rollback()
-            saveError = error.localizedDescription
+            deleteError = error.localizedDescription
         }
-    }
-}
-
-/// 节点列表中的单行展示和操作按钮。
-private struct NodeListRow: View {
-    let node: MagentProxyNode
-    let onEdit: () -> Void
-    let onDelete: () -> Void
-
-    private var endpoint: String {
-        "\(node.address):\(node.port)"
-    }
-
-    private var metadata: String {
-        "\(endpoint) - \(node.type.rawValue)"
-    }
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Image(systemName: "server.rack")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 22, alignment: .center)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(node.displayName)
-                    .font(.body.weight(.medium))
-                    .lineLimit(1)
-
-                Text(metadata)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer()
-
-            Button(action: onEdit) {
-                Image(systemName: "pencil")
-                    .frame(width: 24, height: 24)
-            }
-            .buttonStyle(.borderless)
-            .help("修改节点")
-
-            Button(role: .destructive, action: onDelete) {
-                Image(systemName: "trash")
-                    .frame(width: 24, height: 24)
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.red)
-            .help("删除节点")
-        }
-        .padding(.vertical, 4)
     }
 }

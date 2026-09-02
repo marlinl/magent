@@ -93,6 +93,7 @@
 "Downloaded rules data is not valid Base64" = "Downloaded rules data is not valid Base64.";
 "Decoded rules data is not valid UTF-8 text" = "Decoded rules data is not valid UTF-8 text.";
 "Proxy rule does not exist: %d" = "Proxy rule does not exist: %d.";
+"Proxy rule synchronization failed" = "Proxy rule synchronization failed.";
 "Match value is required" = "Match value is required.";
 "Decision must be direct or proxy" = "Decision must be direct or proxy.";
 "Address is required" = "Address is required.";

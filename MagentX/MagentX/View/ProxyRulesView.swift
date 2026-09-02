@@ -6,20 +6,114 @@
 //  Responsibility: Displays and directly manages persisted proxy rules.
 //
 
+import AppKit
 import Foundation
 import Magent
 import SwiftData
 import SwiftUI
 
+/// 包装原生搜索输入框，在动态加入工具栏后接管键盘焦点并把编辑状态同步回 SwiftUI。
+@MainActor
+private struct AutoFocusedSearchField: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var isPresented: Bool
+    let onSubmit: (String) -> Void
+
+    /// 创建负责 AppKit 委托与提交动作转发的协调器。
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    /// 创建原生搜索框；焦点请求会在控件真正进入窗口时执行。
+    func makeNSView(context: Context) -> FocusRequestingSearchField {
+        let searchField = FocusRequestingSearchField()
+        searchField.placeholderString = String(localized: "搜索")
+        searchField.sendsWholeSearchString = true
+        searchField.delegate = context.coordinator
+        searchField.target = context.coordinator
+        searchField.action = #selector(Coordinator.submit(_:))
+        searchField.setFocusRequested(isPresented)
+        return searchField
+    }
+
+    /// 把最新 SwiftUI 文本与展开状态同步到现有 AppKit 搜索框。
+    func updateNSView(_ searchField: FocusRequestingSearchField, context: Context) {
+        context.coordinator.parent = self
+        if searchField.stringValue != text {
+            searchField.stringValue = text
+        }
+        searchField.setFocusRequested(isPresented)
+    }
+
+    /// 连接 `NSSearchField` 的输入、失焦和提交事件与 SwiftUI 状态。
+    @MainActor
+    final class Coordinator: NSObject, NSSearchFieldDelegate {
+        var parent: AutoFocusedSearchField
+
+        /// 保存当前 representable，以便委托回调写回对应绑定。
+        init(parent: AutoFocusedSearchField) {
+            self.parent = parent
+        }
+
+        /// 输入变化时立即更新 SwiftUI 持有的搜索文本。
+        func controlTextDidChange(_ notification: Notification) {
+            guard let searchField = notification.object as? NSSearchField else { return }
+            parent.text = searchField.stringValue
+        }
+
+        /// 编辑结束表示输入框已经失焦，通知页面收回为放大镜按钮。
+        func controlTextDidEndEditing(_ notification: Notification) {
+            guard let searchField = notification.object as? NSSearchField else { return }
+            parent.text = searchField.stringValue
+            parent.isPresented = false
+        }
+
+        /// 用户按下回车或点击搜索图标时提交当前搜索文本。
+        @objc func submit(_ searchField: NSSearchField) {
+            parent.text = searchField.stringValue
+            parent.onSubmit(searchField.stringValue)
+        }
+    }
+}
+
+/// 在加入 `NSWindow` 后兑现一次待处理的 first-responder 请求。
+@MainActor
+private final class FocusRequestingSearchField: NSSearchField {
+    private var isFocusRequested = false
+
+    /// 记录焦点目标；如果控件已进入窗口则立即把它设为 first responder。
+    func setFocusRequested(_ isRequested: Bool) {
+        isFocusRequested = isRequested
+        guard isRequested else { return }
+        focusIfPossible()
+    }
+
+    /// 控件进入或离开窗口后重新检查尚未兑现的焦点请求。
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard isFocusRequested else { return }
+        focusIfPossible()
+    }
+
+    /// 在窗口可用且当前尚未编辑时，让原生搜索框接管键盘输入。
+    private func focusIfPossible() {
+        guard let window else { return }
+        if let editor = currentEditor(), window.firstResponder === editor {
+            return
+        }
+        window.makeFirstResponder(self)
+    }
+}
+
 /// 代理规则页面，通过初始化、新增、删除、搜索、更新和同步六类页面操作管理 `MagentProxyRule`。
 @MainActor
 struct ProxyRulesView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
     @State private var proxyRules: [MagentProxyRule] = []
     @State private var searchText = ""
     @State private var submittedSearchText = ""
     @State private var isSearchPresented = false
-    @FocusState private var isSearchFocused: Bool
     @State private var loadError: String?
     @State private var canLoadMore = false
     @State private var isRefreshing = false
@@ -73,21 +167,31 @@ struct ProxyRulesView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                guard isSearchPresented else { return }
+                isSearchPresented = false
+            }
+        )
+        .onChange(of: scenePhase) { _, phase in
+            guard phase != .active, isSearchPresented else { return }
+            isSearchPresented = false
+        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 if isSearchPresented {
-                    TextField("搜索 matchValue", text: $searchText)
-                        .textFieldStyle(.roundedBorder)
+                    AutoFocusedSearchField(
+                        text: $searchText,
+                        isPresented: $isSearchPresented
+                    ) { submittedText in
+                        submittedSearchText = submittedText
+                        fetchLimit = Self.pageSize
+                        search()
+                    }
+                        .controlSize(.regular)
                         .frame(width: 220)
-                        .focused($isSearchFocused)
-                        .onAppear {
-                            isSearchFocused = true
-                        }
-                        .onSubmit {
-                            submittedSearchText = searchText
-                            fetchLimit = Self.pageSize
-                            search()
-                        }
+                        .fixedSize(horizontal: false, vertical: true)
                 } else {
                     Button {
                         isSearchPresented = true
@@ -110,6 +214,7 @@ struct ProxyRulesView: View {
         .onAppear {
             toolbarButtons = [
                 ContentToolbarButton(title: "增加规则", systemImage: "plus") {
+                    isSearchPresented = false
                     isAddingRules = true
                 },
                 ContentToolbarButton(
@@ -450,9 +555,11 @@ struct ProxyRulesView: View {
     /// 下载订阅规则、合并数据库并重写 PAC，期间同步主窗口工具栏状态。
     private func sync() {
         guard isRefreshing == false else { return }
+        isSearchPresented = false
         isRefreshing = true
         toolbarButtons = [
             ContentToolbarButton(title: "增加规则", systemImage: "plus") {
+                isSearchPresented = false
                 isAddingRules = true
             },
             ContentToolbarButton(
@@ -470,6 +577,7 @@ struct ProxyRulesView: View {
                 isRefreshing = false
                 toolbarButtons = [
                     ContentToolbarButton(title: "增加规则", systemImage: "plus") {
+                        isSearchPresented = false
                         isAddingRules = true
                     },
                     ContentToolbarButton(
@@ -485,11 +593,23 @@ struct ProxyRulesView: View {
                 let settings = GeneralSettings.load()
                 let now = Date.now
                 let proxyEndpoint = try PacFileService.ProxyEndpoint(generalSettings: settings)
-                let ruleService = MagentProxyRuleService(modelContainer: modelContext.container)
-                let syncFuture = await ruleService.syncRuleFromUrl()
-                let pacRules = try await syncFuture.value
+                let modelContainer = modelContext.container
+                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
+                guard await ruleService.syncRuleFromUrl() else {
+                    throw MagentXError.proxyRuleSynchronizationFailed
+                }
                 let pacDirectoryURL = PacFileService.shared.directoryURL
-                try await Task.detached(priority: .utility) {
+                _ = try await Task.detached(priority: .utility) {
+                    let pacModelContext = ModelContext(modelContainer)
+                    let proxyRules = try pacModelContext.fetch(FetchDescriptor<MagentProxyRule>())
+                    let pacRules = proxyRules.map { proxyRule in
+                        PacFileService.Rule(
+                            matchType: proxyRule.matchType,
+                            matchValue: proxyRule.matchValue,
+                            decision: proxyRule.decision.rawValue,
+                            order: proxyRule.order
+                        )
+                    }
                     try PacFileService.writeProxyHostPAC(
                         rules: pacRules,
                         proxyEndpoint: proxyEndpoint,

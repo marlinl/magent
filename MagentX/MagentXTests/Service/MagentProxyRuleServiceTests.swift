@@ -97,13 +97,13 @@ struct MagentProxyRuleServiceTests {
         }
 
         let service = MagentProxyRuleService(modelContainer: container)
-        let future = await service.syncRuleFromUrl()
-        let pacRules = try await future.value
+        let didSync = await service.syncRuleFromUrl()
 
         let resultContext = ModelContext(container)
         let storedRules = try resultContext.fetch(FetchDescriptor<MagentProxyRule>())
         let rulesByValue = Dictionary(uniqueKeysWithValues: storedRules.map { ($0.matchValue, $0) })
 
+        #expect(didSync)
         #expect(storedRules.count == 6)
         #expect(rulesByValue["google.com"]?.decision == .direct)
         #expect(rulesByValue["google.com"]?.order == 100)
@@ -115,11 +115,10 @@ struct MagentProxyRuleServiceTests {
         #expect(rulesByValue["10.0.0.0/8"]?.matchType == .ipCIDR)
         #expect(rulesByValue["telegram"]?.matchType == .domainKeyword)
         #expect(rulesByValue[#"https?:\/\/.*\.sample\.com"#]?.matchType == .urlRegex)
-        #expect(pacRules.count == storedRules.count)
     }
 
-    /// 验证无效 Base64 会通过 Future 原样传播应用层错误，且不会写入规则。
-    @Test func syncRuleFromURLPropagatesInvalidBase64Error() async throws {
+    /// 验证无效 Base64 会返回 `false`，且不会写入规则。
+    @Test func syncRuleFromURLReturnsFalseForInvalidBase64() async throws {
         let container = try makeContainer()
         let fileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("invalid-rules-\(UUID().uuidString).txt", isDirectory: false)
@@ -139,11 +138,9 @@ struct MagentProxyRuleServiceTests {
         }
 
         let service = MagentProxyRuleService(modelContainer: container)
-        let future = await service.syncRuleFromUrl()
+        let didSync = await service.syncRuleFromUrl()
 
-        await #expect(throws: MagentXError.invalidAclBase64Data) {
-            try await future.value
-        }
+        #expect(didSync == false)
         let resultContext = ModelContext(container)
         #expect(try resultContext.fetchCount(FetchDescriptor<MagentProxyRule>()) == 0)
     }
