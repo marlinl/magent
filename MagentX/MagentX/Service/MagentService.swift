@@ -27,7 +27,7 @@ actor MagentService {
         threadNumber: Int,
         eventLoopGroup: EventLoopGroup,
         pacEndpoint: MagentProxyService.ListenEndpoint,
-        pacFileURL: URL = PacFileService.proxyHostPACURL(in: PacFileService.defaultDirectoryURL())
+        pacFileURL: URL = MagentXApp.localDirectoryURL.appendingPathComponent("pac.json", isDirectory: false)
     ) {
         self.threadNumber = threadNumber
         self.eventLoopGroup = eventLoopGroup
@@ -81,8 +81,8 @@ actor MagentService {
         }
     }
 
-    /// 启动 PAC HTTP 监听器，对任意请求返回当前 `proxy.pac` 内容。
-    func startPACServer(proxyEndpoint: MagentProxyService.ListenEndpoint) async throws {
+    /// 启动 PAC HTTP 监听器，对任意请求返回当前 `pac.json` 中的 PAC 内容。
+    func startPACServer() async throws {
         guard pacChannel == nil else { return }
         let pacEndpoint = pacEndpoint
         let pacFileURL = pacFileURL
@@ -98,7 +98,6 @@ actor MagentService {
                 .childChannelInitializer { channel in
                     channel.pipeline.addHandler(
                         PACHTTPHandler(
-                            proxyEndpoint: proxyEndpoint,
                             pacFileURL: pacFileURL
                         )
                     )
@@ -160,23 +159,20 @@ actor MagentService {
         typealias InboundIn = ByteBuffer
         typealias OutboundOut = ByteBuffer
 
-        private let proxyEndpoint: MagentProxyService.ListenEndpoint
         private let pacFileURL: URL
 
-        init(proxyEndpoint: MagentProxyService.ListenEndpoint, pacFileURL: URL) {
-            self.proxyEndpoint = proxyEndpoint
+        init(pacFileURL: URL) {
             self.pacFileURL = pacFileURL
         }
 
         /// 收到请求后在全局 NIO 线程池读取 PAC 文件，响应完成后关闭连接。
         func channelRead(context: ChannelHandlerContext, data: NIOAny) {
             _ = unwrapInboundIn(data)
-            let proxyEndpoint = proxyEndpoint
             let pacFileURL = pacFileURL
             let loopBoundContext = context.loopBound
 
             NIOThreadPool.singleton.runIfActive(eventLoop: context.eventLoop) {
-                Self.currentPACBody(proxyEndpoint: proxyEndpoint, pacFileURL: pacFileURL)
+                Self.currentPACBody(pacFileURL: pacFileURL)
             }.whenComplete { result in
                 let context = loopBoundContext.value
                 switch result {
@@ -208,23 +204,12 @@ actor MagentService {
             context.close(promise: nil)
         }
 
-        private static func currentPACBody(
-            proxyEndpoint: MagentProxyService.ListenEndpoint,
-            pacFileURL: URL
-        ) -> Data {
+        private static func currentPACBody(pacFileURL: URL) -> Data {
             if let data = try? Data(contentsOf: pacFileURL), data.isEmpty == false {
                 return data
             }
 
-            do {
-                let endpoint = try PacFileService.ProxyEndpoint(
-                    address: proxyEndpoint.address,
-                    port: proxyEndpoint.port
-                )
-                return Data(PacFileService.makeProxyHostPAC(rules: [], proxyEndpoint: endpoint).utf8)
-            } catch {
-                return Data("function FindProxyForURL(url, host) { return \"DIRECT\"; }".utf8)
-            }
+            return Data("function FindProxyForURL(url, host) { return \"DIRECT\"; }".utf8)
         }
 
         private static func makeResponse(bodyData: Data) -> Data {

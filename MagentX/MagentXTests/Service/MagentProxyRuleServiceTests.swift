@@ -20,6 +20,16 @@ struct MagentProxyRuleServiceTests {
     @Test func syncRuleFromURLMergesDownloadedRules() async throws {
         let container = try makeContainer()
         let context = ModelContext(container)
+        let pacFileURL = MagentXApp.localDirectoryURL
+            .appendingPathComponent("pac.json", isDirectory: false)
+        let originalPACData = try? Data(contentsOf: pacFileURL)
+        defer {
+            if let originalPACData {
+                try? originalPACData.write(to: pacFileURL, options: .atomic)
+            } else {
+                try? FileManager.default.removeItem(at: pacFileURL)
+            }
+        }
         let oldDate = Date(timeIntervalSince1970: 100)
         context.insert(MagentProxyRule(
             id: 0,
@@ -87,6 +97,12 @@ struct MagentProxyRuleServiceTests {
         #expect(rulesByValue["10.0.0.0/8"]?.matchType == .ipCIDR)
         #expect(rulesByValue["telegram"]?.matchType == .domainKeyword)
         #expect(rulesByValue[#"https?:\/\/.*\.sample\.com"#]?.matchType == .urlRegex)
+
+        let pac = try String(contentsOf: pacFileURL, encoding: .utf8)
+        #expect(pacFileURL.lastPathComponent == "pac.json")
+        #expect(pac.contains("function FindProxyForURL(url, host)"))
+        #expect(pac.contains(#"{ type: "domainSuffix", value: "google.com", decision: "direct" }"#))
+        #expect(pac.contains(#"{ type: "ipCIDR", value: "10.0.0.0", mask: "255.0.0.0", decision: "proxy" }"#))
     }
 
     /// 验证无效 Base64 会传播原始应用错误，且不会写入规则。

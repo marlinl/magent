@@ -91,7 +91,7 @@ actor MagentProxyService {
     /// 启动 PAC 文件 HTTP 监听服务，监听地址和端口来自 `GeneralSettings`。
     func startPacServer() async throws {
         guard isPacServerRunning == false else { return }
-        try await proxyService.startPACServer(proxyEndpoint: configuration.proxyEndpoint)
+        try await proxyService.startPACServer()
         isPacServerRunning = true
         MagentXLogger.info(
             "Started PAC listener",
@@ -241,8 +241,8 @@ nonisolated private final class ProxyService {
     }
 
     /// 打开由 `MagentService` 管理的 PAC HTTP 监听端口。
-    func startPACServer(proxyEndpoint: MagentProxyService.ListenEndpoint) async throws {
-        try await magentService.startPACServer(proxyEndpoint: proxyEndpoint)
+    func startPACServer() async throws {
+        try await magentService.startPACServer()
     }
 
     /// 关闭由 `MagentService` 管理的 PAC HTTP 监听端口。

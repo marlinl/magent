@@ -122,6 +122,10 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
 struct MagentXApp: App {
     static let mainWindowID = "main"
 
+    /// 应用在当前沙箱中持久化本地文件的根目录。
+    nonisolated static let localDirectoryURL = URL.applicationSupportDirectory
+        .appendingPathComponent(Bundle.main.bundleIdentifier ?? "MagentX", isDirectory: true)
+
     @NSApplicationDelegateAdaptor(MagentXAppDelegate.self) private var appDelegate
     @State private var isMenuBarInserted: Bool
     private let modelContainer: ModelContainer
@@ -130,7 +134,7 @@ struct MagentXApp: App {
     init() {
         do {
             let container = try Self.makeModelContainer()
-            let enableMenuBar = Self.initialMenuBarEnabled()
+            let enableMenuBar = GeneralSettings.load().enableMenuBar
             modelContainer = container
             _isMenuBarInserted = State(initialValue: enableMenuBar)
             MagentXAppDelegate.applyBackgroundPreference(enableMenuBar)
@@ -172,15 +176,9 @@ struct MagentXApp: App {
             ProxyPolicyRule.self
         ])
         let fileManager = FileManager.default
-        let directoryURL = try fileManager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent(Bundle.main.bundleIdentifier ?? "MagentX", isDirectory: true)
-        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        let storeURL = directoryURL.appendingPathComponent("MagentX.store", isDirectory: false)
+        try fileManager.createDirectory(at: localDirectoryURL, withIntermediateDirectories: true)
+        let storeURL = localDirectoryURL.appendingPathComponent("MagentX.store", isDirectory: false)
         let configuration = ModelConfiguration(schema: schema, url: storeURL)
         return try ModelContainer(for: schema, configurations: [configuration])
-    }
-
-    private static func initialMenuBarEnabled() -> Bool {
-        GeneralSettings.load().enableMenuBar
     }
 }

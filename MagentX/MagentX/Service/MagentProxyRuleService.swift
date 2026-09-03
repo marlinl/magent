@@ -122,26 +122,31 @@ actor MagentProxyRuleService {
 
     private func writePACFile() async throws {
         let pacRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>()).map { proxyRule in
-            PacFileService.Rule(
+            PACUtil.Rule(
                 matchType: proxyRule.matchType,
                 matchValue: proxyRule.matchValue,
-                decision: proxyRule.decision.rawValue,
+                decision: proxyRule.decision,
                 order: proxyRule.order
             )
         }
-        let (proxyEndpoint, directoryURL) = try await MainActor.run {
-            (
-                try PacFileService.ProxyEndpoint(generalSettings: GeneralSettings.load()),
-                PacFileService.shared.directoryURL
+        let (proxyEndpoint, pacFileURL) = try await MainActor.run {
+            let generalSettings = GeneralSettings.load()
+            return (
+                try PACUtil.ProxyEndpoint(
+                    address: generalSettings.proxyListenAddress,
+                    port: generalSettings.proxyListenPort
+                ),
+                MagentXApp.localDirectoryURL.appendingPathComponent("pac.json", isDirectory: false)
             )
         }
-        _ = try await MagentXAsyncExecutor.shared.runBlocking {
-            try PacFileService.writeProxyHostPAC(
-                rules: pacRules,
-                proxyEndpoint: proxyEndpoint,
-                directoryURL: directoryURL
+        let pacBody = PACUtil.makePACBody(rules: pacRules, proxyEndpoint: proxyEndpoint)
+
+        try await MagentXAsyncExecutor.shared.runBlocking {
+            try FileManager.default.createDirectory(
+                at: pacFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
             )
+            try pacBody.write(to: pacFileURL, atomically: true, encoding: .utf8)
         }
     }
-
 }
