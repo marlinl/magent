@@ -15,13 +15,11 @@ struct GeneralSettings {
     static let defaultPacListenPort = 10080
     static let defaultProxyThreadNumber = 2
     static let defaultRulesURL = "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt"
-    static let defaultPublicSuffixListURL = "https://publicsuffix.org/list/public_suffix_list.dat"
 
     var launchAtLogin: Bool = false
     var enableMenuBar: Bool = true
     var iCloudSyncEnabled: Bool = false
     var rulesURL: String = GeneralSettings.defaultRulesURL
-    var publicSuffixListURL: String = GeneralSettings.defaultPublicSuffixListURL
     var proxyListenAddress: String = GeneralSettings.localhostAddress
     var proxyListenPort: Int = GeneralSettings.defaultProxyListenPort
     var proxyThreadNumber: Int = GeneralSettings.defaultProxyThreadNumber
@@ -35,7 +33,6 @@ struct GeneralSettings {
         enableMenuBar: Bool = true,
         iCloudSyncEnabled: Bool = false,
         rulesURL: String = GeneralSettings.defaultRulesURL,
-        publicSuffixListURL: String = GeneralSettings.defaultPublicSuffixListURL,
         proxyListenAddress: String = GeneralSettings.localhostAddress,
         proxyListenPort: Int = GeneralSettings.defaultProxyListenPort,
         proxyThreadNumber: Int = GeneralSettings.defaultProxyThreadNumber,
@@ -47,7 +44,6 @@ struct GeneralSettings {
         self.enableMenuBar = enableMenuBar
         self.iCloudSyncEnabled = iCloudSyncEnabled
         self.rulesURL = rulesURL
-        self.publicSuffixListURL = publicSuffixListURL
         self.proxyListenAddress = proxyListenAddress
         self.proxyListenPort = proxyListenPort
         self.proxyThreadNumber = proxyThreadNumber
@@ -63,7 +59,6 @@ struct GeneralSettings {
             enableMenuBar: userDefaults.object(forKey: "general.enableMenuBar") as? Bool ?? true,
             iCloudSyncEnabled: userDefaults.object(forKey: "general.iCloudSyncEnabled") as? Bool ?? false,
             rulesURL: userDefaults.string(forKey: "general.rulesURL") ?? defaultRulesURL,
-            publicSuffixListURL: userDefaults.string(forKey: "general.publicSuffixListURL") ?? defaultPublicSuffixListURL,
             proxyListenAddress: userDefaults.string(forKey: "general.proxyListenAddress") ?? localhostAddress,
             proxyListenPort: userDefaults.object(forKey: "general.proxyListenPort") as? Int ?? defaultProxyListenPort,
             proxyThreadNumber: userDefaults.object(forKey: "general.proxyThreadNumber") as? Int ?? defaultProxyThreadNumber,
@@ -79,7 +74,6 @@ struct GeneralSettings {
         userDefaults.set(enableMenuBar, forKey: "general.enableMenuBar")
         userDefaults.set(iCloudSyncEnabled, forKey: "general.iCloudSyncEnabled")
         userDefaults.set(rulesURL, forKey: "general.rulesURL")
-        userDefaults.set(publicSuffixListURL, forKey: "general.publicSuffixListURL")
         userDefaults.set(proxyListenAddress, forKey: "general.proxyListenAddress")
         userDefaults.set(proxyListenPort, forKey: "general.proxyListenPort")
         userDefaults.set(proxyThreadNumber, forKey: "general.proxyThreadNumber")

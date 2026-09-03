@@ -8,6 +8,12 @@ Swift 类型声明必须写 `///` 文档注释，说明该类型承担的业务�
 
 MagentX app 层异常错误统一定义在 `MagentX/MagentXError.swift` 的 `MagentXError` 中。不要在 Controller、Service、Model 或 View 中新增局部 `Error`/`LocalizedError` enum；需要新错误时给 `MagentXError` 增加 case。
 
+## Pagination
+
+所有分页方法的 `pageAt` 都使用从 `1` 开始的页码，第一页默认是 `1`；调用方不得传入从 `0` 开始的页码。
+
+分页查询必须在方法内部将页码转换为底层 offset。SwiftData 或数据库查询统一使用 `(pageAt - 1) * pageSize`，不得要求调用方预先减 `1`，也不得直接使用 `pageAt * pageSize`。
+
 ## Libraries & Custom Implementations
 
 实现编解码、文件格式、协议、规则语法、加密、网络传输或数据库等通用能力前，必须先检查 Apple 系统框架、已有项目依赖和社区主流成熟库。只要它们能正确覆盖业务语义，优先使用现成 API 或库，不要重新手写解析器、编解码器或协议实现。例如 Base64 应直接使用 Foundation 的 `Data` Base64 API。

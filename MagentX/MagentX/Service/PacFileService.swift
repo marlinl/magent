@@ -12,7 +12,7 @@ import Magent
 /// PAC 文件服务，负责把代理规则快照编译为本地代理使用的 host PAC 文件。
 final class PacFileService {
     static let shared = PacFileService()
-    static let fileName = "proxy.pac"
+    nonisolated static let fileName = "proxy.pac"
 
     let directoryURL: URL
 
@@ -28,7 +28,7 @@ final class PacFileService {
 
     /// 用轻量规则快照原子覆盖 proxy host PAC 文件。
     @discardableResult
-    static func writeProxyHostPAC(
+    nonisolated static func writeProxyHostPAC(
         rules: [Rule],
         proxyEndpoint: ProxyEndpoint,
         directoryURL: URL
@@ -43,7 +43,7 @@ final class PacFileService {
     }
 
     /// 生成完整 proxy host PAC 文件内容；没有规则命中时默认直连。
-    static func makeProxyHostPAC(
+    nonisolated static func makeProxyHostPAC(
         rules: [Rule],
         proxyEndpoint: ProxyEndpoint
     ) -> String {
@@ -116,17 +116,17 @@ final class PacFileService {
     }
 
     /// 返回指定目录下的 proxy host PAC 文件路径。
-    static func proxyHostPACURL(in directoryURL: URL) -> URL {
+    nonisolated static func proxyHostPACURL(in directoryURL: URL) -> URL {
         directoryURL.appendingPathComponent(fileName, isDirectory: false)
     }
 
     /// 返回默认的 `~/.MagentX` 目录路径。
-    static func defaultDirectoryURL() -> URL {
+    nonisolated static func defaultDirectoryURL() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".MagentX", isDirectory: true)
     }
 
-    private static func ruleLiteral(_ rule: Rule) -> String? {
+    nonisolated private static func ruleLiteral(_ rule: Rule) -> String? {
         let type = javaScriptStringLiteral(rule.matchType.rawValue)
         let normalizedValue = rule.matchType == .urlRegex ? rule.matchValue : rule.matchValue.lowercased()
         let value = javaScriptStringLiteral(normalizedValue)
@@ -141,7 +141,7 @@ final class PacFileService {
         }
     }
 
-    private static func javaScriptStringLiteral(_ value: String) -> String {
+    nonisolated private static func javaScriptStringLiteral(_ value: String) -> String {
         var literal = "\""
         for scalar in value.unicodeScalars {
             switch scalar.value {
@@ -195,7 +195,7 @@ extension PacFileService {
 
 /// PAC 文件使用的本地代理端点。
 extension PacFileService {
-    struct ProxyEndpoint: Equatable, Sendable {
+    nonisolated struct ProxyEndpoint: Equatable, Sendable {
         let address: String
         let port: Int
 
@@ -223,7 +223,7 @@ extension PacFileService {
 }
 
 /// IPv4 CIDR PAC 匹配所需的网络地址和子网掩码。
-private struct CIDR {
+nonisolated private struct CIDR {
     let network: String
     let mask: String
 

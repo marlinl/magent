@@ -22,7 +22,7 @@ actor MagentProxyRuleService {
     private static let importedRuleOrder = 100
 
     /// 从当前规则订阅 URL 下载完整响应正文，不做 Base64 解码或内容裁剪。
-    func downloadFromRuleUrl() async throws -> String {
+    private func downloadFromRuleUrl() async throws -> String {
         let rulesURLValue = await MainActor.run {
             GeneralSettings.load().rulesURL.trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -35,7 +35,9 @@ actor MagentProxyRuleService {
 
         let responseData: Data
         if rulesURL.isFileURL {
-            responseData = try Data(contentsOf: rulesURL)
+            responseData = try await MagentXAsyncExecutor.shared.runBlocking {
+                try Data(contentsOf: rulesURL)
+            }
         } else {
             let (data, response) = try await URLSession.shared.data(from: rulesURL)
             if let httpResponse = response as? HTTPURLResponse,
@@ -49,77 +51,96 @@ actor MagentProxyRuleService {
         return String(decoding: responseData, as: UTF8.self)
     }
 
-    /// 异步下载、解析并合并规则订阅；全部操作成功时返回 `true`，失败时回滚并返回 `false`。
-    func syncRuleFromUrl() async -> Bool {
-        do {
-            let response = try await downloadFromRuleUrl()
-            guard let decodedData = Data(base64Encoded: response, options: [.ignoreUnknownCharacters]) else {
-                throw MagentXError.invalidAclBase64Data
+    /// 异步下载、解析并合并规则订阅；失败时向调用方传播原始错误。
+    func syncRuleFromUrl() async throws {
+        let response = try await downloadFromRuleUrl()
+        guard let decodedData = Data(base64Encoded: response, options: [.ignoreUnknownCharacters]) else {
+            throw MagentXError.invalidAclBase64Data
+        }
+        guard let decodedText = String(data: decodedData, encoding: .utf8) else {
+            throw MagentXError.invalidAclDecodedText
+        }
+        let downloadedRules = AdblockUtil.parse(decodedText)
+        let existingRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
+        var rulesByIdentity: [RuleIdentity: MagentProxyRule] = [:]
+        for existingRule in existingRules {
+            rulesByIdentity[RuleIdentity(
+                matchType: existingRule.matchType,
+                matchValue: existingRule.matchValue
+            )] = existingRule
+        }
+
+        let now = Date.now
+        var usedIDs = Set(existingRules.map(\.id))
+        var nextIDCandidate = 0
+        for downloadedRule in downloadedRules {
+            let identity = RuleIdentity(
+                matchType: downloadedRule.matchType,
+                matchValue: downloadedRule.matchValue
+            )
+            let decision: RuleDecision = downloadedRule.isException ? .direct : .proxy
+
+            if let existingRule = rulesByIdentity[identity] {
+                guard existingRule.source == Self.source else { continue }
+                existingRule.matchType = downloadedRule.matchType
+                existingRule.matchValue = downloadedRule.matchValue
+                existingRule.decision = decision
+                existingRule.order = Self.importedRuleOrder
+                existingRule.source = Self.source
+                existingRule.updatedAt = now
+                continue
             }
-            guard let decodedText = String(data: decodedData, encoding: .utf8) else {
-                throw MagentXError.invalidAclDecodedText
-            }
 
-            let downloadedRules = AdblockUtil.parse(decodedText)
-            let existingRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
-            var rulesByIdentity: [RuleIdentity: MagentProxyRule] = [:]
-            for existingRule in existingRules {
-                rulesByIdentity[RuleIdentity(
-                    matchType: existingRule.matchType,
-                    matchValue: existingRule.matchValue
-                )] = existingRule
-            }
-
-            let now = Date.now
-            var usedIDs = Set(existingRules.map(\.id))
-            var nextIDCandidate = 0
-            for downloadedRule in downloadedRules {
-                let identity = RuleIdentity(
-                    matchType: downloadedRule.matchType,
-                    matchValue: downloadedRule.matchValue
-                )
-                let decision: RuleDecision = downloadedRule.isException ? .direct : .proxy
-
-                if let existingRule = rulesByIdentity[identity] {
-                    guard existingRule.source == Self.source else { continue }
-                    existingRule.matchType = downloadedRule.matchType
-                    existingRule.matchValue = downloadedRule.matchValue
-                    existingRule.decision = decision
-                    existingRule.order = Self.importedRuleOrder
-                    existingRule.source = Self.source
-                    existingRule.updatedAt = now
-                    continue
-                }
-
-                while usedIDs.contains(nextIDCandidate) {
-                    nextIDCandidate += 1
-                }
-                let proxyRule = MagentProxyRule(
-                    id: nextIDCandidate,
-                    matchType: downloadedRule.matchType,
-                    matchValue: downloadedRule.matchValue,
-                    decision: decision,
-                    order: Self.importedRuleOrder,
-                    source: Self.source,
-                    createdAt: now,
-                    updatedAt: now
-                )
-                usedIDs.insert(nextIDCandidate)
+            while usedIDs.contains(nextIDCandidate) {
                 nextIDCandidate += 1
-                modelContext.insert(proxyRule)
-                rulesByIdentity[identity] = proxyRule
             }
+            let proxyRule = MagentProxyRule(
+                id: nextIDCandidate,
+                matchType: downloadedRule.matchType,
+                matchValue: downloadedRule.matchValue,
+                decision: decision,
+                order: Self.importedRuleOrder,
+                source: Self.source,
+                createdAt: now,
+                updatedAt: now
+            )
+            usedIDs.insert(nextIDCandidate)
+            nextIDCandidate += 1
+            modelContext.insert(proxyRule)
+            rulesByIdentity[identity] = proxyRule
+        }
 
+        do {
             try modelContext.save()
-            return true
         } catch {
             modelContext.rollback()
-            MagentXLogger.error(
-                error,
-                category: .service,
-                message: "Failed to synchronize proxy rules"
+            throw error
+        }
+
+        try await writePACFile()
+    }
+
+    private func writePACFile() async throws {
+        let pacRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>()).map { proxyRule in
+            PacFileService.Rule(
+                matchType: proxyRule.matchType,
+                matchValue: proxyRule.matchValue,
+                decision: proxyRule.decision.rawValue,
+                order: proxyRule.order
             )
-            return false
+        }
+        let (proxyEndpoint, directoryURL) = try await MainActor.run {
+            (
+                try PacFileService.ProxyEndpoint(generalSettings: GeneralSettings.load()),
+                PacFileService.shared.directoryURL
+            )
+        }
+        _ = try await MagentXAsyncExecutor.shared.runBlocking {
+            try PacFileService.writeProxyHostPAC(
+                rules: pacRules,
+                proxyEndpoint: proxyEndpoint,
+                directoryURL: directoryURL
+            )
         }
     }
 

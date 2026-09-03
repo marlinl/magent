@@ -8,6 +8,7 @@
 
 import Foundation
 import Magent
+import Network
 import SwiftData
 
 /// MagentX 持久化的代理节点，字段语义与 Magent 核心库的 `ProxyNode` 对齐。
@@ -115,8 +116,11 @@ final class MagentProxyNode {
         timeout: TimeInterval
     ) -> [MagentXError] {
         var errors: [MagentXError] = []
-        if normalizedAddress(address).isEmpty {
+        let normalizedAddress = normalizedAddress(address)
+        if normalizedAddress.isEmpty {
             errors.append(.emptyAddress)
+        } else if isValidAddress(normalizedAddress) == false {
+            errors.append(.invalidAddress)
         }
         if (1...65535).contains(port) == false {
             errors.append(.invalidPort)
@@ -124,7 +128,7 @@ final class MagentProxyNode {
         if password.isEmpty {
             errors.append(.emptyPassword)
         }
-        if timeout <= 0 {
+        if timeout <= 0 || Int(exactly: timeout) == nil {
             errors.append(.invalidTimeout)
         }
         return errors
@@ -138,6 +142,38 @@ final class MagentProxyNode {
 
     private static func normalizedAddress(_ address: String) -> String {
         address.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func isValidAddress(_ address: String) -> Bool {
+        if let ipv4Address = IPv4Address(address) {
+            return String(describing: ipv4Address) == address
+        }
+        if IPv6Address(address) != nil {
+            return true
+        }
+        if address.allSatisfy({ $0.isNumber || $0 == "." }) {
+            return false
+        }
+
+        let hostname = address.last == "." ? address.dropLast() : address[...]
+        guard hostname.isEmpty == false, hostname.utf8.count <= 253 else {
+            return false
+        }
+
+        return hostname.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { label in
+            guard (1...63).contains(label.utf8.count),
+                  label.first != "-",
+                  label.last != "-"
+            else {
+                return false
+            }
+            return label.utf8.allSatisfy { character in
+                character == 45 ||
+                    (48...57).contains(character) ||
+                    (65...90).contains(character) ||
+                    (97...122).contains(character)
+            }
+        }
     }
 
     private static func makeUUIDVersion7() -> UUID {

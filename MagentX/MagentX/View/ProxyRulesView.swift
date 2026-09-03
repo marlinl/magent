@@ -74,34 +74,34 @@ private struct AutoFocusedSearchField: NSViewRepresentable {
             parent.onSubmit(searchField.stringValue)
         }
     }
-}
 
-/// 在加入 `NSWindow` 后兑现一次待处理的 first-responder 请求。
-@MainActor
-private final class FocusRequestingSearchField: NSSearchField {
-    private var isFocusRequested = false
+    /// 在加入 `NSWindow` 后兑现一次待处理的 first-responder 请求。
+    @MainActor
+    final class FocusRequestingSearchField: NSSearchField {
+        private var isFocusRequested = false
 
-    /// 记录焦点目标；如果控件已进入窗口则立即把它设为 first responder。
-    func setFocusRequested(_ isRequested: Bool) {
-        isFocusRequested = isRequested
-        guard isRequested else { return }
-        focusIfPossible()
-    }
-
-    /// 控件进入或离开窗口后重新检查尚未兑现的焦点请求。
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        guard isFocusRequested else { return }
-        focusIfPossible()
-    }
-
-    /// 在窗口可用且当前尚未编辑时，让原生搜索框接管键盘输入。
-    private func focusIfPossible() {
-        guard let window else { return }
-        if let editor = currentEditor(), window.firstResponder === editor {
-            return
+        /// 记录焦点目标；如果控件已进入窗口则立即把它设为 first responder。
+        func setFocusRequested(_ isRequested: Bool) {
+            isFocusRequested = isRequested
+            guard isRequested else { return }
+            focusIfPossible()
         }
-        window.makeFirstResponder(self)
+
+        /// 控件进入或离开窗口后重新检查尚未兑现的焦点请求。
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard isFocusRequested else { return }
+            focusIfPossible()
+        }
+
+        /// 在窗口可用且当前尚未编辑时，让原生搜索框接管键盘输入。
+        private func focusIfPossible() {
+            guard let window else { return }
+            if let editor = currentEditor(), window.firstResponder === editor {
+                return
+            }
+            window.makeFirstResponder(self)
+        }
     }
 }
 
@@ -117,15 +117,8 @@ struct ProxyRulesView: View {
     @State private var loadError: String?
     @State private var canLoadMore = false
     @State private var isRefreshing = false
-    @State private var isAddingRules = false
+    @State private var draft: ProxyRuleDraft?
     @State private var fetchLimit = Self.pageSize
-    @State private var newMatchType = MatchType.domainSuffix
-    @State private var newDecision = RuleDecision.proxy
-    @State private var newMatchValuesText = ""
-    @State private var isEditingRule = false
-    @State private var editingRuleID = 0
-    @State private var editingMatchType = MatchType.domainSuffix
-    @State private var editingDecision = RuleDecision.proxy
     @Binding var toolbarButtons: [ContentToolbarButton]
 
     private static let pageSize = 50
@@ -133,14 +126,6 @@ struct ProxyRulesView: View {
     /// 去除首尾空白后的搜索关键字。
     private var trimmedSearchText: String {
         submittedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// 把新增表单中的非空行转换为匹配值。
-    private var newMatchValues: [String] {
-        newMatchValuesText
-            .split(whereSeparator: \.isNewline)
-            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { $0.isEmpty == false }
     }
 
     /// 注入由 `ContentView` 管理的工具栏按钮绑定；环境数据在 View 挂载后由 `search` 首次读取。
@@ -205,17 +190,43 @@ struct ProxyRulesView: View {
                 }
             }
         }
-        .sheet(isPresented: $isAddingRules) {
-            addRulesSheet
-        }
-        .sheet(isPresented: $isEditingRule) {
-            editRuleSheet
+        .sheet(item: $draft) { draft in
+            if draft.editingRuleID == nil {
+                AddProxyRuleFormView(
+                    draft: draft,
+                    onCancel: {
+                        self.draft = nil
+                    },
+                    onSave: { draft in
+                        if add(draft) {
+                            self.draft = nil
+                        }
+                    }
+                )
+            } else {
+                UpdateProxyRuleFormView(
+                    draft: draft,
+                    onCancel: {
+                        self.draft = nil
+                    },
+                    onSave: { draft in
+                        if update(draft) {
+                            self.draft = nil
+                        }
+                    }
+                )
+            }
         }
         .onAppear {
             toolbarButtons = [
                 ContentToolbarButton(title: "增加规则", systemImage: "plus") {
                     isSearchPresented = false
-                    isAddingRules = true
+                    draft = ProxyRuleDraft(
+                        editingRuleID: nil,
+                        matchType: .domainSuffix,
+                        matchValuesText: "",
+                        decision: .proxy
+                    )
                 },
                 ContentToolbarButton(
                     title: "同步规则",
@@ -242,36 +253,41 @@ struct ProxyRulesView: View {
                         search()
                     }
             }
-            .width(min: 180, ideal: 300)
+            .width(min: 64, ideal: 280)
 
             TableColumn("类型") { proxyRule in
                 Text(proxyRule.matchType.rawValue)
+                    .lineLimit(1)
             }
-            .width(min: 80, ideal: 100)
+            .width(min: 44, ideal: 80, max: 110)
 
             TableColumn("顺序") { proxyRule in
                 Text(proxyRule.order, format: .number)
+                    .lineLimit(1)
             }
-            .width(min: 60, ideal: 100)
+            .width(min: 40, ideal: 56, max: 72)
 
             TableColumn("来源") { proxyRule in
                 Text(proxyRule.source.isEmpty ? "-" : proxyRule.source)
                     .lineLimit(1)
             }
-            .width(min: 70, ideal: 100)
+            .width(min: 44, ideal: 76, max: 100)
 
             TableColumn("规则") { proxyRule in
                 Text(proxyRule.decision.rawValue.uppercased())
+                    .lineLimit(1)
             }
-            .width(min: 70, ideal: 100)
+            .width(min: 44, ideal: 64, max: 84)
 
             TableColumn("操作") { proxyRule in
                 ControlGroup {
                     Button {
-                        editingRuleID = proxyRule.id
-                        editingMatchType = proxyRule.matchType
-                        editingDecision = proxyRule.decision
-                        isEditingRule = true
+                        draft = ProxyRuleDraft(
+                            editingRuleID: proxyRule.id,
+                            matchType: proxyRule.matchType,
+                            matchValuesText: proxyRule.matchValue,
+                            decision: proxyRule.decision
+                        )
                     } label: {
                         Label("编辑规则", systemImage: "pencil")
                             .labelStyle(.iconOnly)
@@ -290,123 +306,17 @@ struct ProxyRulesView: View {
                 }
                 .controlSize(.small)
             }
-            .width(min: 120, ideal: 200)
+            .width(min: 72, ideal: 88, max: 96)
         }
-    }
-
-    /// 展示批量新增规则表单，并在提交成功后清空输入并关闭 Sheet。
-    private var addRulesSheet: some View {
-        Form {
-            Section {
-                Picker("匹配类型", selection: $newMatchType) {
-                    ForEach(MatchType.allCases, id: \.rawValue) { matchType in
-                        Text(matchType.rawValue)
-                            .tag(matchType)
-                    }
-                }
-                .pickerStyle(.menu)
-
-                Picker("动作", selection: $newDecision) {
-                    Text("DIRECT").tag(RuleDecision.direct)
-                    Text("PROXY").tag(RuleDecision.proxy)
-                }
-                .pickerStyle(.menu)
-            } header: {
-                Text("增加规则")
-                    .font(.title3.weight(.semibold))
-            }
-
-            Section("MatchValue") {
-                TextEditor(text: $newMatchValuesText)
-                    .frame(minHeight: 160)
-            }
-
-            Section {
-                ControlGroup {
-                    Button("取消", role: .cancel) {
-                        isAddingRules = false
-                    }
-                    .buttonStyle(.glass)
-
-                    Button("添加") {
-                        if add(
-                            matchType: newMatchType,
-                            matchValues: newMatchValues,
-                            decision: newDecision
-                        ) {
-                            newMatchValuesText = ""
-                            isAddingRules = false
-                        }
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(newMatchValues.isEmpty)
-                    .buttonStyle(.glassProminent)
-                }
-            }
-        }
-        .formStyle(.grouped)
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
-        .frame(width: 420)
-    }
-
-    /// 展示规则编辑表单，并用规则 id 提交匹配类型和动作。
-    private var editRuleSheet: some View {
-        Form {
-            Section {
-                Picker("匹配类型", selection: $editingMatchType) {
-                    ForEach(MatchType.allCases, id: \.rawValue) { matchType in
-                        Text(matchType.rawValue)
-                            .tag(matchType)
-                    }
-                }
-                .pickerStyle(.menu)
-
-                Picker("动作", selection: $editingDecision) {
-                    Text("DIRECT").tag(RuleDecision.direct)
-                    Text("PROXY").tag(RuleDecision.proxy)
-                }
-                .pickerStyle(.menu)
-            } header: {
-                Text("编辑规则")
-                    .font(.title3.weight(.semibold))
-            }
-
-            Section {
-                ControlGroup {
-                    Button("取消", role: .cancel) {
-                        isEditingRule = false
-                    }
-                    .buttonStyle(.glass)
-
-                    Button("保存") {
-                        if update(
-                            id: editingRuleID,
-                            matchType: editingMatchType,
-                            decision: editingDecision
-                        ) {
-                            isEditingRule = false
-                        }
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.glassProminent)
-                }
-            }
-        }
-        .formStyle(.grouped)
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
-        .frame(width: 420)
     }
 
     /// 新增一批手工代理规则，完成输入清理、重复校验、持久化和列表刷新。
-    private func add(
-        matchType: MatchType,
-        matchValues: [String],
-        decision: RuleDecision
-    ) -> Bool {
+    private func add(_ draft: ProxyRuleDraft) -> Bool {
+        guard draft.editingRuleID == nil else { return false }
+        let matchType = draft.matchType
+        let decision = draft.decision
         var seenMatchValues = Set<String>()
-        let uniqueMatchValues: [String] = matchValues.compactMap { matchValue in
+        let uniqueMatchValues: [String] = draft.matchValues.compactMap { matchValue in
             let normalizedValue = matchValue.trimmingCharacters(in: .whitespacesAndNewlines)
             guard normalizedValue.isEmpty == false,
                   seenMatchValues.insert(normalizedValue).inserted else {
@@ -509,11 +419,10 @@ struct ProxyRulesView: View {
     }
 
     /// 按业务 id 更新规则的匹配类型和动作，并把界面修改来源标记为 `user`。
-    private func update(
-        id: Int,
-        matchType: MatchType,
-        decision: RuleDecision
-    ) -> Bool {
+    private func update(_ draft: ProxyRuleDraft) -> Bool {
+        guard let id = draft.editingRuleID else { return false }
+        let matchType = draft.matchType
+        let decision = draft.decision
         do {
             let existingRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
             guard let proxyRule = existingRules.first(where: { $0.id == id }) else {
@@ -556,11 +465,21 @@ struct ProxyRulesView: View {
     private func sync() {
         guard isRefreshing == false else { return }
         isSearchPresented = false
+
+        let now = Date.now
+        let modelContainer = modelContext.container
+        let executor = MagentXAsyncExecutor.shared
+
         isRefreshing = true
         toolbarButtons = [
             ContentToolbarButton(title: "增加规则", systemImage: "plus") {
                 isSearchPresented = false
-                isAddingRules = true
+                draft = ProxyRuleDraft(
+                    editingRuleID: nil,
+                    matchType: .domainSuffix,
+                    matchValuesText: "",
+                    decision: .proxy
+                )
             },
             ContentToolbarButton(
                 title: "正在同步规则",
@@ -572,13 +491,23 @@ struct ProxyRulesView: View {
             }
         ]
 
-        Task {
-            defer {
+        executor.submit(
+            priority: .utility,
+            operation: {
+                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
+                try await ruleService.syncRuleFromUrl()
+            },
+            completion: { result in
                 isRefreshing = false
                 toolbarButtons = [
                     ContentToolbarButton(title: "增加规则", systemImage: "plus") {
                         isSearchPresented = false
-                        isAddingRules = true
+                        draft = ProxyRuleDraft(
+                            editingRuleID: nil,
+                            matchType: .domainSuffix,
+                            matchValuesText: "",
+                            decision: .proxy
+                        )
                     },
                     ContentToolbarButton(
                         title: "同步规则",
@@ -587,44 +516,112 @@ struct ProxyRulesView: View {
                         sync()
                     }
                 ]
+
+                switch result {
+                case .success:
+                    var refreshedSettings = GeneralSettings.load()
+                    refreshedSettings.updatedAt = now
+                    refreshedSettings.save()
+                    fetchLimit = Self.pageSize
+                    search()
+                case .failure(let error):
+                    loadError = error.localizedDescription
+                }
+            }
+        )
+    }
+}
+
+/// 新增代理规则表单，使用本地草稿编辑批量匹配值并在确认后提交。
+private struct AddProxyRuleFormView: View {
+    @State var draft: ProxyRuleDraft
+    let onCancel: () -> Void
+    let onSave: (ProxyRuleDraft) -> Void
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("匹配类型", selection: $draft.matchType) {
+                    ForEach(MatchType.allCases, id: \.rawValue) { matchType in
+                        Text(matchType.rawValue)
+                            .tag(matchType)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Picker("动作", selection: $draft.decision) {
+                    Text("DIRECT").tag(RuleDecision.direct)
+                    Text("PROXY").tag(RuleDecision.proxy)
+                }
+                .pickerStyle(.menu)
+            } header: {
+                Text("增加规则")
+                    .font(.title3.weight(.semibold))
             }
 
-            do {
-                let settings = GeneralSettings.load()
-                let now = Date.now
-                let proxyEndpoint = try PacFileService.ProxyEndpoint(generalSettings: settings)
-                let modelContainer = modelContext.container
-                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
-                guard await ruleService.syncRuleFromUrl() else {
-                    throw MagentXError.proxyRuleSynchronizationFailed
-                }
-                let pacDirectoryURL = PacFileService.shared.directoryURL
-                _ = try await Task.detached(priority: .utility) {
-                    let pacModelContext = ModelContext(modelContainer)
-                    let proxyRules = try pacModelContext.fetch(FetchDescriptor<MagentProxyRule>())
-                    let pacRules = proxyRules.map { proxyRule in
-                        PacFileService.Rule(
-                            matchType: proxyRule.matchType,
-                            matchValue: proxyRule.matchValue,
-                            decision: proxyRule.decision.rawValue,
-                            order: proxyRule.order
-                        )
-                    }
-                    try PacFileService.writeProxyHostPAC(
-                        rules: pacRules,
-                        proxyEndpoint: proxyEndpoint,
-                        directoryURL: pacDirectoryURL
-                    )
-                }.value
+            Section("MatchValue") {
+                TextEditor(text: $draft.matchValuesText)
+                    .frame(minHeight: 160)
+            }
 
-                var refreshedSettings = settings
-                refreshedSettings.updatedAt = now
-                refreshedSettings.save()
-                fetchLimit = Self.pageSize
-                search()
-            } catch {
-                loadError = error.localizedDescription
+            Section {
+                ControlGroup {
+                    Button("取消", role: .cancel, action: onCancel)
+                        .buttonStyle(.glass)
+
+                    Button("添加") {
+                        onSave(draft)
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(draft.matchValues.isEmpty)
+                    .buttonStyle(.glassProminent)
+                }
             }
         }
+        .formStyle(.grouped)
+    }
+}
+
+/// 编辑代理规则表单，使用本地草稿修改匹配类型和动作并在确认后提交。
+private struct UpdateProxyRuleFormView: View {
+    @State var draft: ProxyRuleDraft
+    let onCancel: () -> Void
+    let onSave: (ProxyRuleDraft) -> Void
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("匹配类型", selection: $draft.matchType) {
+                    ForEach(MatchType.allCases, id: \.rawValue) { matchType in
+                        Text(matchType.rawValue)
+                            .tag(matchType)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Picker("动作", selection: $draft.decision) {
+                    Text("DIRECT").tag(RuleDecision.direct)
+                    Text("PROXY").tag(RuleDecision.proxy)
+                }
+                .pickerStyle(.menu)
+            } header: {
+                Text("编辑规则")
+                    .font(.title3.weight(.semibold))
+            }
+
+            Section {
+                ControlGroup {
+                    Button("取消", role: .cancel, action: onCancel)
+                        .buttonStyle(.glass)
+
+                    Button("保存") {
+                        onSave(draft)
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.glassProminent)
+                }
+            }
+        }
+        .formStyle(.grouped)
     }
 }

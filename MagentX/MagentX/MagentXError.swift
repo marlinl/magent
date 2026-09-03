@@ -16,7 +16,6 @@ enum MagentXError: LocalizedError, Equatable {
     case invalidAclDecodedText
     case duplicateMagentProxyRule
     case missingMagentProxyRule(Int)
-    case proxyRuleSynchronizationFailed
     case missingAccessControlRule(UUID)
     case missingMagentProxyNode(UUID)
     case proxyNodeInUse(UUID)
@@ -34,6 +33,7 @@ enum MagentXError: LocalizedError, Equatable {
     case tunnelModeNotImplemented
     case emptyName
     case emptyAddress
+    case invalidAddress
     case invalidPort
     case emptyPassword
     case invalidTimeout
@@ -52,8 +52,6 @@ enum MagentXError: LocalizedError, Equatable {
             return String(localized: "Proxy rule already exists")
         case .missingMagentProxyRule(let id):
             return String(format: String(localized: "Proxy rule does not exist: %d"), id)
-        case .proxyRuleSynchronizationFailed:
-            return String(localized: "Proxy rule synchronization failed")
         case .missingAccessControlRule(let id):
             return String(format: String(localized: "Access control rule does not exist: %@"), id.uuidString)
         case .missingMagentProxyNode(let id):
@@ -88,12 +86,14 @@ enum MagentXError: LocalizedError, Equatable {
             return String(localized: "Name is required")
         case .emptyAddress:
             return String(localized: "Address is required")
+        case .invalidAddress:
+            return String(localized: "Address must be a hostname, IPv4 address, or IPv6 address")
         case .invalidPort:
             return String(localized: "Port must be an integer from 1 to 65535")
         case .emptyPassword:
             return String(localized: "Password is required")
         case .invalidTimeout:
-            return String(localized: "Timeout must be greater than 0")
+            return String(localized: "Timeout must be a positive integer")
         }
     }
 }

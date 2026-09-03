@@ -53,21 +53,4 @@ struct GeneralSettingsTests {
         #expect(settings.rulesURL == "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt")
     }
 
-    /// 验证 PSL 下载地址缺省使用 publicsuffix.org，并可随设置保存和读取。
-    @Test func savePersistsPublicSuffixListURL() {
-        let suiteName = "GeneralSettingsTests.\(UUID().uuidString)"
-        let userDefaults = UserDefaults(suiteName: suiteName)!
-        defer {
-            userDefaults.removePersistentDomain(forName: suiteName)
-        }
-
-        let defaultSettings = GeneralSettings.load(userDefaults: userDefaults)
-        #expect(defaultSettings.publicSuffixListURL == "https://publicsuffix.org/list/public_suffix_list.dat")
-
-        let settings = GeneralSettings(publicSuffixListURL: "https://example.com/PSL.dat")
-        settings.save(userDefaults: userDefaults)
-
-        let loadedSettings = GeneralSettings.load(userDefaults: userDefaults)
-        #expect(loadedSettings.publicSuffixListURL == "https://example.com/PSL.dat")
-    }
 }

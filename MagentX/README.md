@@ -27,7 +27,7 @@ MagentX/MagentX/
 │   ├── ProxyPolicy.swift
 │   └── ProxyPolicyRule.swift
 ├── Service/
-│   ├── AclService.swift
+│   ├── MagentProxyRuleService.swift
 │   ├── MagentProxyService.swift
 │   ├── PacFileService.swift
 │   └── SystemNetworkProxyService.swift
@@ -41,7 +41,7 @@ MagentX/MagentX/
 │   ├── ProxyNodesView.swift
 │   ├── ProxyPolicyView.swift
 │   ├── ProxyRulesView.swift
-│   └── SystemSettingsView.swift
+│   └── AppSettingsView.swift
 └── Assets.xcassets/
 ```
 
@@ -64,7 +64,7 @@ Network
 ## Models
 
 - `ProxyNode`: persisted proxy node configuration. The first supported node type is Shadowsocks.
-- `GeneralSettings`: persisted global app configuration, including launch-at-login, menu bar behavior, local proxy listening, optional iCloud sync preference, the rules subscription URL, and the PSL download URL.
+- `GeneralSettings`: persisted global app configuration, including launch-at-login, menu bar behavior, local proxy listening, optional iCloud sync preference, and the rules subscription URL.
 - `CurrentSelection`: persisted selection state for the active proxy node.
 - `AccessControlRule`: persisted access-control rule. The rule-list refresh path stores imported rules with `source = "rulesUrl"`.
 - `MagentProxyRule`: persisted proxy rule used directly by `ProxyRulesView`, including typed direct/proxy decisions.
@@ -73,7 +73,7 @@ Network
 
 ## Services
 
-`AclService` downloads and parses an access-control subscription list. It stores downloaded GFWList data as `~/.MagentX/gfwlist.txt`, stores Public Suffix List data as `~/.MagentX/PSL.dat`, and imports lightweight `AccessControlRuleImport` records tagged with `source = "rulesUrl"` as `MagentProxyRule` values on a background model context.
+`MagentProxyRuleService` downloads and parses the configured rule subscription, then merges imported rules tagged with `source = "rulesUrl"` into SwiftData on its model actor.
 
 `PacFileService` compiles the complete persisted proxy rule set into `~/.MagentX/proxy.pac`. `ProxyRulesView` rewrites that file after subscription refreshes, and `MagentProxyService` serves the latest file through the local PAC HTTP endpoint.
 
@@ -105,12 +105,4 @@ xcodebuild -project MagentX/MagentX.xcodeproj -scheme MagentX \
 ```bash
 xcodebuild -project MagentX/MagentX.xcodeproj -scheme MagentX \
   -destination 'platform=macOS' test
-```
-
-To run only the Magent proxy rule subscription-import tests:
-
-```bash
-xcodebuild -project MagentX/MagentX.xcodeproj -scheme MagentX \
-  -destination 'platform=macOS' \
-  -only-testing:MagentXTests/AclServiceMagentProxyRuleTests test
 ```

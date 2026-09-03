@@ -146,7 +146,7 @@ struct MagentXApp: App {
     }
 
     var body: some Scene {
-        WindowGroup(id: Self.mainWindowID) {
+        Window("MagentX", id: Self.mainWindowID) {
             ContentView(isMenuBarInserted: $isMenuBarInserted)
         }
         .modelContainer(modelContainer)

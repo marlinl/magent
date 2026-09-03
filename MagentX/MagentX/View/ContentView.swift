@@ -25,7 +25,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .proxyNodes: "代理节点"
         case .proxyRules: "代理规则"
         case .proxyPolicy: "代理策略"
-        case .settings: "系统设置"
+        case .settings: "应用设置"
         }
     }
 
@@ -35,7 +35,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .proxyNodes: "代理节点管理与测速"
         case .proxyRules: "代理规则匹配与开关"
         case .proxyPolicy: "代理策略编排与选择"
-        case .settings: "系统设置和启动偏好"
+        case .settings: "应用设置和启动偏好"
         }
     }
 
@@ -171,7 +171,7 @@ struct ContentView: View {
         case .proxyPolicy:
             ProxyPolicyView(toolbarButtons: $toolbarButtons)
         case .settings:
-            SystemSettingsView(
+            AppSettingsView(
                 toolbarButtons: $toolbarButtons,
                 isMenuBarInserted: $isMenuBarInserted
             )

@@ -30,6 +30,24 @@ struct MagentProxyServiceTests {
             Issue.record("Expected MagentXError.listenPortUnavailable, got \(error)")
         }
     }
+
+    /// 验证 PAC HTTP 端口已被占用时，由 `MagentService` 返回统一的 app 层错误。
+    @Test func startPACServerRejectsOccupiedPort() async throws {
+        let reservedPort = try ReservedTCPPort()
+        let settings = GeneralSettings(pacListenPort: reservedPort.port)
+        let service = try await MainActor.run {
+            try MagentProxyService(generalSettings: settings)
+        }
+
+        do {
+            try await service.startPacServer()
+            Issue.record("Expected occupied PAC port to fail before startup")
+        } catch let error as MagentXError {
+            #expect(error == .listenPortUnavailable(GeneralSettings.localhostAddress, reservedPort.port))
+        } catch {
+            Issue.record("Expected MagentXError.listenPortUnavailable, got \(error)")
+        }
+    }
 }
 
 /// 测试用本地 TCP 端口占位器，生命周期内保持一个真实监听 socket。
