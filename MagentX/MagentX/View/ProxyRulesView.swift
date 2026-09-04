@@ -110,7 +110,7 @@ private struct AutoFocusedSearchField: NSViewRepresentable {
 struct ProxyRulesView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
-    @State private var proxyRules: [MagentProxyRule] = []
+    @State private var proxyRules: [MagentProxyRuleService.RuleSnapshot] = []
     @State private var searchText = ""
     @State private var submittedSearchText = ""
     @State private var isSearchPresented = false
@@ -119,6 +119,7 @@ struct ProxyRulesView: View {
     @State private var isRefreshing = false
     @State private var draft: ProxyRuleDraft?
     @State private var fetchLimit = Self.pageSize
+    @State private var latestSearchID: UUID?
     @Binding var toolbarButtons: [ContentToolbarButton]
 
     private static let pageSize = 50
@@ -198,9 +199,7 @@ struct ProxyRulesView: View {
                         self.draft = nil
                     },
                     onSave: { draft in
-                        if add(draft) {
-                            self.draft = nil
-                        }
+                        add(draft)
                     }
                 )
             } else {
@@ -210,9 +209,7 @@ struct ProxyRulesView: View {
                         self.draft = nil
                     },
                     onSave: { draft in
-                        if update(draft) {
-                            self.draft = nil
-                        }
+                        update(draft)
                     }
                 )
             }
@@ -310,155 +307,114 @@ struct ProxyRulesView: View {
         }
     }
 
-    /// 新增一批手工代理规则，完成输入清理、重复校验、持久化和列表刷新。
-    private func add(_ draft: ProxyRuleDraft) -> Bool {
-        guard draft.editingRuleID == nil else { return false }
+    /// 把新增草稿交给 `MagentProxyRuleService`，成功后关闭表单并刷新列表。
+    ///
+    /// - Parameter draft: 包含批量匹配值、匹配类型和动作的新增草稿。
+    private func add(_ draft: ProxyRuleDraft) {
+        guard draft.editingRuleID == nil else { return }
         let matchType = draft.matchType
+        let matchValues = draft.matchValues
         let decision = draft.decision
-        var seenMatchValues = Set<String>()
-        let uniqueMatchValues: [String] = draft.matchValues.compactMap { matchValue in
-            let normalizedValue = matchValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard normalizedValue.isEmpty == false,
-                  seenMatchValues.insert(normalizedValue).inserted else {
-                return nil
-            }
-            return normalizedValue
-        }
-        guard uniqueMatchValues.isEmpty == false else {
-            loadError = String(localized: "Match value is required")
-            return false
-        }
-
-        do {
-            let existingRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
-            let existingIdentities = Set(existingRules.map {
-                "\($0.matchType.rawValue):\($0.matchValue)"
-            })
-            let newIdentities = uniqueMatchValues.map {
-                "\(matchType.rawValue):\($0)"
-            }
-            guard newIdentities.allSatisfy({ existingIdentities.contains($0) == false }) else {
-                loadError = MagentXError.duplicateMagentProxyRule.localizedDescription
-                return false
-            }
-
-            var usedIDs = Set(existingRules.map(\.id))
-            var nextIDCandidate = 0
-            let now = Date.now
-            for matchValue in uniqueMatchValues {
-                while usedIDs.contains(nextIDCandidate) {
-                    nextIDCandidate += 1
-                }
-                let id = nextIDCandidate
-                usedIDs.insert(id)
-                nextIDCandidate += 1
-
-                modelContext.insert(MagentProxyRule(
-                    id: id,
+        let modelContainer = modelContext.container
+        MagentXAsyncExecutor.shared.submit(
+            operation: {
+                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
+                try await ruleService.add(
                     matchType: matchType,
-                    matchValue: matchValue,
-                    decision: decision,
-                    order: 0,
-                    source: "user",
-                    createdAt: now,
-                    updatedAt: now
-                ))
+                    matchValues: matchValues,
+                    decision: decision
+                )
+            },
+            completion: { result in
+                switch result {
+                case .success:
+                    self.draft = nil
+                    search()
+                case .failure(let error):
+                    loadError = error.localizedDescription
+                }
             }
-
-            try modelContext.save()
-            search()
-            return true
-        } catch {
-            loadError = error.localizedDescription
-            return false
-        }
+        )
     }
 
-    /// 删除一条代理规则，保存后重新搜索当前页。
-    private func delete(_ proxyRule: MagentProxyRule) {
-        do {
-            modelContext.delete(proxyRule)
-            try modelContext.save()
-            search()
-        } catch {
-            loadError = error.localizedDescription
-        }
+    /// 把指定规则的业务 id 交给 `MagentProxyRuleService` 删除，成功后刷新列表。
+    ///
+    /// - Parameter proxyRule: 待删除的界面规则快照。
+    private func delete(_ proxyRule: MagentProxyRuleService.RuleSnapshot) {
+        let id = proxyRule.id
+        let modelContainer = modelContext.container
+        MagentXAsyncExecutor.shared.submit(
+            operation: {
+                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
+                try await ruleService.delete(id)
+            },
+            completion: { result in
+                switch result {
+                case .success:
+                    search()
+                case .failure(let error):
+                    loadError = error.localizedDescription
+                }
+            }
+        )
     }
 
-    /// 按当前关键字、排序和分页上限读取 `MagentProxyRule`。
+    /// 通过 `MagentProxyRuleService` 按当前关键字和分页上限读取界面快照。
     private func search() {
-        let sortDescriptors: [SortDescriptor<MagentProxyRule>] = [
-            SortDescriptor(\.order),
-            SortDescriptor(\.matchValue)
-        ]
+        let keyword = trimmedSearchText
+        let pageSize = fetchLimit
+        let modelContainer = modelContext.container
+        let searchID = UUID()
+        latestSearchID = searchID
 
-        var descriptor: FetchDescriptor<MagentProxyRule>
-        if trimmedSearchText.isEmpty {
-            descriptor = FetchDescriptor<MagentProxyRule>(sortBy: sortDescriptors)
-        } else {
-            let query = trimmedSearchText
-            descriptor = FetchDescriptor<MagentProxyRule>(
-                predicate: #Predicate<MagentProxyRule> { proxyRule in
-                    proxyRule.matchValue.contains(query)
-                },
-                sortBy: sortDescriptors
-            )
-        }
-        descriptor.fetchLimit = fetchLimit + 1
-
-        do {
-            let fetchedRules = try modelContext.fetch(descriptor)
-            proxyRules = Array(fetchedRules.prefix(fetchLimit))
-            canLoadMore = fetchedRules.count > proxyRules.count
-            loadError = nil
-        } catch {
-            proxyRules = []
-            canLoadMore = false
-            loadError = error.localizedDescription
-        }
+        MagentXAsyncExecutor.shared.submit(
+            operation: {
+                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
+                return try await ruleService.search(
+                    keyword: keyword,
+                    pageAt: 1,
+                    pageSize: pageSize
+                )
+            },
+            completion: { result in
+                guard latestSearchID == searchID else { return }
+                switch result {
+                case .success(let searchResult):
+                    proxyRules = searchResult.rules
+                    canLoadMore = searchResult.canLoadMore
+                    loadError = nil
+                case .failure(let error):
+                    proxyRules = []
+                    canLoadMore = false
+                    loadError = error.localizedDescription
+                }
+            }
+        )
     }
 
-    /// 按业务 id 更新规则的匹配类型和动作，并把界面修改来源标记为 `user`。
-    private func update(_ draft: ProxyRuleDraft) -> Bool {
-        guard let id = draft.editingRuleID else { return false }
+    /// 把编辑草稿交给 `MagentProxyRuleService` 按业务 id 更新，成功后关闭表单并刷新列表。
+    ///
+    /// - Parameter draft: 包含目标业务 id、新匹配类型和动作的编辑草稿。
+    private func update(_ draft: ProxyRuleDraft) {
+        guard let id = draft.editingRuleID else { return }
         let matchType = draft.matchType
         let decision = draft.decision
-        do {
-            let existingRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
-            guard let proxyRule = existingRules.first(where: { $0.id == id }) else {
-                throw MagentXError.missingMagentProxyRule(id)
+        let modelContainer = modelContext.container
+        MagentXAsyncExecutor.shared.submit(
+            operation: {
+                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
+                try await ruleService.update(id: id, matchType: matchType, decision: decision)
+            },
+            completion: { result in
+                switch result {
+                case .success:
+                    self.draft = nil
+                    search()
+                case .failure(let error):
+                    loadError = error.localizedDescription
+                }
             }
-            guard existingRules.contains(where: {
-                $0.id != id && $0.matchType == matchType && $0.matchValue == proxyRule.matchValue
-            }) == false else {
-                throw MagentXError.duplicateMagentProxyRule
-            }
-
-            let previousMatchType = proxyRule.matchType
-            let previousDecision = proxyRule.decision
-            let previousSource = proxyRule.source
-            let previousUpdatedAt = proxyRule.updatedAt
-            proxyRule.matchType = matchType
-            proxyRule.decision = decision
-            proxyRule.source = "user"
-            proxyRule.updatedAt = .now
-
-            do {
-                try modelContext.save()
-            } catch {
-                proxyRule.matchType = previousMatchType
-                proxyRule.decision = previousDecision
-                proxyRule.source = previousSource
-                proxyRule.updatedAt = previousUpdatedAt
-                throw error
-            }
-
-            search()
-            return true
-        } catch {
-            loadError = error.localizedDescription
-            return false
-        }
+        )
     }
 
     /// 下载订阅规则、合并数据库并重写 PAC，期间同步主窗口工具栏状态。
@@ -495,7 +451,7 @@ struct ProxyRulesView: View {
             priority: .utility,
             operation: {
                 let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
-                try await ruleService.syncRuleFromUrl()
+                try await ruleService.sync()
             },
             completion: { result in
                 isRefreshing = false

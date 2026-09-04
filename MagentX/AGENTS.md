@@ -8,6 +8,12 @@ Swift 类型声明必须写 `///` 文档注释，说明该类型承担的业务�
 
 MagentX app 层异常错误统一定义在 `MagentX/MagentXError.swift` 的 `MagentXError` 中。不要在 Controller、Service、Model 或 View 中新增局部 `Error`/`LocalizedError` enum；需要新错误时给 `MagentXError` 增加 case。
 
+## Unit Testing & Access Control
+
+UT 应测试调用方能够访问的方法及其可观察行为，不要求每个新增或修改的实现方法都一一对应新增测试方法。测试数量应由业务行为、输入边界和分支数量决定；同一个可访问方法可以使用多个测试方法分别覆盖成功、失败和边界场景。
+
+`private` 方法必须保持实现细节。测试应通过调用其最近的可访问入口，构造不同输入或状态，让执行路径到达 `private` 方法的各个重要分支，并断言入口的返回值、错误或副作用。不得仅为了让 UT 直接调用而将 `private` 方法改为 `internal`、`public`，或以其他方式放宽权限。
+
 ## Pagination
 
 所有分页方法的 `pageAt` 都使用从 `1` 开始的页码，第一页默认是 `1`；调用方不得传入从 `0` 开始的页码。
