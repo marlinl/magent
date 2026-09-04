@@ -16,27 +16,40 @@ import Foundation
 actor MagentProxyService {
     private var configuration: Configuration
     private var eventLoopGroup: MultiThreadedEventLoopGroup
+    private let makeMagentService: MagentServiceFactory
     private var proxyService: ProxyService
     private var isProxyServerRunning = false
     private var isPacServerRunning = false
 
-    /// 使用持久化的常规设置创建代理网络服务实例。
+    /// 使用持久化的常规设置和注入的核心服务工厂创建代理网络服务实例。
+    ///
+    /// - Parameters:
+    ///   - generalSettings: 当前持久化的代理监听配置。
+    ///   - makeMagentService: 为每套 NIO runtime 创建独立 Magent 核心服务的闭包。
     @MainActor
-    init(generalSettings: GeneralSettings) throws {
+    init(
+        generalSettings: GeneralSettings,
+        makeMagentService: @escaping MagentServiceFactory
+    ) throws {
         let configuration = try Configuration(generalSettings: generalSettings)
-        try self.init(configuration: configuration)
+        try self.init(configuration: configuration, makeMagentService: makeMagentService)
     }
 
-    private init(configuration: Configuration) throws {
+    private init(
+        configuration: Configuration,
+        makeMagentService: @escaping MagentServiceFactory
+    ) throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: configuration.proxyThreadNumber)
 
         self.configuration = configuration
         self.eventLoopGroup = eventLoopGroup
+        self.makeMagentService = makeMagentService
         self.proxyService = ProxyService(
             endpoint: configuration.proxyEndpoint,
             pacEndpoint: configuration.pacEndpoint,
             eventLoopGroup: eventLoopGroup,
-            threadNumber: configuration.proxyThreadNumber
+            threadNumber: configuration.proxyThreadNumber,
+            makeMagentService: makeMagentService
         )
     }
 
@@ -148,7 +161,8 @@ actor MagentProxyService {
             endpoint: configuration.proxyEndpoint,
             pacEndpoint: configuration.pacEndpoint,
             eventLoopGroup: eventLoopGroup,
-            threadNumber: configuration.proxyThreadNumber
+            threadNumber: configuration.proxyThreadNumber,
+            makeMagentService: makeMagentService
         )
     }
 
@@ -204,15 +218,12 @@ nonisolated private final class ProxyService {
         endpoint: MagentProxyService.ListenEndpoint,
         pacEndpoint: MagentProxyService.ListenEndpoint,
         eventLoopGroup: EventLoopGroup,
-        threadNumber: Int
+        threadNumber: Int,
+        makeMagentService: MagentServiceFactory
     ) {
         self.endpoint = endpoint
         self.eventLoopGroup = eventLoopGroup
-        self.magentService = MagentService(
-            threadNumber: threadNumber,
-            eventLoopGroup: eventLoopGroup,
-            pacEndpoint: pacEndpoint
-        )
+        self.magentService = makeMagentService(threadNumber, eventLoopGroup, pacEndpoint)
     }
 
     /// 打开本地 HTTP/SOCKS 代理监听端口；重复调用保持幂等。

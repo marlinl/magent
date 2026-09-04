@@ -7,6 +7,7 @@
 //
 
 import AppKit
+import FactoryKit
 import SwiftUI
 import SwiftData
 
@@ -136,6 +137,9 @@ struct MagentXApp: App {
             let container = try Self.makeModelContainer()
             let enableMenuBar = GeneralSettings.load().enableMenuBar
             modelContainer = container
+            Container.shared.magentProxyRuleService.register {
+                MagentProxyRuleService(modelContainer: container)
+            }
             _isMenuBarInserted = State(initialValue: enableMenuBar)
             MagentXAppDelegate.applyBackgroundPreference(enableMenuBar)
         } catch {
@@ -167,7 +171,12 @@ struct MagentXApp: App {
         .menuBarExtraStyle(.menu)
     }
 
-    private static func makeModelContainer() throws -> ModelContainer {
+    /// 创建应用 SwiftData 容器；Preview 可请求内存存储以隔离本地用户数据。
+    ///
+    /// - Parameter isStoredInMemoryOnly: 是否仅在内存中保存模型数据。
+    /// - Returns: 注册全部 MagentX 持久化模型的容器。
+    /// - Throws: 目录创建或 SwiftData 容器初始化失败时抛出原始错误。
+    static func makeModelContainer(isStoredInMemoryOnly: Bool = false) throws -> ModelContainer {
         let schema = Schema([
             MagentProxyNode.self,
             MagentProxyRule.self,
@@ -175,6 +184,11 @@ struct MagentXApp: App {
             ProxyPolicy.self,
             ProxyPolicyRule.self
         ])
+        if isStoredInMemoryOnly {
+            let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+            return try ModelContainer(for: schema, configurations: [configuration])
+        }
+
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: localDirectoryURL, withIntermediateDirectories: true)
         let storeURL = localDirectoryURL.appendingPathComponent("MagentX.store", isDirectory: false)

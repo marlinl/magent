@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		95A565CE2F85382A00F204EB /* Magent in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000022F83CF1800EDCF02 /* Magent */; };
+		FA0000032F8A000000000003 /* FactoryKit in Frameworks */ = {isa = PBXBuildFile; productRef = FA0000022F8A000000000002 /* FactoryKit */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -56,6 +57,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				FA0000032F8A000000000003 /* FactoryKit in Frameworks */,
 				95A565CE2F85382A00F204EB /* Magent in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -117,6 +119,7 @@
 			);
 			name = MagentX;
 			packageProductDependencies = (
+				FA0000022F8A000000000002 /* FactoryKit */,
 				AA0000022F83CF1800EDCF02 /* Magent */,
 			);
 			productName = MagentX;
@@ -203,6 +206,7 @@
 			mainGroup = 950BB1412F83CF1600EDCF07;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				FA0000012F8A000000000001 /* XCRemoteSwiftPackageReference "Factory" */,
 				AA0000012F83CF1800EDCF01 /* XCLocalSwiftPackageReference "../Magent" */,
 			);
 			preferredProjectObjectVersion = 77;
@@ -617,11 +621,27 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		FA0000012F8A000000000001 /* XCRemoteSwiftPackageReference "Factory" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/hmlongco/Factory";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 3.3.2;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		AA0000022F83CF1800EDCF02 /* Magent */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = AA0000012F83CF1800EDCF01 /* XCLocalSwiftPackageReference "../Magent" */;
 			productName = Magent;
+		};
+		FA0000022F8A000000000002 /* FactoryKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = FA0000012F8A000000000001 /* XCRemoteSwiftPackageReference "Factory" */;
+			productName = FactoryKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

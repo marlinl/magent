@@ -7,9 +7,9 @@
 //
 
 import AppKit
+import FactoryKit
 import Foundation
 import Magent
-import SwiftData
 import SwiftUI
 
 /// 包装原生搜索输入框，在动态加入工具栏后接管键盘焦点并把编辑状态同步回 SwiftUI。
@@ -108,8 +108,8 @@ private struct AutoFocusedSearchField: NSViewRepresentable {
 /// 代理规则页面，通过初始化、新增、删除、搜索、更新和同步六类页面操作管理 `MagentProxyRule`。
 @MainActor
 struct ProxyRulesView: View {
-    @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
+    @Injected(\.magentProxyRuleService) private var ruleService
     @State private var proxyRules: [MagentProxyRuleService.RuleSnapshot] = []
     @State private var searchText = ""
     @State private var submittedSearchText = ""
@@ -129,7 +129,7 @@ struct ProxyRulesView: View {
         submittedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// 注入由 `ContentView` 管理的工具栏按钮绑定；环境数据在 View 挂载后由 `search` 首次读取。
+    /// 注入由 `ContentView` 管理的工具栏按钮绑定；规则服务由 Factory 提供并在 `.task` 中首次查询。
     init(toolbarButtons: Binding<[ContentToolbarButton]>) {
         self._toolbarButtons = toolbarButtons
     }
@@ -315,10 +315,9 @@ struct ProxyRulesView: View {
         let matchType = draft.matchType
         let matchValues = draft.matchValues
         let decision = draft.decision
-        let modelContainer = modelContext.container
+        let ruleService = ruleService
         MagentXAsyncExecutor.shared.submit(
             operation: {
-                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
                 try await ruleService.add(
                     matchType: matchType,
                     matchValues: matchValues,
@@ -342,10 +341,9 @@ struct ProxyRulesView: View {
     /// - Parameter proxyRule: 待删除的界面规则快照。
     private func delete(_ proxyRule: MagentProxyRuleService.RuleSnapshot) {
         let id = proxyRule.id
-        let modelContainer = modelContext.container
+        let ruleService = ruleService
         MagentXAsyncExecutor.shared.submit(
             operation: {
-                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
                 try await ruleService.delete(id)
             },
             completion: { result in
@@ -363,13 +361,12 @@ struct ProxyRulesView: View {
     private func search() {
         let keyword = trimmedSearchText
         let pageSize = fetchLimit
-        let modelContainer = modelContext.container
+        let ruleService = ruleService
         let searchID = UUID()
         latestSearchID = searchID
 
         MagentXAsyncExecutor.shared.submit(
             operation: {
-                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
                 return try await ruleService.search(
                     keyword: keyword,
                     pageAt: 1,
@@ -399,10 +396,9 @@ struct ProxyRulesView: View {
         guard let id = draft.editingRuleID else { return }
         let matchType = draft.matchType
         let decision = draft.decision
-        let modelContainer = modelContext.container
+        let ruleService = ruleService
         MagentXAsyncExecutor.shared.submit(
             operation: {
-                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
                 try await ruleService.update(id: id, matchType: matchType, decision: decision)
             },
             completion: { result in
@@ -423,7 +419,7 @@ struct ProxyRulesView: View {
         isSearchPresented = false
 
         let now = Date.now
-        let modelContainer = modelContext.container
+        let ruleService = ruleService
         let executor = MagentXAsyncExecutor.shared
 
         isRefreshing = true
@@ -450,7 +446,6 @@ struct ProxyRulesView: View {
         executor.submit(
             priority: .utility,
             operation: {
-                let ruleService = MagentProxyRuleService(modelContainer: modelContainer)
                 try await ruleService.sync()
             },
             completion: { result in

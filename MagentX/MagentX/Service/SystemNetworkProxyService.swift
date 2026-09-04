@@ -6,6 +6,7 @@
 //  Responsibility: Applies MagentX background service state to macOS network proxy settings.
 //
 
+import FactoryKit
 import Foundation
 import SystemConfiguration
 
@@ -15,6 +16,7 @@ final class SystemNetworkProxyService {
     /// MagentX 进程内唯一的系统代理协调服务。
     static let shared = SystemNetworkProxyService()
 
+    @Injected(\.magentServiceFactory) private var makeMagentService
     private let systemProxyPreferences = SystemNetworkProxyPreferences()
     private var magentProxyService: MagentProxyService?
     private var dynamicStore: SCDynamicStore?
@@ -172,7 +174,10 @@ final class SystemNetworkProxyService {
             return magentProxyService
         }
 
-        let magentProxyService = try MagentProxyService(generalSettings: generalSettings)
+        let magentProxyService = try MagentProxyService(
+            generalSettings: generalSettings,
+            makeMagentService: makeMagentService
+        )
         self.magentProxyService = magentProxyService
         return magentProxyService
     }

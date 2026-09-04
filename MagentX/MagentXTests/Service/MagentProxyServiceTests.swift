@@ -18,7 +18,16 @@ struct MagentProxyServiceTests {
         let reservedPort = try ReservedTCPPort()
         let settings = GeneralSettings(proxyListenPort: reservedPort.port)
         let service = try await MainActor.run {
-            try MagentProxyService(generalSettings: settings)
+            try MagentProxyService(
+                generalSettings: settings,
+                makeMagentService: { threadNumber, eventLoopGroup, pacEndpoint in
+                    MagentService(
+                        threadNumber: threadNumber,
+                        eventLoopGroup: eventLoopGroup,
+                        pacEndpoint: pacEndpoint
+                    )
+                }
+            )
         }
 
         do {
@@ -36,7 +45,16 @@ struct MagentProxyServiceTests {
         let reservedPort = try ReservedTCPPort()
         let settings = GeneralSettings(pacListenPort: reservedPort.port)
         let service = try await MainActor.run {
-            try MagentProxyService(generalSettings: settings)
+            try MagentProxyService(
+                generalSettings: settings,
+                makeMagentService: { threadNumber, eventLoopGroup, pacEndpoint in
+                    MagentService(
+                        threadNumber: threadNumber,
+                        eventLoopGroup: eventLoopGroup,
+                        pacEndpoint: pacEndpoint
+                    )
+                }
+            )
         }
 
         do {
