@@ -30,7 +30,7 @@ enum SystemProxyMode: String, Codable, CaseIterable, Identifiable, Sendable {
 /// 当前后台代理服务配置。
 ///
 /// KV 模型，只保存服务开关状态和系统代理模式。
-struct CurrentSelection {
+nonisolated struct CurrentSelection: Sendable {
     static let stateStorageKey = "currentSelection.state"
 
     var state: BackgroundServiceState = BackgroundServiceState.stop

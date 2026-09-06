@@ -9,27 +9,130 @@
 import FactoryKit
 import Foundation
 import SystemConfiguration
+import Combine
 
 /// 监听当前 macOS 网络服务变化，并按 `CurrentSelection` 维护系统代理配置。
 @MainActor
-final class SystemNetworkProxyService {
+final class SystemNetworkProxyService: ObservableObject {
     /// MagentX 进程内唯一的系统代理协调服务。
     static let shared = SystemNetworkProxyService()
 
-    @Injected(\.magentServiceFactory) private var makeMagentService
-    private let systemProxyPreferences = SystemNetworkProxyPreferences()
-    private var magentProxyService: MagentProxyService?
+    /// 当前已持久化的后台代理服务选择，供所有界面入口共同显示。
+    @Published private(set) var currentSelection: CurrentSelection
+    /// 最近一次用户发起的服务切换错误，供界面显示和清除。
+    @Published private(set) var serviceError: String?
+    /// 是否正在应用服务状态，避免多个界面入口并发修改系统代理。
+    @Published private(set) var isApplying = false
+
+    @Injected(\.magentService) private var magentService
+    private let systemProxyPreferences: SystemNetworkProxyPreferences
     private var dynamicStore: SCDynamicStore?
     private var runLoopSource: CFRunLoopSource?
     private var activeConfiguration: SystemNetworkProxyConfiguration?
+    private let stateApplier: ((CurrentSelection, GeneralSettings) async throws -> Void)?
+    private let loadCurrentSelection: () -> CurrentSelection
+    private let saveCurrentSelection: (CurrentSelection) -> Void
+    private let disableMagentProxyOperation: () throws -> Void
+    private let stopPACServerOperation: @MainActor () async throws -> Void
+    private let stopMagentOperation: @MainActor () async throws -> Void
 
     /// 创建系统网络代理协调服务。
-    init() {}
+    ///
+    /// 默认构造直接读写应用选择并应用真实系统代理；可选依赖仅用于隔离服务状态事务测试。
+    ///
+    /// - Parameters:
+    ///   - stateApplier: 测试时替换真实系统代理应用的闭包。
+    ///   - loadCurrentSelection: 读取当前选择的持久化依赖。
+    ///   - saveCurrentSelection: 保存当前选择的持久化依赖。
+    ///   - disableMagentProxyOperation: 关闭系统代理的依赖；默认写入真实系统网络偏好。
+    ///   - stopPACServerOperation: 停止 PAC 监听器的依赖；默认调用共享 Magent 服务。
+    ///   - stopMagentOperation: 停止 Magent 核心监听器的依赖；默认调用共享 Magent 服务。
+    init(
+        stateApplier: ((CurrentSelection, GeneralSettings) async throws -> Void)? = nil,
+        loadCurrentSelection: @escaping () -> CurrentSelection = { CurrentSelection.load() },
+        saveCurrentSelection: @escaping (CurrentSelection) -> Void = { $0.save() },
+        disableMagentProxyOperation: (() throws -> Void)? = nil,
+        stopPACServerOperation: (@MainActor () async throws -> Void)? = nil,
+        stopMagentOperation: (@MainActor () async throws -> Void)? = nil
+    ) {
+        let resolvedMagentService = Container.shared.magentService()
+        let resolvedSystemProxyPreferences = SystemNetworkProxyPreferences()
+        self.stateApplier = stateApplier
+        self.loadCurrentSelection = loadCurrentSelection
+        self.saveCurrentSelection = saveCurrentSelection
+        self.systemProxyPreferences = resolvedSystemProxyPreferences
+        self.disableMagentProxyOperation = disableMagentProxyOperation ?? {
+            try resolvedSystemProxyPreferences.disableMagentProxy()
+        }
+        self.stopPACServerOperation = stopPACServerOperation ?? {
+            try await resolvedMagentService.stopPACServer()
+        }
+        self.stopMagentOperation = stopMagentOperation ?? {
+            try await resolvedMagentService.stop()
+        }
+        self.currentSelection = loadCurrentSelection()
+    }
+
+    /// 当前选择是否表示代理服务已启动。
+    var isServiceStarted: Bool {
+        currentSelection.state == .start
+    }
+
+    /// 从持久化存储重新读取当前服务选择。
+    func reloadCurrentSelection() {
+        currentSelection = loadCurrentSelection()
+    }
+
+    /// 按持久化状态恢复已启动的代理服务，并把结果反馈给共享界面状态。
+    func applyStoredConfigurationIfNeeded() async {
+        reloadCurrentSelection()
+        guard currentSelection.state == .start, isApplying == false else { return }
+
+        isApplying = true
+        defer { isApplying = false }
+
+        do {
+            try await applyStoredConfiguration()
+            serviceError = nil
+            reloadCurrentSelection()
+        } catch {
+            MagentXLogger.error(
+                error,
+                category: .service,
+                message: "Failed to apply stored proxy service configuration",
+                metadata: [
+                    "state": currentSelection.state.rawValue,
+                    "mode": currentSelection.mode.rawValue
+                ]
+            )
+            serviceError = error.localizedDescription
+        }
+    }
+
+    /// 启动代理服务，并且只在成功后持久化启动状态。
+    func startService() async {
+        await applyServiceState(.start)
+    }
+
+    /// 停止代理服务，并且只在成功后持久化停止状态。
+    func stopService() async {
+        await applyServiceState(.stop)
+    }
+
+    /// 在启动和停止状态之间切换代理服务。
+    func toggleService() async {
+        await applyServiceState(isServiceStarted ? .stop : .start)
+    }
+
+    /// 清除最近一次服务操作的界面错误提示。
+    func clearServiceError() {
+        serviceError = nil
+    }
 
     /// 读取持久化配置并应用当前后台代理服务状态。
     func applyStoredConfiguration() async throws {
         try await apply(
-            currentSelection: CurrentSelection.load(),
+            currentSelection: loadCurrentSelection(),
             generalSettings: GeneralSettings.load()
         )
     }
@@ -114,35 +217,81 @@ final class SystemNetworkProxyService {
             currentSelection: currentSelection,
             generalSettings: generalSettings
         )
-        activeConfiguration = configuration
 
-        if configuration.state == .start {
-            try startMonitoring()
-        } else {
+        guard configuration.state == .start else {
             stopMonitoring()
+            activeConfiguration = nil
+            try await apply(configuration: configuration)
+            return
         }
 
-        try await apply(configuration: configuration, generalSettings: generalSettings)
+        activeConfiguration = configuration
+        do {
+            try startMonitoring()
+            try await apply(configuration: configuration)
+        } catch {
+            activeConfiguration = nil
+            stopMonitoring()
+            await stopLocalProxyServicesAfterFailedStart()
+            throw error
+        }
     }
 
-    private func apply(
-        configuration: SystemNetworkProxyConfiguration,
-        generalSettings: GeneralSettings
-    ) async throws {
+    /// 串行应用用户请求的服务状态，并在成功后更新持久化和可观察选择。
+    ///
+    /// - Parameter state: 用户请求的后台服务状态。
+    private func applyServiceState(_ state: BackgroundServiceState) async {
+        guard isApplying == false else { return }
+
+        isApplying = true
+        defer { isApplying = false }
+
+        var nextSelection = loadCurrentSelection()
+        nextSelection.state = state
+
+        do {
+            let generalSettings = GeneralSettings.load()
+            if let stateApplier {
+                try await stateApplier(nextSelection, generalSettings)
+            } else {
+                try await apply(currentSelection: nextSelection, generalSettings: generalSettings)
+            }
+            saveCurrentSelection(nextSelection)
+            currentSelection = nextSelection
+            serviceError = nil
+        } catch {
+            currentSelection = loadCurrentSelection()
+            MagentXLogger.error(
+                error,
+                category: .service,
+                message: "Failed to apply proxy service state",
+                metadata: [
+                    "requestedState": state.rawValue,
+                    "currentState": currentSelection.state.rawValue,
+                    "mode": currentSelection.mode.rawValue
+                ]
+            )
+            serviceError = error.localizedDescription
+        }
+    }
+
+    /// 应用已校验的运行配置，并统一协调本地服务和系统代理设置。
+    ///
+    /// - Parameter configuration: 当前后台服务、代理模式和监听端点快照。
+    private func apply(configuration: SystemNetworkProxyConfiguration) async throws {
         switch configuration.state {
         case .stop:
-            try systemProxyPreferences.disableMagentProxy()
+            try disableMagentProxyOperation()
             try await stopLocalProxyServices()
         case .start:
-            try await applyStartedMode(configuration: configuration, generalSettings: generalSettings)
+            try await applyStartedMode(configuration: configuration)
         }
     }
 
-    private func applyStartedMode(
-        configuration: SystemNetworkProxyConfiguration,
-        generalSettings: GeneralSettings
-    ) async throws {
-        let proxyService = try await configuredProxyService(generalSettings: generalSettings)
+    /// 启动 Magent 与 PAC 监听器，并按当前模式写入对应系统代理配置。
+    ///
+    /// - Parameter configuration: 已校验的启动模式和监听配置。
+    private func applyStartedMode(configuration: SystemNetworkProxyConfiguration) async throws {
         MagentXLogger.info(
             "Starting proxy services",
             category: .service,
@@ -153,41 +302,64 @@ final class SystemNetworkProxyService {
             ]
         )
 
-        switch configuration.mode {
-        case .pac:
-            try await proxyService.startProxyServer()
-            try await proxyService.startPacServer()
-            try systemProxyPreferences.applyPAC(url: configuration.pacURL)
-        case .global:
-            try await proxyService.startProxyServer()
-            try await proxyService.startPacServer()
-            try systemProxyPreferences.applySOCKS(endpoint: configuration.proxyEndpoint)
-        case .tunnel:
-            try systemProxyPreferences.disableMagentProxy()
+        if case .tunnel = configuration.mode {
+            try disableMagentProxyOperation()
             throw MagentXError.tunnelModeNotImplemented
         }
+
+        try await magentService.start(
+            address: configuration.proxyEndpoint.address,
+            port: configuration.proxyEndpoint.port
+        )
+        try await magentService.startPACServer()
+
+        switch configuration.mode {
+        case .pac:
+            try systemProxyPreferences.applyPAC(url: configuration.pacURL)
+        case .global:
+            try systemProxyPreferences.applySOCKS(endpoint: configuration.proxyEndpoint)
+        case .tunnel:
+            break
+        }
     }
 
-    private func configuredProxyService(generalSettings: GeneralSettings) async throws -> MagentProxyService {
-        if let magentProxyService {
-            try await magentProxyService.reload(generalSettings: generalSettings)
-            return magentProxyService
+    /// 停止 PAC HTTP 和 Magent 核心监听器；二者均支持重复停止。
+    private func stopLocalProxyServices() async throws {
+        var firstError: Error?
+
+        do {
+            try await stopPACServerOperation()
+        } catch {
+            firstError = error
         }
 
-        let magentProxyService = try MagentProxyService(
-            generalSettings: generalSettings,
-            makeMagentService: makeMagentService
-        )
-        self.magentProxyService = magentProxyService
-        return magentProxyService
+        do {
+            try await stopMagentOperation()
+        } catch {
+            if firstError == nil {
+                firstError = error
+            }
+        }
+
+        if let firstError {
+            throw firstError
+        }
     }
 
-    private func stopLocalProxyServices() async throws {
-        guard let magentProxyService else { return }
-        try await magentProxyService.stopPacServer()
-        try await magentProxyService.stopProxyServer()
+    /// 在启动失败后尽力停止本地监听器，同时保留触发启动失败的原始错误。
+    private func stopLocalProxyServicesAfterFailedStart() async {
+        do {
+            try await stopLocalProxyServices()
+        } catch {
+            MagentXLogger.error(
+                error,
+                category: .service,
+                message: "Failed to stop local proxy services after startup failure"
+            )
+        }
     }
 
+    /// 网络主服务变化后，按最近成功应用的启动配置重新写入系统代理项。
     private func handleNetworkChange() {
         guard let activeConfiguration, activeConfiguration.state == .start else { return }
 
@@ -210,6 +382,7 @@ final class SystemNetworkProxyService {
         }
     }
 
+    /// 将 SystemConfiguration 的网络变化回调转交给主 actor 上的共享协调服务。
     private static let dynamicStoreDidChange: SCDynamicStoreCallBack = { _, _, info in
         guard let info else { return }
         let service = Unmanaged<SystemNetworkProxyService>
@@ -220,6 +393,9 @@ final class SystemNetworkProxyService {
         }
     }
 
+    /// 读取最近一次 SystemConfiguration 调用的可展示错误文本。
+    ///
+    /// - Returns: SystemConfiguration 提供的错误描述。
     private static func systemConfigurationError() -> String {
         String(cString: SCErrorString(SCError()))
     }
@@ -236,7 +412,11 @@ private struct SystemNetworkProxyConfiguration {
         URL(string: "http://\(pacEndpoint.urlHost):\(pacEndpoint.port)/proxy.pac")!
     }
 
-    @MainActor
+    /// 根据持久化选择和常规设置创建可跨异步边界使用的系统代理配置快照。
+    ///
+    /// - Parameters:
+    ///   - currentSelection: 当前服务开关与代理模式选择。
+    ///   - generalSettings: 本次启动使用的监听设置。
     init(
         currentSelection: CurrentSelection,
         generalSettings: GeneralSettings
@@ -263,6 +443,11 @@ private struct SystemNetworkProxyEndpoint {
         address.contains(":") ? "[\(address)]" : address
     }
 
+    /// 规范化并校验系统代理端点。
+    ///
+    /// - Parameters:
+    ///   - address: 待校验的监听地址。
+    ///   - port: 待校验的监听端口。
     init(address: String, port: Int) throws {
         let normalizedAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard normalizedAddress.isEmpty == false else {
@@ -314,6 +499,9 @@ private final class SystemNetworkProxyPreferences {
         }
     }
 
+    /// 锁定当前网络偏好，将给定变更应用到所有活跃网络服务并提交。
+    ///
+    /// - Parameter mutate: 对每个服务代理字典执行的原子修改。
     private func updateCurrentNetworkServices(
         mutate: (inout [String: Any]) -> Void
     ) throws {
@@ -337,6 +525,11 @@ private final class SystemNetworkProxyPreferences {
         }
     }
 
+    /// 遍历应更新的网络服务并写回其代理协议配置。
+    ///
+    /// - Parameters:
+    ///   - preferences: 已锁定的系统网络偏好。
+    ///   - mutate: 对每个服务代理字典执行的修改。
     private func updateProxyProtocols(
         in preferences: SCPreferences,
         mutate: (inout [String: Any]) -> Void
@@ -370,6 +563,12 @@ private final class SystemNetworkProxyPreferences {
         }
     }
 
+    /// 判断网络服务是否启用且属于当前活动连接。
+    ///
+    /// - Parameters:
+    ///   - service: 待检查的系统网络服务。
+    ///   - activeServiceIDs: IPv4 与 IPv6 当前主服务标识集合。
+    /// - Returns: 是否应写入 MagentX 管理的代理配置。
     private static func shouldUpdate(
         service: SCNetworkService,
         activeServiceIDs: Set<String>
@@ -381,6 +580,9 @@ private final class SystemNetworkProxyPreferences {
         return activeServiceIDs.isEmpty || activeServiceIDs.contains(serviceID)
     }
 
+    /// 读取 IPv4 与 IPv6 当前主网络服务标识。
+    ///
+    /// - Returns: 为空时表示无法识别主服务，调用方会退回更新所有启用服务。
     private static func activeServiceIDs() -> Set<String> {
         guard let store = SCDynamicStoreCreate(
             nil,
@@ -401,6 +603,9 @@ private final class SystemNetworkProxyPreferences {
         })
     }
 
+    /// 读取最近一次 SystemConfiguration 调用的可展示错误文本。
+    ///
+    /// - Returns: SystemConfiguration 提供的错误描述。
     private static func systemConfigurationError() -> String {
         String(cString: SCErrorString(SCError()))
     }

@@ -16,37 +16,13 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
     /// 应用菜单栏后台运行偏好。
     static var keepsRunningAfterLastWindowClosed = true
 
-    private var singleInstanceLock: CurrentUserAppInstanceLock?
-    private var isSecondaryInstance = false
-
     /// 应用设置中的后台运行偏好。
     static func applyBackgroundPreference(_ isEnabled: Bool) {
         keepsRunningAfterLastWindowClosed = isEnabled
     }
 
-    /// 打开主窗口前激活当前应用。
-    static func prepareMainWindowPresentation() {
-        NSApplication.shared.activate(ignoringOtherApps: true)
-    }
-
-    /// 在应用完成启动前取得当前用户的单实例锁；重复启动时唤起已有实例并退出本进程。
-    func applicationWillFinishLaunching(_ notification: Notification) {
-        do {
-            singleInstanceLock = try CurrentUserAppInstanceLock()
-        } catch MagentXError.anotherInstanceRunning {
-            isSecondaryInstance = true
-            activateExistingInstanceAndTerminate()
-        } catch {
-            isSecondaryInstance = true
-            MagentXLogger.fault(error, category: .app, message: "Failed to enforce single-instance launch")
-            NSApplication.shared.terminate(nil)
-        }
-    }
-
     /// 应用启动后按持久化状态恢复本地代理和系统代理配置。
     func applicationDidFinishLaunching(_ notification: Notification) {
-        guard !isSecondaryInstance else { return }
-
         MagentXLogger.info(
             "Application did finish launching",
             category: .app,
@@ -67,8 +43,6 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
 
     /// 应用退出前停止进程内本地监听，并清理 MagentX 写入的系统代理配置。
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard !isSecondaryInstance else { return .terminateNow }
-
         MagentXLogger.info("Application will terminate", category: .app)
         Task { @MainActor in
             await SystemNetworkProxyService.shared.deactivateRuntimeServices()
@@ -85,36 +59,6 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
     /// 允许用户点击 Dock 图标时重新打开窗口。
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         return true
-    }
-
-    private func activateExistingInstanceAndTerminate() {
-        Task { @MainActor in
-            for _ in 0..<10 {
-                if Self.activateExistingInstance() {
-                    break
-                }
-                try? await Task.sleep(for: .milliseconds(100))
-            }
-            NSApplication.shared.terminate(nil)
-        }
-    }
-
-    private static func activateExistingInstance() -> Bool {
-        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return false }
-
-        let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
-        guard let existingInstance = NSRunningApplication
-            .runningApplications(withBundleIdentifier: bundleIdentifier)
-            .filter({ $0.processIdentifier != currentProcessIdentifier && !$0.isTerminated })
-            .min(by: { ($0.launchDate ?? .distantFuture) < ($1.launchDate ?? .distantFuture) })
-        else {
-            return false
-        }
-
-        return existingInstance.activate(
-            from: NSRunningApplication.current,
-            options: [.activateAllWindows]
-        )
     }
 }
 
@@ -180,9 +124,8 @@ struct MagentXApp: App {
         let schema = Schema([
             MagentProxyNode.self,
             MagentProxyRule.self,
-            AccessControlRule.self,
-            ProxyPolicy.self,
-            ProxyPolicyRule.self
+            MagentProxyPolicy.self,
+            MagentProxyPolicyRule.self
         ])
         if isStoredInMemoryOnly {
             let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)

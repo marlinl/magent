@@ -1,17 +1,10 @@
-//
-//  ProxyRuleDraft.swift
-//  MagentX
-//
-//  Responsibility: Stores uncommitted proxy-rule form values.
-//
-
 import Foundation
 import Magent
 
-/// 代理规则新增或编辑期间使用的表单草稿，避免取消操作影响持久化实体。
+/// 代理规则页面的临时表单状态，避免取消新增或编辑时直接修改持久化规则。
 struct ProxyRuleDraft: Identifiable {
     let id = UUID()
-    let editingRuleID: Int?
+    let editingRule: MagentProxyRule?
     var matchType: MatchType
     var matchValuesText: String
     var decision: RuleDecision

@@ -10,7 +10,7 @@ import Foundation
 import OSLog
 
 /// MagentX 运行期日志分类，对应 Apple Unified Logging 的 category。
-enum MagentXLogCategory: String, Codable, Sendable {
+nonisolated enum MagentXLogCategory: String, Codable, Sendable {
     case app
     case service
     case systemProxy
@@ -19,7 +19,7 @@ enum MagentXLogCategory: String, Codable, Sendable {
 }
 
 /// MagentX 运行期日志级别，统一映射到 `Logger` 和本地日志文件。
-enum MagentXLogLevel: String, Codable, Sendable {
+nonisolated enum MagentXLogLevel: String, Codable, Sendable {
     case debug
     case info
     case warning
@@ -133,7 +133,7 @@ enum MagentXLogger {
 }
 
 /// 本地日志文件单行记录，使用 JSON Lines 便于 Console 之外的脚本排查。
-private struct MagentXLogFileEntry: Encodable {
+private nonisolated struct MagentXLogFileEntry: Encodable, Sendable {
     let timestamp: Date
     let level: MagentXLogLevel
     let category: MagentXLogCategory

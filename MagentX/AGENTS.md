@@ -8,6 +8,10 @@ Swift 类型声明必须写 `///` 文档注释，说明该类型承担的业务�
 
 MagentX app 层异常错误统一定义在 `MagentX/MagentXError.swift` 的 `MagentXError` 中。不要在 Controller、Service、Model 或 View 中新增局部 `Error`/`LocalizedError` enum；需要新错误时给 `MagentXError` 增加 case。
 
+## IoC 注入命名
+
+使用 `@Injected` 注入的实例变量必须采用其类型名的 lowerCamelCase 形式，不得使用泛化或职责缩写名称。例如 `MagentProxyRuleService` 必须命名为 `magentProxyRuleService`，不能命名为 `service` 或 `ruleService`。
+
 ## Unit Testing & Access Control
 
 UT 应测试调用方能够访问的方法及其可观察行为，不要求每个新增或修改的实现方法都一一对应新增测试方法。测试数量应由业务行为、输入边界和分支数量决定；同一个可访问方法可以使用多个测试方法分别覆盖成功、失败和边界场景。

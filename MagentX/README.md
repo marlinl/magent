@@ -19,21 +19,16 @@ MagentX/MagentX/
 ├── MagentXApp.swift
 ├── MagentXError.swift
 ├── Model/
-│   ├── AccessControlRule.swift
 │   ├── CurrentSelection.swift
 │   ├── GeneralSettings.swift
 │   ├── MagentNode.swift
-│   ├── MagentProxyRule.swift
-│   ├── ProxyPolicy.swift
-│   └── ProxyPolicyRule.swift
+│   └── MagentProxyRule.swift
 ├── Service/
 │   ├── MagentProxyRuleService.swift
-│   ├── MagentProxyService.swift
-│   ├── PacFileService.swift
+│   ├── MagentService.swift
 │   └── SystemNetworkProxyService.swift
 ├── Controller/
 │   ├── NodeController.swift
-│   ├── PolicyController.swift
 │   └── SettingsController.swift
 ├── View/
 │   ├── ContentView.swift
@@ -66,21 +61,17 @@ Network
 - `ProxyNode`: persisted proxy node configuration. The first supported node type is Shadowsocks.
 - `GeneralSettings`: persisted global app configuration, including launch-at-login, menu bar behavior, local proxy listening, optional iCloud sync preference, and the rules subscription URL.
 - `CurrentSelection`: persisted selection state for the active proxy node.
-- `AccessControlRule`: persisted access-control rule. The rule-list refresh path stores imported rules with `source = "rulesUrl"`.
 - `MagentProxyRule`: persisted proxy rule used directly by `ProxyRulesView`, including typed direct/proxy decisions.
-- `ProxyPolicy`: persisted policy group with its own id, display name, suffix domain text, and optional selected Magent node id.
-- `ProxyPolicyRule`: persisted join between a `ProxyPolicy` id and an `AccessControlRule` id.
 
 ## Services
 
 `MagentProxyRuleService` downloads and parses the configured rule subscription, then merges imported rules tagged with `source = "rulesUrl"` into SwiftData on its model actor.
 
-`PacFileService` compiles the complete persisted proxy rule set into `~/.MagentX/proxy.pac`. `ProxyRulesView` rewrites that file after subscription refreshes, and `MagentProxyService` serves the latest file through the local PAC HTTP endpoint.
+`MagentProxyRuleService` rewrites the complete persisted proxy rule set to the app-local `pac.json` after a subscription refresh. `MagentService` serves the latest file through the local PAC HTTP endpoint.
 
 ## Controllers
 
 - `NodeController`: manages `ProxyNode` CRUD through SwiftData.
-- `PolicyController`: manages proxy policy business operations through SwiftData.
 - `SettingsController`: manages default settings records and menu bar background behavior.
 
 ## Core Package Dependencies

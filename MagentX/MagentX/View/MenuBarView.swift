@@ -13,34 +13,29 @@ import SwiftUI
 struct MenuBarView: View {
     @Environment(\.openWindow) private var openWindow
     @Binding var isMenuBarInserted: Bool
-    @StateObject private var serviceController = MagentServiceController()
-
-    private var currentState: BackgroundServiceState {
-        serviceController.currentSelection.state
-    }
+    @ObservedObject private var systemNetworkProxyService = SystemNetworkProxyService.shared
 
     var body: some View {
         Group {
             Label(
-                currentState == .start ? "当前状态：已开启" : "当前状态：已关闭",
-                systemImage: currentState == .start ? "checkmark.circle" : "pause.circle"
+                systemNetworkProxyService.isServiceStarted ? "当前状态：已开启" : "当前状态：已关闭",
+                systemImage: systemNetworkProxyService.isServiceStarted ? "checkmark.circle" : "pause.circle"
             )
 
-            Button(currentState == .start ? "关闭代理服务" : "开启代理服务") {
+            Button(systemNetworkProxyService.isServiceStarted ? "关闭代理服务" : "开启代理服务") {
                 Task {
-                    await serviceController.toggleService()
+                    await systemNetworkProxyService.toggleService()
                 }
             }
-            .disabled(serviceController.isApplying)
+            .disabled(systemNetworkProxyService.isApplying)
 
-            if let serviceError = serviceController.serviceError {
+            if let serviceError = systemNetworkProxyService.serviceError {
                 Text(serviceError)
             }
 
             Divider()
 
             Button("打开 MagentX") {
-                MagentXAppDelegate.prepareMainWindowPresentation()
                 openWindow(id: MagentXApp.mainWindowID)
             }
 
@@ -51,9 +46,9 @@ struct MenuBarView: View {
             }
         }
         .onAppear {
-            serviceController.reloadCurrentSelection()
+            systemNetworkProxyService.reloadCurrentSelection()
             Task {
-                await serviceController.applyStoredConfigurationIfNeeded()
+                await systemNetworkProxyService.applyStoredConfigurationIfNeeded()
             }
         }
     }

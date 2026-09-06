@@ -26,6 +26,9 @@ CREATE TABLE magent_proxy_rules (
     updated_at INTEGER NOT NULL
 ) STRICT;
 
+CREATE UNIQUE INDEX idx_magent_proxy_rules_match_type_match_value
+    ON magent_proxy_rules (match_type, match_value);
+
 CREATE TABLE magent_proxy_policies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,

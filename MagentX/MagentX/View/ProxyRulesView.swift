@@ -10,6 +10,7 @@ import AppKit
 import FactoryKit
 import Foundation
 import Magent
+import SwiftData
 import SwiftUI
 
 /// 包装原生搜索输入框，在动态加入工具栏后接管键盘焦点并把编辑状态同步回 SwiftUI。
@@ -17,7 +18,7 @@ import SwiftUI
 private struct AutoFocusedSearchField: NSViewRepresentable {
     @Binding var text: String
     @Binding var isPresented: Bool
-    let onSubmit: (String) -> Void
+    let onSubmit: () -> Void
 
     /// 创建负责 AppKit 委托与提交动作转发的协调器。
     func makeCoordinator() -> Coordinator {
@@ -71,7 +72,7 @@ private struct AutoFocusedSearchField: NSViewRepresentable {
         /// 用户按下回车或点击搜索图标时提交当前搜索文本。
         @objc func submit(_ searchField: NSSearchField) {
             parent.text = searchField.stringValue
-            parent.onSubmit(searchField.stringValue)
+            parent.onSubmit()
         }
     }
 
@@ -105,31 +106,38 @@ private struct AutoFocusedSearchField: NSViewRepresentable {
     }
 }
 
-/// 代理规则页面，通过初始化、新增、删除、搜索、更新和同步六类页面操作管理 `MagentProxyRule`。
+/// 代理规则页面，通过初始化、新增、搜索和同步四类页面操作管理规则。
 @MainActor
 struct ProxyRulesView: View {
     @Environment(\.scenePhase) private var scenePhase
-    @Injected(\.magentProxyRuleService) private var ruleService
-    @State private var proxyRules: [MagentProxyRuleService.RuleSnapshot] = []
-    @State private var searchText = ""
-    @State private var submittedSearchText = ""
-    @State private var isSearchPresented = false
+    @Injected(\.localExecutor) private var localExecutor
+    @Injected(\.magentProxyRuleService) private var magentProxyRuleService
     @State private var loadError: String?
-    @State private var canLoadMore = false
+    @State private var searchQuery = SearchQuery()
     @State private var isRefreshing = false
     @State private var draft: ProxyRuleDraft?
-    @State private var fetchLimit = Self.pageSize
-    @State private var latestSearchID: UUID?
+    @State private var pagingResult = ProxyRulesPagingResult(
+        persistentIdentifiers: [],
+        pageAt: 1,
+        pageSize: Self.pageSize,
+        canLoadMore: false
+    )
     @Binding var toolbarButtons: [ContentToolbarButton]
 
     private static let pageSize = 50
 
-    /// 去除首尾空白后的搜索关键字。
-    private var trimmedSearchText: String {
-        submittedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// 表示规则搜索的关键字与工具栏输入框的呈现状态。
+    private struct SearchQuery {
+        var text = ""
+        var isPresented = false
+
+        /// 返回去除首尾空白后的搜索关键字，供查询与空状态文案使用。
+        var trimmedSearchText: String {
+            text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
-    /// 注入由 `ContentView` 管理的工具栏按钮绑定；规则服务由 Factory 提供并在 `.task` 中首次查询。
+    /// 注入由 `ContentView` 管理的工具栏按钮绑定；规则服务由 Factory 提供并在页面出现时首次查询。
     init(toolbarButtons: Binding<[ContentToolbarButton]>) {
         self._toolbarButtons = toolbarButtons
     }
@@ -142,37 +150,33 @@ struct ProxyRulesView: View {
                     systemImage: "exclamationmark.triangle",
                     description: Text(loadError)
                 )
-            } else if proxyRules.isEmpty {
-                ContentUnavailableView(
-                    trimmedSearchText.isEmpty ? "暂无规则" : "未找到规则",
-                    systemImage: trimmedSearchText.isEmpty ? "arrow.triangle.branch" : "magnifyingglass",
-                    description: Text(trimmedSearchText.isEmpty ? "MagentProxyRule 会显示在这里" : trimmedSearchText)
-                )
             } else {
-                rulesTable
+                RulesTableView(
+                    searchQuery: searchQuery.trimmedSearchText,
+                    proxyRulesPagingResult: $pagingResult,
+                    isRefreshing: $isRefreshing
+                )
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
         .simultaneousGesture(
             TapGesture().onEnded {
-                guard isSearchPresented else { return }
-                isSearchPresented = false
+                guard searchQuery.isPresented else { return }
+                searchQuery.isPresented = false
             }
         )
         .onChange(of: scenePhase) { _, phase in
-            guard phase != .active, isSearchPresented else { return }
-            isSearchPresented = false
+            guard phase != .active, searchQuery.isPresented else { return }
+            searchQuery.isPresented = false
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                if isSearchPresented {
+                if searchQuery.isPresented {
                     AutoFocusedSearchField(
-                        text: $searchText,
-                        isPresented: $isSearchPresented
-                    ) { submittedText in
-                        submittedSearchText = submittedText
-                        fetchLimit = Self.pageSize
+                        text: $searchQuery.text,
+                        isPresented: $searchQuery.isPresented
+                    ) {
                         search()
                     }
                         .controlSize(.regular)
@@ -180,7 +184,7 @@ struct ProxyRulesView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
                     Button {
-                        isSearchPresented = true
+                        searchQuery.isPresented = true
                     } label: {
                         Label("搜索规则", systemImage: "magnifyingglass")
                             .labelStyle(.iconOnly)
@@ -192,24 +196,30 @@ struct ProxyRulesView: View {
             }
         }
         .sheet(item: $draft) { draft in
-            if draft.editingRuleID == nil {
+            if draft.editingRule == nil {
                 AddProxyRuleFormView(
+                    magentProxyRuleService: magentProxyRuleService,
                     draft: draft,
+                    loadError: $loadError,
                     onCancel: {
                         self.draft = nil
                     },
-                    onSave: { draft in
-                        add(draft)
+                    onAdded: {
+                        self.draft = nil
+                        search()
                     }
                 )
             } else {
                 UpdateProxyRuleFormView(
+                    magentProxyRuleService: magentProxyRuleService,
                     draft: draft,
+                    loadError: $loadError,
                     onCancel: {
                         self.draft = nil
                     },
-                    onSave: { draft in
-                        update(draft)
+                    onUpdated: {
+                        self.draft = nil
+                        search()
                     }
                 )
             }
@@ -217,9 +227,9 @@ struct ProxyRulesView: View {
         .onAppear {
             toolbarButtons = [
                 ContentToolbarButton(title: "增加规则", systemImage: "plus") {
-                    isSearchPresented = false
+                    searchQuery.isPresented = false
                     draft = ProxyRuleDraft(
-                        editingRuleID: nil,
+                        editingRule: nil,
                         matchType: .domainSuffix,
                         matchValuesText: "",
                         decision: .proxy
@@ -233,201 +243,24 @@ struct ProxyRulesView: View {
                 }
             ]
         }
-        .task {
+        .onAppear {
             search()
         }
-    }
-
-    /// 展示规则列表，并在末行出现时继续加载下一页。
-    private var rulesTable: some View {
-        Table(proxyRules) {
-            TableColumn("匹配值") { proxyRule in
-                Text(proxyRule.matchValue)
-                    .lineLimit(1)
-                    .onAppear {
-                        guard proxyRule.id == proxyRules.last?.id, canLoadMore else { return }
-                        fetchLimit += Self.pageSize
-                        search()
-                    }
-            }
-            .width(min: 64, ideal: 280)
-
-            TableColumn("类型") { proxyRule in
-                Text(proxyRule.matchType.rawValue)
-                    .lineLimit(1)
-            }
-            .width(min: 44, ideal: 80, max: 110)
-
-            TableColumn("顺序") { proxyRule in
-                Text(proxyRule.order, format: .number)
-                    .lineLimit(1)
-            }
-            .width(min: 40, ideal: 56, max: 72)
-
-            TableColumn("来源") { proxyRule in
-                Text(proxyRule.source.isEmpty ? "-" : proxyRule.source)
-                    .lineLimit(1)
-            }
-            .width(min: 44, ideal: 76, max: 100)
-
-            TableColumn("规则") { proxyRule in
-                Text(proxyRule.decision.rawValue.uppercased())
-                    .lineLimit(1)
-            }
-            .width(min: 44, ideal: 64, max: 84)
-
-            TableColumn("操作") { proxyRule in
-                ControlGroup {
-                    Button {
-                        draft = ProxyRuleDraft(
-                            editingRuleID: proxyRule.id,
-                            matchType: proxyRule.matchType,
-                            matchValuesText: proxyRule.matchValue,
-                            decision: proxyRule.decision
-                        )
-                    } label: {
-                        Label("编辑规则", systemImage: "pencil")
-                            .labelStyle(.iconOnly)
-                    }
-                    .help("编辑规则")
-                    .buttonStyle(.glass)
-
-                    Button(role: .destructive) {
-                        delete(proxyRule)
-                    } label: {
-                        Label("删除规则", systemImage: "trash")
-                            .labelStyle(.iconOnly)
-                    }
-                    .help("删除规则")
-                    .buttonStyle(.glass)
-                }
-                .controlSize(.small)
-            }
-            .width(min: 72, ideal: 88, max: 96)
-        }
-    }
-
-    /// 把新增草稿交给 `MagentProxyRuleService`，成功后关闭表单并刷新列表。
-    ///
-    /// - Parameter draft: 包含批量匹配值、匹配类型和动作的新增草稿。
-    private func add(_ draft: ProxyRuleDraft) {
-        guard draft.editingRuleID == nil else { return }
-        let matchType = draft.matchType
-        let matchValues = draft.matchValues
-        let decision = draft.decision
-        let ruleService = ruleService
-        MagentXAsyncExecutor.shared.submit(
-            operation: {
-                try await ruleService.add(
-                    matchType: matchType,
-                    matchValues: matchValues,
-                    decision: decision
-                )
-            },
-            completion: { result in
-                switch result {
-                case .success:
-                    self.draft = nil
-                    search()
-                case .failure(let error):
-                    loadError = error.localizedDescription
-                }
-            }
-        )
-    }
-
-    /// 把指定规则的业务 id 交给 `MagentProxyRuleService` 删除，成功后刷新列表。
-    ///
-    /// - Parameter proxyRule: 待删除的界面规则快照。
-    private func delete(_ proxyRule: MagentProxyRuleService.RuleSnapshot) {
-        let id = proxyRule.id
-        let ruleService = ruleService
-        MagentXAsyncExecutor.shared.submit(
-            operation: {
-                try await ruleService.delete(id)
-            },
-            completion: { result in
-                switch result {
-                case .success:
-                    search()
-                case .failure(let error):
-                    loadError = error.localizedDescription
-                }
-            }
-        )
-    }
-
-    /// 通过 `MagentProxyRuleService` 按当前关键字和分页上限读取界面快照。
-    private func search() {
-        let keyword = trimmedSearchText
-        let pageSize = fetchLimit
-        let ruleService = ruleService
-        let searchID = UUID()
-        latestSearchID = searchID
-
-        MagentXAsyncExecutor.shared.submit(
-            operation: {
-                return try await ruleService.search(
-                    keyword: keyword,
-                    pageAt: 1,
-                    pageSize: pageSize
-                )
-            },
-            completion: { result in
-                guard latestSearchID == searchID else { return }
-                switch result {
-                case .success(let searchResult):
-                    proxyRules = searchResult.rules
-                    canLoadMore = searchResult.canLoadMore
-                    loadError = nil
-                case .failure(let error):
-                    proxyRules = []
-                    canLoadMore = false
-                    loadError = error.localizedDescription
-                }
-            }
-        )
-    }
-
-    /// 把编辑草稿交给 `MagentProxyRuleService` 按业务 id 更新，成功后关闭表单并刷新列表。
-    ///
-    /// - Parameter draft: 包含目标业务 id、新匹配类型和动作的编辑草稿。
-    private func update(_ draft: ProxyRuleDraft) {
-        guard let id = draft.editingRuleID else { return }
-        let matchType = draft.matchType
-        let decision = draft.decision
-        let ruleService = ruleService
-        MagentXAsyncExecutor.shared.submit(
-            operation: {
-                try await ruleService.update(id: id, matchType: matchType, decision: decision)
-            },
-            completion: { result in
-                switch result {
-                case .success:
-                    self.draft = nil
-                    search()
-                case .failure(let error):
-                    loadError = error.localizedDescription
-                }
-            }
-        )
     }
 
     /// 下载订阅规则、合并数据库并重写 PAC，期间同步主窗口工具栏状态。
     private func sync() {
         guard isRefreshing == false else { return }
-        isSearchPresented = false
+        searchQuery.isPresented = false
 
         let now = Date.now
-        let ruleService = ruleService
-        let executor = MagentXAsyncExecutor.shared
-
+        let magentProxyRuleService = self.magentProxyRuleService
         isRefreshing = true
         toolbarButtons = [
             ContentToolbarButton(title: "增加规则", systemImage: "plus") {
-                isSearchPresented = false
-                draft = ProxyRuleDraft(
-                    editingRuleID: nil,
+                searchQuery.isPresented = false
+                    draft = ProxyRuleDraft(
+                        editingRule: nil,
                     matchType: .domainSuffix,
                     matchValuesText: "",
                     decision: .proxy
@@ -443,18 +276,27 @@ struct ProxyRulesView: View {
             }
         ]
 
-        executor.submit(
+        localExecutor.submit(
             priority: .utility,
             operation: {
-                try await ruleService.sync()
+                try await magentProxyRuleService.sync()
             },
             completion: { result in
                 isRefreshing = false
+                switch result {
+                case .success:
+                    var refreshedSettings = GeneralSettings.load()
+                    refreshedSettings.updatedAt = now
+                    refreshedSettings.save()
+                    search()
+                case .failure(let error):
+                    loadError = error.localizedDescription
+                }
                 toolbarButtons = [
                     ContentToolbarButton(title: "增加规则", systemImage: "plus") {
-                        isSearchPresented = false
+                        searchQuery.isPresented = false
                         draft = ProxyRuleDraft(
-                            editingRuleID: nil,
+                            editingRule: nil,
                             matchType: .domainSuffix,
                             matchValuesText: "",
                             decision: .proxy
@@ -467,15 +309,58 @@ struct ProxyRulesView: View {
                         sync()
                     }
                 ]
+            }
+        )
+    }
+
+    /// 按当前关键字读取第一页规则，或在滚动到表格末尾时读取并追加下一页。
+    ///
+    /// - Parameter loadMore: 为 `true` 时读取下一页并追加结果；否则从第一页重新开始。
+    private func search(loadMore: Bool = false) {
+        guard isRefreshing == false,
+              loadMore == false || pagingResult.canLoadMore else {
+            return
+        }
+
+        let keyword = searchQuery.trimmedSearchText
+        let pageAt = loadMore ? pagingResult.pageAt + 1 : 1
+        let pageSize = Self.pageSize
+        let existingPersistentIdentifiers = pagingResult.persistentIdentifiers
+        let magentProxyRuleService = self.magentProxyRuleService
+        isRefreshing = true
+        loadError = nil
+
+        localExecutor.submit(
+            priority: .userInitiated,
+            operation: {
+                try await magentProxyRuleService.search(
+                    keyword: keyword,
+                    pageAt: pageAt,
+                    pageSize: pageSize
+                )
+            },
+            completion: { result in
+                isRefreshing = false
 
                 switch result {
-                case .success:
-                    var refreshedSettings = GeneralSettings.load()
-                    refreshedSettings.updatedAt = now
-                    refreshedSettings.save()
-                    fetchLimit = Self.pageSize
-                    search()
+                case .success(let searchResult):
+                    pagingResult = loadMore
+                        ? ProxyRulesPagingResult(
+                            persistentIdentifiers: existingPersistentIdentifiers + searchResult.persistentIdentifiers,
+                            pageAt: searchResult.pageAt,
+                            pageSize: searchResult.pageSize,
+                            canLoadMore: searchResult.canLoadMore
+                        )
+                        : searchResult
                 case .failure(let error):
+                    if loadMore == false {
+                        pagingResult = ProxyRulesPagingResult(
+                            persistentIdentifiers: [],
+                            pageAt: 1,
+                            pageSize: Self.pageSize,
+                            canLoadMore: false
+                        )
+                    }
                     loadError = error.localizedDescription
                 }
             }
@@ -483,11 +368,211 @@ struct ProxyRulesView: View {
     }
 }
 
-/// 新增代理规则表单，使用本地草稿编辑批量匹配值并在确认后提交。
+/// 代理规则表格，负责分页展示、编辑和删除当前查询结果。
+@MainActor
+private struct RulesTableView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Injected(\.localExecutor) private var localExecutor
+    @Injected(\.magentProxyRuleService) private var magentProxyRuleService
+    let searchQuery: String
+    @Binding var proxyRulesPagingResult: ProxyRulesPagingResult
+    @Binding var isRefreshing: Bool
+    @State private var loadError: String?
+    @State private var draft: ProxyRuleDraft?
+
+    var body: some View {
+        let rules = proxyRulesPagingResult.persistentIdentifiers.compactMap { persistentIdentifier in
+            modelContext.model(for: persistentIdentifier) as? MagentProxyRule
+        }
+
+        Group {
+            if isRefreshing, rules.isEmpty {
+                ProgressView("正在读取规则")
+            } else if let loadError {
+                ContentUnavailableView(
+                    "规则读取失败",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text(loadError)
+                )
+            } else if rules.isEmpty {
+                ContentUnavailableView(
+                    searchQuery.isEmpty ? "暂无规则" : "未找到规则",
+                    systemImage: searchQuery.isEmpty ? "arrow.triangle.branch" : "magnifyingglass",
+                    description: Text(searchQuery.isEmpty ? "MagentProxyRule 会显示在这里" : searchQuery)
+                )
+            } else {
+                Table(rules) {
+                    TableColumn("匹配值") { proxyRule in
+                        Text(proxyRule.matchValue)
+                            .lineLimit(1)
+                            .onAppear {
+                                guard proxyRule.id == rules.last?.id,
+                                      proxyRulesPagingResult.canLoadMore else {
+                                    return
+                                }
+                                search(loadMore: true)
+                            }
+                    }
+                    .width(min: 64, ideal: 280)
+
+                    TableColumn("类型") { proxyRule in
+                        Text(proxyRule.matchType.rawValue)
+                            .lineLimit(1)
+                    }
+                    .width(min: 44, ideal: 80, max: 110)
+
+                    TableColumn("顺序") { proxyRule in
+                        Text(proxyRule.order, format: .number)
+                            .lineLimit(1)
+                    }
+                    .width(min: 40, ideal: 56, max: 72)
+
+                    TableColumn("来源") { proxyRule in
+                        Text(proxyRule.source.isEmpty ? "-" : proxyRule.source)
+                            .lineLimit(1)
+                    }
+                    .width(min: 44, ideal: 76, max: 100)
+
+                    TableColumn("规则") { proxyRule in
+                        Text(proxyRule.decision.rawValue.uppercased())
+                            .lineLimit(1)
+                    }
+                    .width(min: 44, ideal: 64, max: 84)
+
+                    TableColumn("操作") { proxyRule in
+                        ControlGroup {
+                            Button {
+                                draft = ProxyRuleDraft(
+                                    editingRule: proxyRule,
+                                    matchType: proxyRule.matchType,
+                                    matchValuesText: proxyRule.matchValue,
+                                    decision: proxyRule.decision
+                                )
+                            } label: {
+                                Label("编辑规则", systemImage: "pencil")
+                                    .labelStyle(.iconOnly)
+                            }
+                            .help("编辑规则")
+                            .buttonStyle(.glass)
+
+                            Button(role: .destructive) {
+                                delete([proxyRule.id])
+                            } label: {
+                                Label("删除规则", systemImage: "trash")
+                                    .labelStyle(.iconOnly)
+                            }
+                            .help("删除规则")
+                            .buttonStyle(.glass)
+                        }
+                        .controlSize(.small)
+                    }
+                    .width(min: 72, ideal: 88, max: 96)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .sheet(item: $draft) { draft in
+            UpdateProxyRuleFormView(
+                magentProxyRuleService: magentProxyRuleService,
+                draft: draft,
+                loadError: $loadError,
+                onCancel: {
+                    self.draft = nil
+                },
+                onUpdated: {
+                    self.draft = nil
+                    search()
+                }
+            )
+        }
+    }
+
+    /// 删除指定业务 id 的规则；成功后重新读取当前关键字的第一页。
+    ///
+    /// - Parameter ids: 待删除规则的唯一整数业务主键。
+    private func delete(_ ids: [Int]) {
+        guard isRefreshing == false else { return }
+        let magentProxyRuleService = self.magentProxyRuleService
+        isRefreshing = true
+        localExecutor.submit(
+            operation: {
+                try await magentProxyRuleService.delete(ids)
+            },
+            completion: { result in
+                isRefreshing = false
+                switch result {
+                case .success:
+                    search()
+                case .failure(let error):
+                    loadError = error.localizedDescription
+                }
+            }
+        )
+    }
+
+    /// 按当前搜索关键字读取第一页，或读取下一页并追加其持久化标识。
+    ///
+    /// - Parameter loadMore: 为 `true` 时读取下一页；否则从第一页重新开始。
+    private func search(loadMore: Bool = false) {
+        guard isRefreshing == false,
+              loadMore == false || proxyRulesPagingResult.canLoadMore else {
+            return
+        }
+
+        let pageAt = loadMore ? proxyRulesPagingResult.pageAt + 1 : 1
+        let pageSize = proxyRulesPagingResult.pageSize
+        let existingPersistentIdentifiers = proxyRulesPagingResult.persistentIdentifiers
+        let magentProxyRuleService = self.magentProxyRuleService
+        isRefreshing = true
+        loadError = nil
+
+        localExecutor.submit(
+            priority: .userInitiated,
+            operation: {
+                try await magentProxyRuleService.search(
+                    keyword: searchQuery,
+                    pageAt: pageAt,
+                    pageSize: pageSize
+                )
+            },
+            completion: { result in
+                isRefreshing = false
+
+                switch result {
+                case .success(let searchResult):
+                    proxyRulesPagingResult = loadMore
+                        ? ProxyRulesPagingResult(
+                            persistentIdentifiers: existingPersistentIdentifiers + searchResult.persistentIdentifiers,
+                            pageAt: searchResult.pageAt,
+                            pageSize: searchResult.pageSize,
+                            canLoadMore: searchResult.canLoadMore
+                        )
+                        : searchResult
+                case .failure(let error):
+                    if loadMore == false {
+                        proxyRulesPagingResult = ProxyRulesPagingResult(
+                            persistentIdentifiers: [],
+                            pageAt: 1,
+                            pageSize: pageSize,
+                            canLoadMore: false
+                        )
+                    }
+                    loadError = error.localizedDescription
+                }
+            }
+        )
+    }
+}
+
+/// 新增代理规则表单，使用本地草稿创建批量规则并在成功后通知父页面刷新。
+@MainActor
 private struct AddProxyRuleFormView: View {
+    @Injected(\.localExecutor) private var localExecutor
+    let magentProxyRuleService: MagentProxyRuleService
     @State var draft: ProxyRuleDraft
+    @Binding var loadError: String?
     let onCancel: () -> Void
-    let onSave: (ProxyRuleDraft) -> Void
+    let onAdded: () -> Void
 
     var body: some View {
         Form {
@@ -520,9 +605,7 @@ private struct AddProxyRuleFormView: View {
                     Button("取消", role: .cancel, action: onCancel)
                         .buttonStyle(.glass)
 
-                    Button("添加") {
-                        onSave(draft)
-                    }
+                    Button("添加", action: add)
                     .keyboardShortcut(.defaultAction)
                     .disabled(draft.matchValues.isEmpty)
                     .buttonStyle(.glassProminent)
@@ -531,13 +614,50 @@ private struct AddProxyRuleFormView: View {
         }
         .formStyle(.grouped)
     }
+
+    /// 将当前新增草稿提交给规则服务；成功时通知父页面结束表单，失败时写入页面错误状态。
+    private func add() {
+        guard draft.editingRule == nil else { return }
+        let now = Date.now
+        let firstID = Int(now.timeIntervalSince1970 * 1_000_000)
+        let rules = draft.matchValues.enumerated().map { offset, matchValue in
+            MagentProxyRuleInput(
+                id: firstID + offset,
+                matchType: draft.matchType,
+                matchValue: matchValue,
+                decision: draft.decision,
+                order: 0,
+                source: "user",
+                createdAt: now,
+                updatedAt: now
+            )
+        }
+        let magentProxyRuleService = self.magentProxyRuleService
+        localExecutor.submit(
+            operation: {
+                try await magentProxyRuleService.batchInsert(rules)
+            },
+            completion: { result in
+                switch result {
+                case .success:
+                    onAdded()
+                case .failure(let error):
+                    loadError = error.localizedDescription
+                }
+            }
+        )
+    }
 }
 
 /// 编辑代理规则表单，使用本地草稿修改匹配类型和动作并在确认后提交。
+@MainActor
 private struct UpdateProxyRuleFormView: View {
+    @Injected(\.localExecutor) private var localExecutor
+    let magentProxyRuleService: MagentProxyRuleService
     @State var draft: ProxyRuleDraft
+    @Binding var loadError: String?
     let onCancel: () -> Void
-    let onSave: (ProxyRuleDraft) -> Void
+    let onUpdated: () -> Void
 
     var body: some View {
         Form {
@@ -565,14 +685,40 @@ private struct UpdateProxyRuleFormView: View {
                     Button("取消", role: .cancel, action: onCancel)
                         .buttonStyle(.glass)
 
-                    Button("保存") {
-                        onSave(draft)
-                    }
+                    Button("保存", action: update)
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.glassProminent)
                 }
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// 将编辑后的草稿直接提交给规则服务；成功后通知父页面刷新，失败时写入页面错误状态。
+    private func update() {
+        guard let editingRule = draft.editingRule else { return }
+        let rule = MagentProxyRuleInput(
+            id: editingRule.id,
+            matchType: draft.matchType,
+            matchValue: editingRule.matchValue,
+            decision: draft.decision,
+            order: editingRule.order,
+            source: "user",
+            createdAt: editingRule.createdAt
+        )
+        let magentProxyRuleService = self.magentProxyRuleService
+        localExecutor.submit(
+            operation: {
+                try await magentProxyRuleService.insert(rule)
+            },
+            completion: { result in
+                switch result {
+                case .success:
+                    onUpdated()
+                case .failure(let error):
+                    loadError = error.localizedDescription
+                }
+            }
+        )
     }
 }

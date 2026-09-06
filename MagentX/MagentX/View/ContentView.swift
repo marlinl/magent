@@ -184,9 +184,8 @@ struct ContentView: View {
         .modelContainer(for: [
             MagentProxyNode.self,
             MagentProxyRule.self,
-            AccessControlRule.self,
-            ProxyPolicy.self,
-            ProxyPolicyRule.self
+            MagentProxyPolicy.self,
+            MagentProxyPolicyRule.self
         ], inMemory: true)
         .frame(width: 1184, height: 760)
 }

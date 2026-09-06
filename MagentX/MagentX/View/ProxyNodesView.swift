@@ -209,24 +209,11 @@ struct ProxyNodesView: View {
         return false
     }
 
-    /// 删除指定节点；节点仍被策略引用时拒绝删除并保留原数据。
+    /// 删除指定节点，并在保存成功后刷新节点列表。
     ///
     /// - Parameter node: 准备从 SwiftData 删除的代理节点。
     private func delete(_ node: MagentProxyNode) {
-        let targetNodeID: UUID? = node.id
-        let policyDescriptor = FetchDescriptor<ProxyPolicy>(
-            predicate: #Predicate<ProxyPolicy> { policy in
-                policy.magentNodeID == targetNodeID
-            }
-        )
-
         do {
-            guard try modelContext.fetchCount(policyDescriptor) == 0 else {
-                let error = MagentXError.proxyNodeInUse(node.id)
-                operationError = "删除节点失败：\(error.localizedDescription)"
-                return
-            }
-
             modelContext.delete(node)
             try modelContext.save()
             if selectedNodeID == node.id {

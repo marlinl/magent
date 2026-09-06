@@ -16,30 +16,63 @@ import Testing
 @MainActor
 @Suite(.serialized)
 struct MagentProxyRuleServiceTests {
-    /// 验证新增、查询、更新和删除都由规则服务按界面业务语义完成。
-    @Test func addUpdateAndDeleteRules() async throws {
+    /// 验证相同匹配身份的再次新增会更新动作，且批次内重复规则仅保留首条。
+    @Test func batchInsertUpsertsAndFiltersRulesWithSameMatchIdentity() async throws {
         let container = try makeContainer()
         let service = MagentProxyRuleService(modelContainer: container)
-        try await service.add(
-            matchType: .domainSuffix,
-            matchValues: [" example.com ", "example.com"],
-            decision: .proxy
-        )
-        try await service.add(
-            matchType: .domainKeyword,
-            matchValues: ["telegram"],
-            decision: .direct
-        )
+        try await service.batchInsert([MagentProxyRuleInput(
+            id: 1, matchType: .domainSuffix, matchValue: "example.com",
+            decision: .proxy, order: 0, source: "user"
+        )])
+        let insertedResult = try await service.search(keyword: "", pageAt: 1, pageSize: 10)
+        let insertedRules = rules(for: insertedResult, container: container)
+        #expect(insertedRules.count == 1)
+        #expect(insertedRules.first?.decision == .proxy)
+
+        try await service.batchInsert([
+            MagentProxyRuleInput(
+                id: 2, matchType: .domainSuffix, matchValue: "example.com",
+                decision: .direct, order: 0, source: "user"
+            ),
+            MagentProxyRuleInput(
+                id: 3, matchType: .domainSuffix, matchValue: "example.com",
+                decision: .proxy, order: 0, source: "user"
+            )
+        ])
+        let result = try await service.search(keyword: "", pageAt: 1, pageSize: 10)
+        let resultRules = rules(for: result, container: container)
+        #expect(resultRules.count == 1)
+        #expect(resultRules.first?.decision == .direct)
+    }
+
+    /// 验证新增、查询、更新和按业务 id 批量删除都由规则服务完成。
+    @Test func batchInsertInsertAndBatchDeleteRules() async throws {
+        let container = try makeContainer()
+        let service = MagentProxyRuleService(modelContainer: container)
+        try await service.batchInsert([
+            MagentProxyRuleInput(id: 0, matchType: .domainSuffix, matchValue: "example.com", decision: .proxy, order: 0, source: "user"),
+            MagentProxyRuleInput(id: 1, matchType: .domainKeyword, matchValue: "telegram", decision: .direct, order: 0, source: "user"),
+            MagentProxyRuleInput(id: 2, matchType: .domainSuffix, matchValue: "apple.com", decision: .proxy, order: 0, source: "user")
+        ])
 
         var searchResult = try await service.search(keyword: "", pageAt: 1, pageSize: 10)
-        #expect(searchResult.rules.count == 2)
-        #expect(searchResult.rules.map(\.id) == [0, 1])
+        var searchRules = rules(for: searchResult, container: container)
+        #expect(searchRules.count == 3)
+        #expect(searchRules.map(\.id) == [2, 0, 1])
         #expect(searchResult.canLoadMore == false)
 
-        try await service.update(id: 0, matchType: .urlRegex, decision: .direct)
+        try await service.insert(MagentProxyRuleInput(
+            id: 0,
+            matchType: .urlRegex,
+            matchValue: "example.com",
+            decision: .direct,
+            order: 0,
+            source: "user"
+        ))
 
         searchResult = try await service.search(keyword: "example", pageAt: 1, pageSize: 10)
-        let updatedRule = try #require(searchResult.rules.first)
+        searchRules = rules(for: searchResult, container: container)
+        let updatedRule = try #require(searchRules.first)
         #expect(updatedRule.matchType == .urlRegex)
         #expect(updatedRule.matchValue == "example.com")
         #expect(updatedRule.decision == .direct)
@@ -47,62 +80,55 @@ struct MagentProxyRuleServiceTests {
         #expect(updatedRule.source == "user")
         #expect(updatedRule.updatedAt >= updatedRule.createdAt)
 
-        try await service.delete(1)
+        try await service.delete([0, 2])
 
         searchResult = try await service.search(keyword: "", pageAt: 1, pageSize: 10)
-        #expect(searchResult.rules.map(\.id) == [0])
+        searchRules = rules(for: searchResult, container: container)
+        #expect(searchRules.map(\.id) == [1])
     }
 
     /// 验证查询使用从 `1` 开始的页码，并通过额外读取一条正确标记下一页。
     @Test func searchUsesOneBasedPagination() async throws {
         let container = try makeContainer()
         let service = MagentProxyRuleService(modelContainer: container)
-        try await service.add(
-            matchType: .domainSuffix,
-            matchValues: ["b.example", "a.example", "c.example"],
-            decision: .proxy
-        )
+        try await service.batchInsert([
+            MagentProxyRuleInput(id: 0, matchType: .domainSuffix, matchValue: "b.example", decision: .proxy, order: 0, source: "user"),
+            MagentProxyRuleInput(id: 1, matchType: .domainSuffix, matchValue: "a.example", decision: .proxy, order: 0, source: "user"),
+            MagentProxyRuleInput(id: 2, matchType: .domainSuffix, matchValue: "c.example", decision: .proxy, order: 0, source: "user")
+        ])
 
         let firstPage = try await service.search(keyword: "example", pageAt: 1, pageSize: 2)
-        #expect(firstPage.rules.map(\.matchValue) == ["a.example", "b.example"])
+        let firstPageRules = rules(for: firstPage, container: container)
+        #expect(firstPageRules.map(\.matchValue) == ["a.example", "b.example"])
+        #expect(firstPage.pageAt == 1)
+        #expect(firstPage.pageSize == 2)
         #expect(firstPage.canLoadMore)
 
         let secondPage = try await service.search(keyword: "example", pageAt: 2, pageSize: 2)
-        #expect(secondPage.rules.map(\.matchValue) == ["c.example"])
+        let secondPageRules = rules(for: secondPage, container: container)
+        #expect(secondPageRules.map(\.matchValue) == ["c.example"])
+        #expect(secondPage.pageAt == 2)
+        #expect(secondPage.pageSize == 2)
         #expect(secondPage.canLoadMore == false)
     }
 
-    /// 验证空匹配值、重复规则、更新或删除不存在 id 时返回统一应用错误。
-    @Test func invalidCRUDRequestsThrow() async throws {
+    /// 验证空业务 id 数组不会删除现有规则。
+    @Test func deleteWithEmptyIDsDoesNothing() async throws {
         let container = try makeContainer()
         let service = MagentProxyRuleService(modelContainer: container)
-
-        await #expect(throws: MagentXError.emptyProxyRuleMatchValue) {
-            try await service.add(
-                matchType: .domainSuffix,
-                matchValues: ["  "],
-                decision: .proxy
-            )
-        }
-        try await service.add(
+        try await service.insert(MagentProxyRuleInput(
+            id: 99,
             matchType: .domainSuffix,
-            matchValues: ["example.com"],
-            decision: .proxy
-        )
-        await #expect(throws: MagentXError.duplicateMagentProxyRule) {
-            try await service.add(
-                matchType: .domainSuffix,
-                matchValues: ["example.com"],
-                decision: .direct
-            )
-        }
+            matchValue: "example.com",
+            decision: .proxy,
+            order: 0,
+            source: "user"
+        ))
 
-        await #expect(throws: MagentXError.missingMagentProxyRule(99)) {
-            try await service.update(id: 99, matchType: .domainSuffix, decision: .proxy)
-        }
-        await #expect(throws: MagentXError.missingMagentProxyRule(99)) {
-            try await service.delete(99)
-        }
+        try await service.delete([])
+
+        let result = try await service.search(keyword: "", pageAt: 1, pageSize: 10)
+        #expect(rules(for: result, container: container).map(\.id) == [99])
     }
 
     /// 验证同步会覆盖同来源规则、保留冲突的用户规则，并给新增规则分配未占用 id。
@@ -222,12 +248,28 @@ struct MagentProxyRuleServiceTests {
         #expect(try resultContext.fetchCount(FetchDescriptor<MagentProxyRule>()) == 0)
     }
 
-    /// 创建仅包含代理规则模型的内存 SwiftData 容器。
+    /// 创建仅包含代理规则存储记录的内存 SwiftData 容器。
     private func makeContainer() throws -> ModelContainer {
         try ModelContainer(
             for: MagentProxyRule.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true)
         )
+    }
+
+    /// 在测试主 actor 的模型上下文中按查询结果的持久化标识重新读取规则。
+    ///
+    /// - Parameters:
+    ///   - result: 规则服务返回的分页结果。
+    ///   - container: 承载被测规则的内存模型容器。
+    /// - Returns: 与分页结果顺序相同且可供断言的持久化规则。
+    private func rules(
+        for result: ProxyRulesPagingResult,
+        container: ModelContainer
+    ) -> [MagentProxyRule] {
+        let modelContext = ModelContext(container)
+        return result.persistentIdentifiers.compactMap { persistentIdentifier in
+            modelContext.model(for: persistentIdentifier) as? MagentProxyRule
+        }
     }
 
     /// 创建包含 Base64 GFWList 文本的唯一临时文件。

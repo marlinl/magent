@@ -2,6 +2,13 @@
 
 `schema.sql` defines the canonical database schema.
 
+## AI Modification Boundary
+
+AI agents must not create, edit, rename, move, or delete any file under
+`docs/database/`, including `schema.sql` and migrations. This directory is
+read-only to AI unless the user gives explicit authorization for the specific
+file and requested change in the current task.
+
 Before editing any file in this directory:
 
 1. Read `schema.sql`.
