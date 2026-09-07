@@ -20,29 +20,29 @@ struct MagentProxyRuleServiceTests {
     @Test func batchInsertUpsertsAndFiltersRulesWithSameMatchIdentity() async throws {
         let container = try makeContainer()
         let service = MagentProxyRuleService(modelContainer: container)
-        try await service.batchInsert([MagentProxyRuleInput(
+        try await service.batchInsert([ProxyRulesViewModel(
             id: 1, matchType: .domainSuffix, matchValue: "example.com",
-            decision: .proxy, order: 0, source: "user"
+            decision: .proxy, order: 0, source: "user", createdAt: .now, updatedAt: .now
         )])
         let insertedResult = try await service.search(keyword: "", pageAt: 1, pageSize: 10)
         let insertedRules = rules(for: insertedResult, container: container)
         #expect(insertedRules.count == 1)
-        #expect(insertedRules.first?.decision == .proxy)
+        #expect(insertedRules.first?.decision == "proxy")
 
         try await service.batchInsert([
-            MagentProxyRuleInput(
+            ProxyRulesViewModel(
                 id: 2, matchType: .domainSuffix, matchValue: "example.com",
-                decision: .direct, order: 0, source: "user"
+                decision: .direct, order: 0, source: "user", createdAt: .now, updatedAt: .now
             ),
-            MagentProxyRuleInput(
+            ProxyRulesViewModel(
                 id: 3, matchType: .domainSuffix, matchValue: "example.com",
-                decision: .proxy, order: 0, source: "user"
+                decision: .proxy, order: 0, source: "user", createdAt: .now, updatedAt: .now
             )
         ])
         let result = try await service.search(keyword: "", pageAt: 1, pageSize: 10)
         let resultRules = rules(for: result, container: container)
         #expect(resultRules.count == 1)
-        #expect(resultRules.first?.decision == .direct)
+        #expect(resultRules.first?.decision == "direct")
     }
 
     /// 验证新增、查询、更新和按业务 id 批量删除都由规则服务完成。
@@ -50,9 +50,9 @@ struct MagentProxyRuleServiceTests {
         let container = try makeContainer()
         let service = MagentProxyRuleService(modelContainer: container)
         try await service.batchInsert([
-            MagentProxyRuleInput(id: 0, matchType: .domainSuffix, matchValue: "example.com", decision: .proxy, order: 0, source: "user"),
-            MagentProxyRuleInput(id: 1, matchType: .domainKeyword, matchValue: "telegram", decision: .direct, order: 0, source: "user"),
-            MagentProxyRuleInput(id: 2, matchType: .domainSuffix, matchValue: "apple.com", decision: .proxy, order: 0, source: "user")
+            ProxyRulesViewModel(id: 0, matchType: .domainSuffix, matchValue: "example.com", decision: .proxy, order: 0, source: "user", createdAt: .now, updatedAt: .now),
+            ProxyRulesViewModel(id: 1, matchType: .domainKeyword, matchValue: "telegram", decision: .direct, order: 0, source: "user", createdAt: .now, updatedAt: .now),
+            ProxyRulesViewModel(id: 2, matchType: .domainSuffix, matchValue: "apple.com", decision: .proxy, order: 0, source: "user", createdAt: .now, updatedAt: .now)
         ])
 
         var searchResult = try await service.search(keyword: "", pageAt: 1, pageSize: 10)
@@ -60,22 +60,25 @@ struct MagentProxyRuleServiceTests {
         #expect(searchRules.count == 3)
         #expect(searchRules.map(\.id) == [2, 0, 1])
         #expect(searchResult.canLoadMore == false)
+        let updatedRuleCreatedAt = try #require(searchRules.first(where: { $0.id == 0 })?.createdAt)
 
-        try await service.insert(MagentProxyRuleInput(
+        try await service.insert(ProxyRulesViewModel(
             id: 0,
             matchType: .urlRegex,
             matchValue: "example.com",
             decision: .direct,
             order: 0,
-            source: "user"
+            source: "user",
+            createdAt: updatedRuleCreatedAt,
+            updatedAt: .now
         ))
 
         searchResult = try await service.search(keyword: "example", pageAt: 1, pageSize: 10)
         searchRules = rules(for: searchResult, container: container)
         let updatedRule = try #require(searchRules.first)
-        #expect(updatedRule.matchType == .urlRegex)
+        #expect(updatedRule.matchType == MatchType.urlRegex.rawValue)
         #expect(updatedRule.matchValue == "example.com")
-        #expect(updatedRule.decision == .direct)
+        #expect(updatedRule.decision == "direct")
         #expect(updatedRule.order == 0)
         #expect(updatedRule.source == "user")
         #expect(updatedRule.updatedAt >= updatedRule.createdAt)
@@ -92,9 +95,9 @@ struct MagentProxyRuleServiceTests {
         let container = try makeContainer()
         let service = MagentProxyRuleService(modelContainer: container)
         try await service.batchInsert([
-            MagentProxyRuleInput(id: 0, matchType: .domainSuffix, matchValue: "b.example", decision: .proxy, order: 0, source: "user"),
-            MagentProxyRuleInput(id: 1, matchType: .domainSuffix, matchValue: "a.example", decision: .proxy, order: 0, source: "user"),
-            MagentProxyRuleInput(id: 2, matchType: .domainSuffix, matchValue: "c.example", decision: .proxy, order: 0, source: "user")
+            ProxyRulesViewModel(id: 0, matchType: .domainSuffix, matchValue: "b.example", decision: .proxy, order: 0, source: "user", createdAt: .now, updatedAt: .now),
+            ProxyRulesViewModel(id: 1, matchType: .domainSuffix, matchValue: "a.example", decision: .proxy, order: 0, source: "user", createdAt: .now, updatedAt: .now),
+            ProxyRulesViewModel(id: 2, matchType: .domainSuffix, matchValue: "c.example", decision: .proxy, order: 0, source: "user", createdAt: .now, updatedAt: .now)
         ])
 
         let firstPage = try await service.search(keyword: "example", pageAt: 1, pageSize: 2)
@@ -116,13 +119,15 @@ struct MagentProxyRuleServiceTests {
     @Test func deleteWithEmptyIDsDoesNothing() async throws {
         let container = try makeContainer()
         let service = MagentProxyRuleService(modelContainer: container)
-        try await service.insert(MagentProxyRuleInput(
+        try await service.insert(ProxyRulesViewModel(
             id: 99,
             matchType: .domainSuffix,
             matchValue: "example.com",
             decision: .proxy,
             order: 0,
-            source: "user"
+            source: "user",
+            createdAt: .now,
+            updatedAt: .now
         ))
 
         try await service.delete([])
@@ -148,9 +153,9 @@ struct MagentProxyRuleServiceTests {
         let oldDate = Date(timeIntervalSince1970: 100)
         context.insert(MagentProxyRule(
             id: 0,
-            matchType: .domainSuffix,
+            matchType: MatchType.domainSuffix.rawValue,
             matchValue: "google.com",
-            decision: .proxy,
+            decision: "proxy",
             order: 0,
             source: "rulesUrl",
             createdAt: oldDate,
@@ -158,9 +163,9 @@ struct MagentProxyRuleServiceTests {
         ))
         context.insert(MagentProxyRule(
             id: 1,
-            matchType: .domainSuffix,
+            matchType: MatchType.domainSuffix.rawValue,
             matchValue: "example.com",
-            decision: .direct,
+            decision: "direct",
             order: 0,
             source: "user",
             createdAt: oldDate,
@@ -202,16 +207,16 @@ struct MagentProxyRuleServiceTests {
         let rulesByValue = Dictionary(uniqueKeysWithValues: storedRules.map { ($0.matchValue, $0) })
 
         #expect(storedRules.count == 6)
-        #expect(rulesByValue["google.com"]?.decision == .direct)
+        #expect(rulesByValue["google.com"]?.decision == "direct")
         #expect(rulesByValue["google.com"]?.order == 100)
         #expect(rulesByValue["google.com"]?.source == "rulesUrl")
-        #expect(rulesByValue["example.com"]?.decision == .direct)
+        #expect(rulesByValue["example.com"]?.decision == "direct")
         #expect(rulesByValue["example.com"]?.source == "user")
         #expect(rulesByValue["example.com"]?.updatedAt == oldDate)
         #expect(rulesByValue["apple.com"]?.id == 2)
-        #expect(rulesByValue["10.0.0.0/8"]?.matchType == .ipCIDR)
-        #expect(rulesByValue["telegram"]?.matchType == .domainKeyword)
-        #expect(rulesByValue[#"https?:\/\/.*\.sample\.com"#]?.matchType == .urlRegex)
+        #expect(rulesByValue["10.0.0.0/8"]?.matchType == MatchType.ipCIDR.rawValue)
+        #expect(rulesByValue["telegram"]?.matchType == MatchType.domainKeyword.rawValue)
+        #expect(rulesByValue[#"https?:\/\/.*\.sample\.com"#]?.matchType == MatchType.urlRegex.rawValue)
 
         let pac = try String(contentsOf: pacFileURL, encoding: .utf8)
         #expect(pacFileURL.lastPathComponent == "pac.json")

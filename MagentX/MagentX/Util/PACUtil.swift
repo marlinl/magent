@@ -20,8 +20,8 @@ enum PACUtil {
             if leftRule.order != rightRule.order {
                 return leftRule.order < rightRule.order
             }
-            if leftRule.matchType.rawValue != rightRule.matchType.rawValue {
-                return leftRule.matchType.rawValue < rightRule.matchType.rawValue
+            if leftRule.matchType != rightRule.matchType {
+                return leftRule.matchType < rightRule.matchType
             }
             return leftRule.matchValue.localizedStandardCompare(rightRule.matchValue) == .orderedAscending
         }
@@ -84,12 +84,14 @@ enum PACUtil {
 
     /// 将单条代理规则转换为 PAC JavaScript 对象字面量；无效 CIDR 返回 `nil`。
     nonisolated private static func ruleLiteral(_ rule: MagentProxyRule) -> String? {
-        let type = javaScriptStringLiteral(rule.matchType.rawValue)
-        let normalizedValue = rule.matchType == .urlRegex ? rule.matchValue : rule.matchValue.lowercased()
-        let value = javaScriptStringLiteral(normalizedValue)
-        let decision = javaScriptStringLiteral(rule.decision.rawValue)
+        guard let matchType = MatchType(rawValue: rule.matchType) else { return nil }
 
-        switch rule.matchType {
+        let type = javaScriptStringLiteral(matchType.rawValue)
+        let normalizedValue = matchType == .urlRegex ? rule.matchValue : rule.matchValue.lowercased()
+        let value = javaScriptStringLiteral(normalizedValue)
+        let decision = javaScriptStringLiteral(rule.decision)
+
+        switch matchType {
         case .exactDomain, .domainSuffix, .domainKeyword, .urlRegex:
             return "{ type: \(type), value: \(value), decision: \(decision) }"
         case .ipCIDR:

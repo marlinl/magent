@@ -17,7 +17,7 @@ actor MagentProxyRuleService {
 
     /// 规则的业务匹配身份，用于在订阅同步时识别同一条数据库记录。
     private struct RuleIdentity: Hashable, Sendable {
-        let matchType: MatchType
+        let matchType: String
         let matchValue: String
     }
 
@@ -28,7 +28,7 @@ actor MagentProxyRuleService {
     ///
     /// - Parameter rules: 需要持久化的不可变规则输入；同一批次内相同业务匹配身份仅保留首次出现的规则。
     /// - Throws: SwiftData 保存失败时抛出原始错误。
-    func batchInsert(_ rules: [MagentProxyRuleInput]) throws {
+    func batchInsert(_ rules: [ProxyRulesViewModel]) throws {
         let storedRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
         var rulesByID = Dictionary(uniqueKeysWithValues: storedRules.map { ($0.id, $0) })
         var rulesByIdentity = Dictionary(uniqueKeysWithValues: storedRules.map { proxyRule in
@@ -39,16 +39,16 @@ actor MagentProxyRuleService {
         })
         var seenIdentities = Set<RuleIdentity>()
         for rule in rules {
-            let identity = RuleIdentity(matchType: rule.matchType, matchValue: rule.matchValue)
+            let identity = RuleIdentity(matchType: rule.matchType.rawValue, matchValue: rule.matchValue)
             guard seenIdentities.insert(identity).inserted else { continue }
             if let storedRule = rulesByID[rule.id] ?? rulesByIdentity[identity] {
                 let originalIdentity = RuleIdentity(
                     matchType: storedRule.matchType,
                     matchValue: storedRule.matchValue
                 )
-                storedRule.matchType = rule.matchType
+                storedRule.matchType = rule.matchType.rawValue
                 storedRule.matchValue = rule.matchValue
-                storedRule.decision = rule.decision
+                storedRule.decision = rule.decision.rawValue
                 storedRule.order = rule.order
                 storedRule.source = rule.source
                 storedRule.updatedAt = rule.updatedAt
@@ -60,9 +60,9 @@ actor MagentProxyRuleService {
 
             let storedRule = MagentProxyRule(
                 id: rule.id,
-                matchType: rule.matchType,
+                matchType: rule.matchType.rawValue,
                 matchValue: rule.matchValue,
-                decision: rule.decision,
+                decision: rule.decision.rawValue,
                 order: rule.order,
                 source: rule.source,
                 createdAt: rule.createdAt,
@@ -84,25 +84,25 @@ actor MagentProxyRuleService {
     ///
     /// - Parameter rule: 包含非空整数业务 id 与待保存字段的不可变规则输入。
     /// - Throws: SwiftData 保存失败时抛出原始错误。
-    func insert(_ rule: MagentProxyRuleInput) throws {
+    func insert(_ rule: ProxyRulesViewModel) throws {
         let storedRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
-        let identity = RuleIdentity(matchType: rule.matchType, matchValue: rule.matchValue)
+        let identity = RuleIdentity(matchType: rule.matchType.rawValue, matchValue: rule.matchValue)
         if let storedRule = storedRules.first(where: { $0.id == rule.id })
             ?? storedRules.first(where: {
                 $0.matchType == identity.matchType && $0.matchValue == identity.matchValue
             }) {
-            storedRule.matchType = rule.matchType
+            storedRule.matchType = rule.matchType.rawValue
             storedRule.matchValue = rule.matchValue
-            storedRule.decision = rule.decision
+            storedRule.decision = rule.decision.rawValue
             storedRule.order = rule.order
             storedRule.source = rule.source
             storedRule.updatedAt = rule.updatedAt
         } else {
             modelContext.insert(MagentProxyRule(
                 id: rule.id,
-                matchType: rule.matchType,
+                matchType: rule.matchType.rawValue,
                 matchValue: rule.matchValue,
-                decision: rule.decision,
+                decision: rule.decision.rawValue,
                 order: rule.order,
                 source: rule.source,
                 createdAt: rule.createdAt,
@@ -199,14 +199,14 @@ actor MagentProxyRuleService {
         var nextIDCandidate = 0
         for downloadedRule in downloadedRules {
             let identity = RuleIdentity(
-                matchType: downloadedRule.matchType,
+                matchType: downloadedRule.matchType.rawValue,
                 matchValue: downloadedRule.matchValue
             )
-            let decision: RuleDecision = downloadedRule.isException ? .direct : .proxy
+            let decision = downloadedRule.isException ? "direct" : "proxy"
 
             if let existingRule = rulesByIdentity[identity] {
                 guard existingRule.source == Self.source else { continue }
-                existingRule.matchType = downloadedRule.matchType
+                existingRule.matchType = downloadedRule.matchType.rawValue
                 existingRule.matchValue = downloadedRule.matchValue
                 existingRule.decision = decision
                 existingRule.order = Self.importedRuleOrder
@@ -220,7 +220,7 @@ actor MagentProxyRuleService {
             }
             let proxyRule = MagentProxyRule(
                 id: nextIDCandidate,
-                matchType: downloadedRule.matchType,
+                matchType: downloadedRule.matchType.rawValue,
                 matchValue: downloadedRule.matchValue,
                 decision: decision,
                 order: Self.importedRuleOrder,
