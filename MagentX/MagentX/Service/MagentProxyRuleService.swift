@@ -25,13 +25,17 @@ actor MagentProxyRuleService {
     private static let source = "rulesUrl"
     private static let importedRuleOrder = 100
 
-    /// 同步当前规则订阅并重写本地 PAC 文件。
+    /// 下载并解析当前规则订阅，将规则批量写入 SwiftData。
     ///
-    /// 副作用：下载并合并规则、保存 SwiftData、更新 PAC 文件，以及写入不含规则内容的系统日志。
-    /// - Throws: 下载、解析、持久化或 PAC 写入失败时抛出原始错误。
+    /// 副作用：下载规则文件、解析规则并通过业务唯一键批量 upsert 后保存 SwiftData。
+    /// - Throws: 下载、解析或持久化失败时抛出原始错误。
     func sync() async throws {
         AppLog.rules.info("Starting proxy rule synchronization")
+
+        // 1. 从当前规则订阅地址下载完整文件内容。
         let response = try await downloadFromRuleUrl()
+
+        // 2. 对文件内容进行 Base64 解码，并解析为规则数组 [AdblockUtil.Rule]。
         guard let decodedData = Data(base64Encoded: response, options: [.ignoreUnknownCharacters]) else {
             throw MagentXError.invalidAclBase64Data
         }
@@ -39,53 +43,51 @@ actor MagentProxyRuleService {
             throw MagentXError.invalidAclDecodedText
         }
         let downloadedRules = AdblockUtil.parsePACRules(decodedText)
+
+        // 3. 批量组建待写入的 [MagentProxyRule]，已有规则复用 id 和创建时间。
         let existingRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
-        var rulesByIdentity: [RuleIdentity: MagentProxyRule] = [:]
-        for existingRule in existingRules {
-            rulesByIdentity[RuleIdentity(
+        let rulesByIdentity = Dictionary(uniqueKeysWithValues: existingRules.map { existingRule in
+            (RuleIdentity(
                 matchType: existingRule.matchType,
                 matchValue: existingRule.matchValue
-            )] = existingRule
-        }
-
-        let now = Date.now
+            ), existingRule)
+        })
         var usedIDs = Set(existingRules.map(\.id))
         var nextIDCandidate = 0
-        for downloadedRule in downloadedRules {
+        let now = Date.now
+        let proxyRules = downloadedRules.map { downloadedRule in
             let identity = RuleIdentity(
                 matchType: downloadedRule.matchType.rawValue,
                 matchValue: downloadedRule.matchValue
             )
-            let decision = downloadedRule.isException ? "direct" : "proxy"
-
-            if let existingRule = rulesByIdentity[identity] {
-                guard existingRule.source == Self.source else { continue }
-                existingRule.matchType = downloadedRule.matchType.rawValue
-                existingRule.matchValue = downloadedRule.matchValue
-                existingRule.decision = decision
-                existingRule.order = Self.importedRuleOrder
-                existingRule.source = Self.source
-                existingRule.updatedAt = now
-                continue
-            }
-
-            while usedIDs.contains(nextIDCandidate) {
+            let existingRule = rulesByIdentity[identity]
+            let id: Int
+            if let existingRule {
+                id = existingRule.id
+            } else {
+                while usedIDs.contains(nextIDCandidate) {
+                    nextIDCandidate += 1
+                }
+                id = nextIDCandidate
+                usedIDs.insert(nextIDCandidate)
                 nextIDCandidate += 1
             }
-            let proxyRule = MagentProxyRule(
-                id: nextIDCandidate,
+
+            return MagentProxyRule(
+                id: id,
                 matchType: downloadedRule.matchType.rawValue,
                 matchValue: downloadedRule.matchValue,
-                decision: decision,
+                decision: downloadedRule.isException ? "direct" : "proxy",
                 order: Self.importedRuleOrder,
                 source: Self.source,
-                createdAt: now,
+                createdAt: existingRule?.createdAt ?? now,
                 updatedAt: now
             )
-            usedIDs.insert(nextIDCandidate)
-            nextIDCandidate += 1
+        }
+
+        // 4. 利用 (matchType, matchValue) 业务唯一键批量 upsert，并统一保存。
+        for proxyRule in proxyRules {
             modelContext.insert(proxyRule)
-            rulesByIdentity[identity] = proxyRule
         }
 
         do {
@@ -96,7 +98,6 @@ actor MagentProxyRuleService {
             throw error
         }
 
-        try await writePACFile()
         AppLog.rules.info("Completed proxy rule synchronization")
     }
 
@@ -128,26 +129,5 @@ actor MagentProxyRuleService {
 
         try Task.checkCancellation()
         return String(decoding: responseData, as: UTF8.self)
-    }
-
-
-
-    /// 读取全部持久化代理规则并将生成的 PAC 内容写入应用本地目录。
-    ///
-    /// 副作用：读取 SwiftData 并覆盖应用本地 PAC 文件，不记录规则正文或存储路径。
-    /// - Throws: 读取规则、创建目录或写入 PAC 文件失败时抛出原始错误。
-    private func writePACFile() async throws {
-        let storedRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
-        let pacFileURL = await MainActor.run {
-            MagentXApp.localDirectoryURL.appendingPathComponent("pac.json", isDirectory: false)
-        }
-        let pacBody = PACUtil.makePACBody(rules: storedRules)
-        try await localExecutor.runBlocking {
-            try FileManager.default.createDirectory(
-                at: pacFileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try pacBody.write(to: pacFileURL, atomically: true, encoding: .utf8)
-        }
     }
 }

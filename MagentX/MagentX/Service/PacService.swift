@@ -27,6 +27,60 @@ actor PacService {
         case stop
     }
 
+    /// 处理 PAC 服务单个客户端连接上的 HTTP 请求与响应。
+    private final class PacHTTPHandler: ChannelInboundHandler {
+        typealias InboundIn = HTTPServerRequestPart
+        typealias OutboundOut = HTTPServerResponsePart
+
+        private let pacFileContents: Data
+        private var requestedPACFile = false
+
+        /// 使用当前已加载的 PAC 内容创建单连接 HTTP handler。
+        init(pacFileContents: Data) {
+            self.pacFileContents = pacFileContents
+        }
+
+        /// 读取 HTTP 请求，并在请求结束时返回 PAC 文件或 404 响应。
+        func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+            switch unwrapInboundIn(data) {
+            case .head(let requestHead):
+                requestedPACFile = String(requestHead.uri.prefix { $0 != "?" }) == "/proxy.pac"
+            case .body:
+                break
+            case .end:
+                let bodyData = requestedPACFile ? pacFileContents : Data()
+                var headers = HTTPHeaders()
+                headers.add(name: "Content-Length", value: String(bodyData.count))
+                headers.add(name: "Connection", value: "close")
+                if requestedPACFile {
+                    headers.add(
+                        name: "Content-Type",
+                        value: "application/x-ns-proxy-autoconfig; charset=utf-8"
+                    )
+                }
+                let responseHead = HTTPResponseHead(
+                    version: .http1_1,
+                    status: requestedPACFile ? .ok : .notFound,
+                    headers: headers
+                )
+                context.write(wrapOutboundOut(.head(responseHead)), promise: nil)
+                if bodyData.isEmpty == false {
+                    var bodyBuffer = context.channel.allocator.buffer(capacity: bodyData.count)
+                    bodyBuffer.writeBytes(bodyData)
+                    context.write(wrapOutboundOut(.body(.byteBuffer(bodyBuffer))), promise: nil)
+                }
+                context.writeAndFlush(wrapOutboundOut(.end(nil))).whenComplete { _ in
+                    context.close(promise: nil)
+                }
+            }
+        }
+
+        /// 连接处理失败时关闭当前客户端通道。
+        func errorCaught(context: ChannelHandlerContext, error: Error) {
+            context.close(promise: nil)
+        }
+    }
+
     deinit {
         try? pacGroup.syncShutdownGracefully()
     }
@@ -43,57 +97,7 @@ actor PacService {
     /// 启动本地 PAC HTTP 服务，并在绑定前完整加载当前 PAC 文件到内存。
     ///
     /// 服务仅响应 `/proxy.pac`，监听地址和端口取自当前 `GeneralSettings`。
-    func startServer() async throws {
-        final class PACHTTPHandler: ChannelInboundHandler {
-            typealias InboundIn = HTTPServerRequestPart
-            typealias OutboundOut = HTTPServerResponsePart
-
-            private let pacFileContents: Data
-            private var requestedPACFile = false
-
-            init(pacFileContents: Data) {
-                self.pacFileContents = pacFileContents
-            }
-
-            func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-                switch unwrapInboundIn(data) {
-                case .head(let requestHead):
-                    requestedPACFile = String(requestHead.uri.prefix { $0 != "?" }) == "/proxy.pac"
-                case .body:
-                    break
-                case .end:
-                    let bodyData = requestedPACFile ? pacFileContents : Data()
-                    var headers = HTTPHeaders()
-                    headers.add(name: "Content-Length", value: String(bodyData.count))
-                    headers.add(name: "Connection", value: "close")
-                    if requestedPACFile {
-                        headers.add(
-                            name: "Content-Type",
-                            value: "application/x-ns-proxy-autoconfig; charset=utf-8"
-                        )
-                    }
-                    let responseHead = HTTPResponseHead(
-                        version: .http1_1,
-                        status: requestedPACFile ? .ok : .notFound,
-                        headers: headers
-                    )
-                    context.write(wrapOutboundOut(.head(responseHead)), promise: nil)
-                    if bodyData.isEmpty == false {
-                        var bodyBuffer = context.channel.allocator.buffer(capacity: bodyData.count)
-                        bodyBuffer.writeBytes(bodyData)
-                        context.write(wrapOutboundOut(.body(.byteBuffer(bodyBuffer))), promise: nil)
-                    }
-                    context.writeAndFlush(wrapOutboundOut(.end(nil))).whenComplete { _ in
-                        context.close(promise: nil)
-                    }
-                }
-            }
-
-            func errorCaught(context: ChannelHandlerContext, error: Error) {
-                context.close(promise: nil)
-            }
-        }
-
+    func startServer() async {
         if case .running = pacState {
             return
         }
@@ -104,22 +108,29 @@ actor PacService {
         let address = generalSettings.pacListenAddress
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard address.isEmpty == false else {
-            throw MagentXError.invalidListenAddress(generalSettings.pacListenAddress)
+            let error = MagentXError.invalidListenAddress(generalSettings.pacListenAddress)
+            AppLog.proxy.error(
+                "Failed to start PAC HTTP service: \(error.localizedDescription, privacy: .public)"
+            )
+            return
         }
         let port = generalSettings.pacListenPort
         guard (1...65_535).contains(port) else {
-            throw MagentXError.invalidListenPort(port)
+            let error = MagentXError.invalidListenPort(port)
+            AppLog.proxy.error(
+                "Failed to start PAC HTTP service: \(error.localizedDescription, privacy: .public)"
+            )
+            return
         }
         loadPacFile()
         let pacFileContents = pacResponse
 
-        let tcpChannel: Channel
         do {
-            tcpChannel = try await ServerBootstrap(group: pacGroup)
+            let tcpChannel = try await ServerBootstrap(group: pacGroup)
                 .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
                 .childChannelInitializer { channel in
                     channel.pipeline.configureHTTPServerPipeline().flatMap {
-                        channel.pipeline.addHandler(PACHTTPHandler(pacFileContents: pacFileContents))
+                        channel.pipeline.addHandler(PacHTTPHandler(pacFileContents: pacFileContents))
                     }
                 }
                 .bind(
@@ -127,26 +138,31 @@ actor PacService {
                     port: port
                 )
                 .get()
+            let shutdownPromise = tcpChannel.eventLoop.makePromise(of: Void.self)
+            pacState = .running(tcpChannel: tcpChannel, shutdownPromise: shutdownPromise)
+            AppLog.proxy.info(
+                "PAC HTTP service started on \(address):\(port)"
+            )
         } catch {
+            let loggedError: Error
             if let ioError = error as? IOError, ioError.errnoCode == EADDRINUSE {
-                throw MagentXError.listenPortUnavailable(
+                loggedError = MagentXError.listenPortUnavailable(
                     address,
                     port
                 )
+            } else {
+                loggedError = error
             }
-            throw error
+            AppLog.proxy.error(
+                "Failed to start PAC HTTP service: \(loggedError.localizedDescription, privacy: .public)"
+            )
         }
-        let shutdownPromise = tcpChannel.eventLoop.makePromise(of: Void.self)
-        pacState = .running(tcpChannel: tcpChannel, shutdownPromise: shutdownPromise)
-        AppLog.proxy.info(
-            "PAC HTTP service started on \(address):\(port)"
-        )
     }
 
 
     /// 关闭本地 PAC HTTP 服务监听通道，但保留 NIO EventLoopGroup 供后续重启。
     ///
-    func shudownServer() async throws {
+    func shudownServer() async {
         guard case .running(let tcpChannel, let shutdownPromise) = pacState else {
             return
         }
@@ -160,7 +176,9 @@ actor PacService {
             if case .stop = pacState {
                 pacState = .running(tcpChannel: tcpChannel, shutdownPromise: shutdownPromise)
             }
-            throw error
+            AppLog.proxy.error(
+                "Failed to close PAC HTTP service listener: \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 }

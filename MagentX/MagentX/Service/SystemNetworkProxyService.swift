@@ -68,7 +68,7 @@ final class SystemNetworkProxyService: ObservableObject {
             try resolvedSystemProxyPreferences.disableMagentProxy()
         }
         self.shudownServerOperation = shudownServerOperation ?? {
-            try await resolvedPacService.shudownServer()
+            await resolvedPacService.shudownServer()
         }
         self.stopMagentOperation = stopMagentOperation ?? {
             try await resolvedMagentService.stop()
@@ -281,7 +281,7 @@ final class SystemNetworkProxyService: ObservableObject {
             address: configuration.proxyEndpoint.address,
             port: configuration.proxyEndpoint.port
         )
-        try await pacService.startServer()
+        await pacService.startServer()
 
         switch configuration.mode {
         case .pac:

@@ -1,5 +1,5 @@
 //
-//  PACUtil.swift
+//  PacUtil.swift
 //  MagentX
 //
 //  Author: MarlinL
@@ -10,7 +10,7 @@ import Foundation
 import Magent
 
 /// PAC 内容生成工具，负责把代理规则转换为 JavaScript 文本。
-enum PACUtil {
+enum PacUtil {
     /// 按规则优先级生成完整的 PAC JavaScript；不读取数据库，也不写入文件。
     /// - Parameters:
     ///   - rules: 需要写入 PAC 的持久化代理规则。

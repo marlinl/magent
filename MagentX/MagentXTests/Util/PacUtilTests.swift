@@ -1,5 +1,5 @@
 //
-//  PACUtilTests.swift
+//  PacUtilTests.swift
 //  MagentXTests
 //
 //  Author: MarlinL
@@ -10,11 +10,11 @@ import Magent
 import Testing
 @testable import MagentX
 
-/// `PACUtil` 规则到 PAC 文本转换行为的单元测试。
-struct PACUtilTests {
+/// `PacUtil` 规则到 PAC 文本转换行为的单元测试。
+struct PacUtilTests {
     /// 验证生成结果包含固定本地代理及各类规则对应的 PAC 字面量。
     @Test func makePACBodyReturnsRuleText() {
-        let pacBody = PACUtil.makePACBody(rules: [
+        let pacBody = PacUtil.makePACBody(rules: [
             MagentProxyRule(
                 id: 1,
                 matchType: MatchType.domainSuffix.rawValue,

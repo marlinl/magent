@@ -16,20 +16,10 @@ import Testing
 @MainActor
 @Suite(.serialized)
 struct MagentProxyRuleServiceTests {
-    /// 验证同步会覆盖同来源规则、保留冲突的用户规则，并给新增规则分配未占用 id。
+    /// 验证同步会批量 upsert 规则、复用已有 id，并给新增规则分配未占用 id。
     @Test func syncRuleFromURLMergesDownloadedRules() async throws {
         let container = try makeContainer()
         let context = ModelContext(container)
-        let pacFileURL = MagentXApp.localDirectoryURL
-            .appendingPathComponent("pac.json", isDirectory: false)
-        let originalPACData = try? Data(contentsOf: pacFileURL)
-        defer {
-            if let originalPACData {
-                try? originalPACData.write(to: pacFileURL, options: .atomic)
-            } else {
-                try? FileManager.default.removeItem(at: pacFileURL)
-            }
-        }
         let oldDate = Date(timeIntervalSince1970: 100)
         context.insert(MagentProxyRule(
             id: 0,
@@ -81,6 +71,7 @@ struct MagentProxyRuleServiceTests {
 
         let service = MagentProxyRuleService(modelContainer: container)
         try await service.sync()
+        try await service.sync()
 
         let resultContext = ModelContext(container)
         let storedRules = try resultContext.fetch(FetchDescriptor<MagentProxyRule>())
@@ -90,19 +81,15 @@ struct MagentProxyRuleServiceTests {
         #expect(rulesByValue["google.com"]?.decision == "direct")
         #expect(rulesByValue["google.com"]?.order == 100)
         #expect(rulesByValue["google.com"]?.source == "rulesUrl")
-        #expect(rulesByValue["example.com"]?.decision == "direct")
-        #expect(rulesByValue["example.com"]?.source == "user")
-        #expect(rulesByValue["example.com"]?.updatedAt == oldDate)
+        #expect(rulesByValue["example.com"]?.decision == "proxy")
+        #expect(rulesByValue["example.com"]?.source == "rulesUrl")
+        #expect(rulesByValue["example.com"]?.id == 1)
+        #expect(rulesByValue["example.com"]?.createdAt == oldDate)
+        #expect(rulesByValue["example.com"]?.updatedAt != oldDate)
         #expect(rulesByValue["apple.com"]?.id == 2)
         #expect(rulesByValue["10.0.0.0/8"]?.matchType == MatchType.ipCIDR.rawValue)
         #expect(rulesByValue["telegram"]?.matchType == MatchType.domainKeyword.rawValue)
         #expect(rulesByValue[#"https?:\/\/.*\.sample\.com"#]?.matchType == MatchType.urlRegex.rawValue)
-
-        let pac = try String(contentsOf: pacFileURL, encoding: .utf8)
-        #expect(pacFileURL.lastPathComponent == "pac.json")
-        #expect(pac.contains("function FindProxyForURL(url, host)"))
-        #expect(pac.contains(#"{ type: "domainSuffix", value: "google.com", decision: "direct" }"#))
-        #expect(pac.contains(#"{ type: "ipCIDR", value: "10.0.0.0", mask: "255.0.0.0", decision: "proxy" }"#))
     }
 
     /// 验证无效 Base64 会传播原始应用错误，且不会写入规则。

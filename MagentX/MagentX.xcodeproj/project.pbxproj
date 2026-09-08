@@ -50,6 +50,9 @@
 			exceptions = (
 				A1F000012FA0000000000001 /* Exceptions for "MagentX" folder in "MagentX" target */,
 			);
+			explicitFileTypes = {
+				"Util/PacUtil.swift" = sourcecode.swift;
+			};
 			path = MagentX;
 			sourceTree = "<group>";
 		};
