@@ -60,7 +60,7 @@ struct SystemNetworkProxyServiceTests {
             loadCurrentSelection: { persistedSelection },
             saveCurrentSelection: { persistedSelection = $0 },
             disableMagentProxyOperation: {},
-            stopPACServerOperation: {
+            shudownServerOperation: {
                 operations.append("pac")
                 throw SystemNetworkProxyServiceTestError.expected
             },
@@ -89,7 +89,7 @@ struct SystemNetworkProxyServiceTests {
         var operations: [String] = []
         let service = SystemNetworkProxyService(
             disableMagentProxyOperation: {},
-            stopPACServerOperation: {
+            shudownServerOperation: {
                 operations.append("pac")
                 throw SystemNetworkProxyServiceTestError.expected
             },

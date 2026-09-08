@@ -8,6 +8,7 @@
 
 import FactoryKit
 import Foundation
+import OSLog
 import SystemConfiguration
 import Combine
 
@@ -25,6 +26,7 @@ final class SystemNetworkProxyService: ObservableObject {
     @Published private(set) var isApplying = false
 
     @Injected(\.magentService) private var magentService
+    @Injected(\.pacService) private var pacService
     private let systemProxyPreferences: SystemNetworkProxyPreferences
     private var dynamicStore: SCDynamicStore?
     private var runLoopSource: CFRunLoopSource?
@@ -33,7 +35,7 @@ final class SystemNetworkProxyService: ObservableObject {
     private let loadCurrentSelection: () -> CurrentSelection
     private let saveCurrentSelection: (CurrentSelection) -> Void
     private let disableMagentProxyOperation: () throws -> Void
-    private let stopPACServerOperation: @MainActor () async throws -> Void
+    private let shudownServerOperation: @MainActor () async throws -> Void
     private let stopMagentOperation: @MainActor () async throws -> Void
 
     /// 创建系统网络代理协调服务。
@@ -45,17 +47,18 @@ final class SystemNetworkProxyService: ObservableObject {
     ///   - loadCurrentSelection: 读取当前选择的持久化依赖。
     ///   - saveCurrentSelection: 保存当前选择的持久化依赖。
     ///   - disableMagentProxyOperation: 关闭系统代理的依赖；默认写入真实系统网络偏好。
-    ///   - stopPACServerOperation: 停止 PAC 监听器的依赖；默认调用共享 Magent 服务。
+    ///   - shudownServerOperation: 关闭 PAC 监听器的依赖；默认调用共享 PAC 服务。
     ///   - stopMagentOperation: 停止 Magent 核心监听器的依赖；默认调用共享 Magent 服务。
     init(
         stateApplier: ((CurrentSelection, GeneralSettings) async throws -> Void)? = nil,
         loadCurrentSelection: @escaping () -> CurrentSelection = { CurrentSelection.load() },
         saveCurrentSelection: @escaping (CurrentSelection) -> Void = { $0.save() },
         disableMagentProxyOperation: (() throws -> Void)? = nil,
-        stopPACServerOperation: (@MainActor () async throws -> Void)? = nil,
+        shudownServerOperation: (@MainActor () async throws -> Void)? = nil,
         stopMagentOperation: (@MainActor () async throws -> Void)? = nil
     ) {
         let resolvedMagentService = Container.shared.magentService()
+        let resolvedPacService = Container.shared.pacService()
         let resolvedSystemProxyPreferences = SystemNetworkProxyPreferences()
         self.stateApplier = stateApplier
         self.loadCurrentSelection = loadCurrentSelection
@@ -64,8 +67,8 @@ final class SystemNetworkProxyService: ObservableObject {
         self.disableMagentProxyOperation = disableMagentProxyOperation ?? {
             try resolvedSystemProxyPreferences.disableMagentProxy()
         }
-        self.stopPACServerOperation = stopPACServerOperation ?? {
-            try await resolvedMagentService.stopPACServer()
+        self.shudownServerOperation = shudownServerOperation ?? {
+            try await resolvedPacService.shudownServer()
         }
         self.stopMagentOperation = stopMagentOperation ?? {
             try await resolvedMagentService.stop()
@@ -96,15 +99,7 @@ final class SystemNetworkProxyService: ObservableObject {
             serviceError = nil
             reloadCurrentSelection()
         } catch {
-            MagentXLogger.error(
-                error,
-                category: .service,
-                message: "Failed to apply stored proxy service configuration",
-                metadata: [
-                    "state": currentSelection.state.rawValue,
-                    "mode": currentSelection.mode.rawValue
-                ]
-            )
+            AppLog.proxy.error("Failed to apply stored proxy service configuration")
             serviceError = error.localizedDescription
         }
     }
@@ -144,20 +139,12 @@ final class SystemNetworkProxyService: ObservableObject {
         do {
             try systemProxyPreferences.disableMagentProxy()
         } catch {
-            MagentXLogger.error(
-                error,
-                category: .systemProxy,
-                message: "Failed to disable system proxy during runtime deactivation"
-            )
+            AppLog.network.error("Failed to disable system proxy during runtime deactivation")
         }
         do {
             try await stopLocalProxyServices()
         } catch {
-            MagentXLogger.error(
-                error,
-                category: .service,
-                message: "Failed to stop local proxy services during runtime deactivation"
-            )
+            AppLog.proxy.error("Failed to stop local proxy services during runtime deactivation")
         }
     }
 
@@ -195,14 +182,14 @@ final class SystemNetworkProxyService: ObservableObject {
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         dynamicStore = store
         runLoopSource = source
-        MagentXLogger.info("Started monitoring network service changes", category: .systemProxy)
+        AppLog.network.info("Started monitoring network service changes")
     }
 
     /// 停止监听当前网络服务变化。
     func stopMonitoring() {
         if let runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-            MagentXLogger.info("Stopped monitoring network service changes", category: .systemProxy)
+            AppLog.network.info("Stopped monitoring network service changes")
         }
         runLoopSource = nil
         dynamicStore = nil
@@ -261,16 +248,7 @@ final class SystemNetworkProxyService: ObservableObject {
             serviceError = nil
         } catch {
             currentSelection = loadCurrentSelection()
-            MagentXLogger.error(
-                error,
-                category: .service,
-                message: "Failed to apply proxy service state",
-                metadata: [
-                    "requestedState": state.rawValue,
-                    "currentState": currentSelection.state.rawValue,
-                    "mode": currentSelection.mode.rawValue
-                ]
-            )
+            AppLog.proxy.error("Failed to apply proxy service state")
             serviceError = error.localizedDescription
         }
     }
@@ -292,15 +270,7 @@ final class SystemNetworkProxyService: ObservableObject {
     ///
     /// - Parameter configuration: 已校验的启动模式和监听配置。
     private func applyStartedMode(configuration: SystemNetworkProxyConfiguration) async throws {
-        MagentXLogger.info(
-            "Starting proxy services",
-            category: .service,
-            metadata: [
-                "mode": configuration.mode.rawValue,
-                "proxyEndpoint": "\(configuration.proxyEndpoint.address):\(configuration.proxyEndpoint.port)",
-                "pacEndpoint": "\(configuration.pacEndpoint.address):\(configuration.pacEndpoint.port)"
-            ]
-        )
+        AppLog.proxy.info("Starting proxy services")
 
         if case .tunnel = configuration.mode {
             try disableMagentProxyOperation()
@@ -311,7 +281,7 @@ final class SystemNetworkProxyService: ObservableObject {
             address: configuration.proxyEndpoint.address,
             port: configuration.proxyEndpoint.port
         )
-        try await magentService.startPACServer()
+        try await pacService.startServer()
 
         switch configuration.mode {
         case .pac:
@@ -328,7 +298,7 @@ final class SystemNetworkProxyService: ObservableObject {
         var firstError: Error?
 
         do {
-            try await stopPACServerOperation()
+            try await shudownServerOperation()
         } catch {
             firstError = error
         }
@@ -351,11 +321,7 @@ final class SystemNetworkProxyService: ObservableObject {
         do {
             try await stopLocalProxyServices()
         } catch {
-            MagentXLogger.error(
-                error,
-                category: .service,
-                message: "Failed to stop local proxy services after startup failure"
-            )
+            AppLog.proxy.error("Failed to stop local proxy services after startup failure")
         }
     }
 
@@ -373,12 +339,7 @@ final class SystemNetworkProxyService: ObservableObject {
                 break
             }
         } catch {
-            MagentXLogger.error(
-                error,
-                category: .systemProxy,
-                message: "Failed to reapply system proxy after network service change",
-                metadata: ["mode": activeConfiguration.mode.rawValue]
-            )
+            AppLog.network.error("Failed to reapply system proxy after network service change")
         }
     }
 

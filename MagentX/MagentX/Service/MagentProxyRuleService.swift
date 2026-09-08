@@ -8,9 +8,10 @@
 import FactoryKit
 import Foundation
 import Magent
+import OSLog
 import SwiftData
 
-/// 代理规则服务，负责在独立 SwiftData 执行器上完成 CRUD 与订阅同步。
+/// 代理规则服务，负责在独立 SwiftData 执行器上完成订阅同步。
 @ModelActor
 actor MagentProxyRuleService {
     @Injected(\.localExecutor) private var localExecutor
@@ -24,159 +25,12 @@ actor MagentProxyRuleService {
     private static let source = "rulesUrl"
     private static let importedRuleOrder = 100
 
-    /// 按 `matchType` 和 `matchValue` 批量插入或更新代理规则。
-    ///
-    /// - Parameter rules: 需要持久化的不可变规则输入；同一批次内相同业务匹配身份仅保留首次出现的规则。
-    /// - Throws: SwiftData 保存失败时抛出原始错误。
-    func batchInsert(_ rules: [ProxyRulesViewModel]) throws {
-        let storedRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
-        var rulesByID = Dictionary(uniqueKeysWithValues: storedRules.map { ($0.id, $0) })
-        var rulesByIdentity = Dictionary(uniqueKeysWithValues: storedRules.map { proxyRule in
-            (
-                RuleIdentity(matchType: proxyRule.matchType, matchValue: proxyRule.matchValue),
-                proxyRule
-            )
-        })
-        var seenIdentities = Set<RuleIdentity>()
-        for rule in rules {
-            let identity = RuleIdentity(matchType: rule.matchType.rawValue, matchValue: rule.matchValue)
-            guard seenIdentities.insert(identity).inserted else { continue }
-            if let storedRule = rulesByID[rule.id] ?? rulesByIdentity[identity] {
-                let originalIdentity = RuleIdentity(
-                    matchType: storedRule.matchType,
-                    matchValue: storedRule.matchValue
-                )
-                storedRule.matchType = rule.matchType.rawValue
-                storedRule.matchValue = rule.matchValue
-                storedRule.decision = rule.decision.rawValue
-                storedRule.order = rule.order
-                storedRule.source = rule.source
-                storedRule.updatedAt = rule.updatedAt
-                rulesByIdentity.removeValue(forKey: originalIdentity)
-                rulesByIdentity[identity] = storedRule
-                rulesByID[storedRule.id] = storedRule
-                continue
-            }
-
-            let storedRule = MagentProxyRule(
-                id: rule.id,
-                matchType: rule.matchType.rawValue,
-                matchValue: rule.matchValue,
-                decision: rule.decision.rawValue,
-                order: rule.order,
-                source: rule.source,
-                createdAt: rule.createdAt,
-                updatedAt: rule.updatedAt
-            )
-            modelContext.insert(storedRule)
-            rulesByID[storedRule.id] = storedRule
-            rulesByIdentity[identity] = storedRule
-        }
-        do {
-            try modelContext.save()
-        } catch {
-            modelContext.rollback()
-            throw error
-        }
-    }
-
-    /// 按提交规则的唯一业务 id 直接插入或更新代理规则。
-    ///
-    /// - Parameter rule: 包含非空整数业务 id 与待保存字段的不可变规则输入。
-    /// - Throws: SwiftData 保存失败时抛出原始错误。
-    func insert(_ rule: ProxyRulesViewModel) throws {
-        let storedRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
-        let identity = RuleIdentity(matchType: rule.matchType.rawValue, matchValue: rule.matchValue)
-        if let storedRule = storedRules.first(where: { $0.id == rule.id })
-            ?? storedRules.first(where: {
-                $0.matchType == identity.matchType && $0.matchValue == identity.matchValue
-            }) {
-            storedRule.matchType = rule.matchType.rawValue
-            storedRule.matchValue = rule.matchValue
-            storedRule.decision = rule.decision.rawValue
-            storedRule.order = rule.order
-            storedRule.source = rule.source
-            storedRule.updatedAt = rule.updatedAt
-        } else {
-            modelContext.insert(MagentProxyRule(
-                id: rule.id,
-                matchType: rule.matchType.rawValue,
-                matchValue: rule.matchValue,
-                decision: rule.decision.rawValue,
-                order: rule.order,
-                source: rule.source,
-                createdAt: rule.createdAt,
-                updatedAt: rule.updatedAt
-            ))
-        }
-        do {
-            try modelContext.save()
-        } catch {
-            modelContext.rollback()
-            throw error
-        }
-    }
-
-    /// 按业务 id 批量删除已持久化代理规则。
-    ///
-    /// - Parameter ids: 待删除规则的唯一整数业务主键；空数组不执行删除。
-    /// - Throws: SwiftData 批量删除失败时抛出原始错误。
-    func delete(_ ids: [Int]) throws {
-        guard ids.isEmpty == false else { return }
-        try modelContext.delete(
-            model: MagentProxyRule.self,
-            where: #Predicate<MagentProxyRule> { proxyRule in
-                ids.contains(proxyRule.id)
-            }
-        )
-    }
-
-    /// 按关键字和从 `1` 开始的页码读取规则持久化标识。
-    ///
-    /// - Parameters:
-    ///   - keyword: 用于包含匹配 `matchValue` 的关键字；空白值表示全部规则。
-    ///   - pageAt: 从 `1` 开始的页码。
-    ///   - pageSize: 当页最多返回的规则数。
-    /// - Returns: 按顺序和匹配值排序的分页规则持久化标识，以及是否存在下一页。
-    /// - Throws: SwiftData 查询失败时抛出原始错误。
-    func search(keyword: String, pageAt: Int = 1, pageSize: Int) throws -> ProxyRulesPagingResult {
-        precondition(pageAt >= 1, "pageAt must start at 1")
-        precondition(pageSize > 0, "pageSize must be greater than 0")
-
-        let normalizedKeyword = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
-        let sortDescriptors: [SortDescriptor<MagentProxyRule>] = [
-            SortDescriptor(\.order),
-            SortDescriptor(\.matchValue)
-        ]
-        var descriptor: FetchDescriptor<MagentProxyRule>
-        if normalizedKeyword.isEmpty {
-            descriptor = FetchDescriptor<MagentProxyRule>(sortBy: sortDescriptors)
-        } else {
-            let query = normalizedKeyword
-            descriptor = FetchDescriptor<MagentProxyRule>(
-                predicate: #Predicate<MagentProxyRule> { proxyRule in
-                    proxyRule.matchValue.contains(query)
-                },
-                sortBy: sortDescriptors
-            )
-        }
-        descriptor.fetchOffset = (pageAt - 1) * pageSize
-        descriptor.fetchLimit = pageSize + 1
-
-        let fetchedRules = try modelContext.fetch(descriptor)
-        let persistentIdentifiers = fetchedRules.prefix(pageSize).map(\.persistentModelID)
-        return ProxyRulesPagingResult(
-            persistentIdentifiers: persistentIdentifiers,
-            pageAt: pageAt,
-            pageSize: pageSize,
-            canLoadMore: fetchedRules.count > persistentIdentifiers.count
-        )
-    }
-
     /// 同步当前规则订阅并重写本地 PAC 文件。
     ///
+    /// 副作用：下载并合并规则、保存 SwiftData、更新 PAC 文件，以及写入不含规则内容的系统日志。
     /// - Throws: 下载、解析、持久化或 PAC 写入失败时抛出原始错误。
     func sync() async throws {
+        AppLog.rules.info("Starting proxy rule synchronization")
         let response = try await downloadFromRuleUrl()
         guard let decodedData = Data(base64Encoded: response, options: [.ignoreUnknownCharacters]) else {
             throw MagentXError.invalidAclBase64Data
@@ -184,7 +38,7 @@ actor MagentProxyRuleService {
         guard let decodedText = String(data: decodedData, encoding: .utf8) else {
             throw MagentXError.invalidAclDecodedText
         }
-        let downloadedRules = AdblockUtil.parse(decodedText)
+        let downloadedRules = AdblockUtil.parsePACRules(decodedText)
         let existingRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
         var rulesByIdentity: [RuleIdentity: MagentProxyRule] = [:]
         for existingRule in existingRules {
@@ -238,10 +92,12 @@ actor MagentProxyRuleService {
             try modelContext.save()
         } catch {
             modelContext.rollback()
+            AppLog.database.error("Failed to save synchronized proxy rules")
             throw error
         }
 
         try await writePACFile()
+        AppLog.rules.info("Completed proxy rule synchronization")
     }
 
     /// 从当前规则订阅 URL 下载完整响应正文，不做 Base64 解码或内容裁剪。
@@ -278,6 +134,7 @@ actor MagentProxyRuleService {
 
     /// 读取全部持久化代理规则并将生成的 PAC 内容写入应用本地目录。
     ///
+    /// 副作用：读取 SwiftData 并覆盖应用本地 PAC 文件，不记录规则正文或存储路径。
     /// - Throws: 读取规则、创建目录或写入 PAC 文件失败时抛出原始错误。
     private func writePACFile() async throws {
         let storedRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())

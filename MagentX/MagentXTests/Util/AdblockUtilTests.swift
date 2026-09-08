@@ -14,7 +14,7 @@ import Testing
 struct AdblockUtilTests {
     /// 验证常用 GFWList/Adblock 语法被转换为与业务对象无关的匹配结果。
     @Test func parsesSupportedRuleStyles() {
-        let rules = AdblockUtil.parse(
+        let rules = AdblockUtil.parsePACRules(
             """
             ! comment
             [AutoProxy 0.2.9]
@@ -45,7 +45,7 @@ struct AdblockUtilTests {
 
     /// 验证同值例外规则优先，且注释、元数据和无效空规则不进入结果。
     @Test func exceptionRuleOverridesDuplicateBlockingRule() {
-        let rules = AdblockUtil.parse(
+        let rules = AdblockUtil.parsePACRules(
             """
             ||duplicate.com^
             @@||duplicate.com^
@@ -65,5 +65,50 @@ struct AdblockUtilTests {
         #expect(AdblockUtil.normalizedDomain("  .Example.COM.  ") == "example.com")
         #expect(AdblockUtil.normalizedDomain("bad..example.com") == nil)
         #expect(AdblockUtil.normalizedDomain("例子.com") == nil)
+    }
+
+    /// 验证结构化 parser 保留 cosmetic 域名条件及 network 选项，而不把它们降级为 PAC 匹配。
+    @Test func preservesAdblockRuleSemantics() {
+        let rules = AdblockRuleParser.parse(
+            """
+            ||doubleclick.net^$script,third-party,domain=foo.com|bar.com
+            example.com,~vip.example.com#@#.sponsor
+            /foo$bar/$image
+            """
+        )
+
+        #expect(rules == [
+            AdblockRule(
+                raw: "||doubleclick.net^$script,third-party,domain=foo.com|bar.com",
+                kind: .network,
+                isException: false,
+                domains: [],
+                pattern: "||doubleclick.net^",
+                options: [
+                    .init(name: "script", value: nil, negated: false),
+                    .init(name: "third-party", value: nil, negated: false),
+                    .init(name: "domain", value: "foo.com|bar.com", negated: false)
+                ]
+            ),
+            AdblockRule(
+                raw: "example.com,~vip.example.com#@#.sponsor",
+                kind: .cosmetic(.allow),
+                isException: true,
+                domains: [
+                    .init(value: "example.com", excluded: false),
+                    .init(value: "vip.example.com", excluded: true)
+                ],
+                pattern: ".sponsor",
+                options: []
+            ),
+            AdblockRule(
+                raw: "/foo$bar/$image",
+                kind: .network,
+                isException: false,
+                domains: [],
+                pattern: "/foo$bar/",
+                options: [.init(name: "image", value: nil, negated: false)]
+            )
+        ])
     }
 }

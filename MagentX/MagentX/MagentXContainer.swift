@@ -90,6 +90,15 @@ extension Container {
         .cached
     }
 
+    /// 提供进程内唯一的 PAC HTTP 服务，由服务自身持有 NIO 运行时和监听器生命周期。
+    @MainActor
+    var pacService: Factory<PacService> {
+        self {
+            PacService()
+        }
+        .cached
+    }
+
     /// 提供绑定当前 SwiftData 容器的代理规则服务；应用启动时必须先注册实际实例。
     @MainActor
     var magentProxyRuleService: Factory<MagentProxyRuleService> {

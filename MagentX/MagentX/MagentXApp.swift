@@ -8,6 +8,7 @@
 
 import AppKit
 import FactoryKit
+import OSLog
 import SwiftUI
 import SwiftData
 
@@ -23,27 +24,19 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
 
     /// 应用启动后按持久化状态恢复本地代理和系统代理配置。
     func applicationDidFinishLaunching(_ notification: Notification) {
-        MagentXLogger.info(
-            "Application did finish launching",
-            category: .app,
-            metadata: ["logFile": MagentXLogger.logFileURL.path]
-        )
+        AppLog.app.info("Application did finish launching")
         Task { @MainActor in
             do {
                 try await SystemNetworkProxyService.shared.applyStoredConfiguration()
             } catch {
-                MagentXLogger.error(
-                    error,
-                    category: .systemProxy,
-                    message: "Failed to restore stored proxy configuration at launch"
-                )
+                AppLog.network.error("Failed to restore stored proxy configuration at launch")
             }
         }
     }
 
     /// 应用退出前停止进程内本地监听，并清理 MagentX 写入的系统代理配置。
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        MagentXLogger.info("Application will terminate", category: .app)
+        AppLog.app.info("Application will terminate")
         Task { @MainActor in
             await SystemNetworkProxyService.shared.deactivateRuntimeServices()
             sender.reply(toApplicationShouldTerminate: true)
@@ -88,11 +81,7 @@ struct MagentXApp: App {
             MagentXAppDelegate.applyBackgroundPreference(enableMenuBar)
         } catch {
             let appError = MagentXError.modelContainerCreationFailed(error.localizedDescription)
-            MagentXLogger.fault(
-                appError,
-                category: .persistence,
-                message: "Failed to initialize SwiftData model container"
-            )
+            AppLog.database.fault("Failed to initialize SwiftData model container")
             fatalError(appError.localizedDescription)
         }
     }
