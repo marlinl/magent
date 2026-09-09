@@ -13,9 +13,12 @@ import SwiftUI
 import SwiftData
 
 /// macOS 应用代理，协调窗口关闭后是否继续保留后台进程。
+@MainActor
 final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
     /// 应用菜单栏后台运行偏好。
     static var keepsRunningAfterLastWindowClosed = true
+
+    @Injected(\.systemNetworkSettingService) private var systemNetworkSettingService
 
     /// 应用设置中的后台运行偏好。
     static func applyBackgroundPreference(_ isEnabled: Bool) {
@@ -27,7 +30,7 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
         AppLog.app.info("Application did finish launching")
         Task { @MainActor in
             do {
-                try await SystemNetworkProxyService.shared.applyStoredConfiguration()
+                try await systemNetworkSettingService.applyStoredConfiguration()
             } catch {
                 AppLog.network.error("Failed to restore stored proxy configuration at launch")
             }
@@ -38,7 +41,7 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         AppLog.app.info("Application will terminate")
         Task { @MainActor in
-            await SystemNetworkProxyService.shared.deactivateRuntimeServices()
+            await systemNetworkSettingService.deactivateRuntimeServices()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -74,8 +77,8 @@ struct MagentXApp: App {
             let container = try Self.makeModelContainer()
             let enableMenuBar = GeneralSettings.load().enableMenuBar
             modelContainer = container
-            Container.shared.magentProxyRuleService.register {
-                MagentProxyRuleService(modelContainer: container)
+            Container.shared.syncProxyRulesCoordinator.register {
+                SyncProxyRulesCoordinator(modelContainer: container)
             }
             _isMenuBarInserted = State(initialValue: enableMenuBar)
             MagentXAppDelegate.applyBackgroundPreference(enableMenuBar)

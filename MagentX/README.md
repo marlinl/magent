@@ -24,9 +24,10 @@ MagentX/MagentX/
 │   ├── MagentNode.swift
 │   └── MagentProxyRule.swift
 ├── Service/
-│   ├── MagentProxyRuleService.swift
 │   ├── MagentService.swift
-│   └── SystemNetworkProxyService.swift
+│   └── SystemNetworkSettingService.swift
+├── Coordinator/
+│   └── SyncProxyRulesCoordinator.swift
 ├── Controller/
 │   ├── NodeController.swift
 │   └── SettingsController.swift
@@ -49,8 +50,8 @@ Controllers
     ↓ CRUD and refresh orchestration
 SwiftData Models
     ↓ local persistence by default
-Services
-    ↓ subscription download and parsing
+Coordinators and Services
+    ↓ subscription synchronization and runtime operations
 Magent Swift Package
     ↓ proxy protocol, routing, crypto, and connection state
 Network
@@ -63,11 +64,11 @@ Network
 - `CurrentSelection`: persisted selection state for the active proxy node.
 - `MagentProxyRule`: persisted proxy rule used directly by `ProxyRulesView`, including typed direct/proxy decisions.
 
-## Services
+## Coordinators and Services
 
-`MagentProxyRuleService` downloads and parses the configured rule subscription, then merges imported rules tagged with `source = "rulesUrl"` into SwiftData on its model actor.
+`SyncProxyRulesCoordinator` is a Factory-managed process singleton. It owns the observable synchronization state, downloads and parses the configured rule subscription, then merges imported rules tagged with `source = "rulesUrl"` into SwiftData without blocking the main actor.
 
-`MagentProxyRuleService` rewrites the complete persisted proxy rule set to the app-local `pac.json` after a subscription refresh. `MagentService` serves the latest file through the local PAC HTTP endpoint.
+`MagentService` manages the local Magent proxy runtime. `SystemNetworkSettingService` coordinates runtime activation and system network proxy settings.
 
 ## Controllers
 

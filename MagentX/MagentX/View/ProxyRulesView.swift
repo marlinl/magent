@@ -16,14 +16,11 @@ import SwiftUI
 @MainActor
 struct ProxyRulesView: View {
     @Environment(\.modelContext) private var modelContext
-    @Injected(\.localExecutor) private var localExecutor
-    @Injected(\.magentProxyRuleService) private var magentProxyRuleService
+    @InjectedObservable(\.syncProxyRulesCoordinator) private var syncProxyRulesCoordinator
     @Binding var toolbarButtons: [ContentToolbarButton]
     @State private var searchText = ""
     @State private var pageAt = 1
-    @State private var isRefreshing = false
     @State private var editingRule: MagentProxyRule?
-    @State private var syncError: String?
 
     private static let pageSize = 100
 
@@ -33,7 +30,7 @@ struct ProxyRulesView: View {
             searchText: normalizedSearchText,
             pageAt: $pageAt,
             pageSize: Self.pageSize,
-            isRefreshing: isRefreshing,
+            isRefreshing: syncProxyRulesCoordinator.state == .running,
             editingRule: $editingRule
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -55,22 +52,22 @@ struct ProxyRulesView: View {
         .alert(
             "规则同步失败",
             isPresented: Binding(
-                get: { syncError != nil },
+                get: { syncProxyRulesCoordinator.syncError != nil },
                 set: { isPresented in
                     if isPresented == false {
-                        syncError = nil
+                        syncProxyRulesCoordinator.syncError = nil
                     }
                 }
             )
         ) {
             Button("好", role: .cancel) {
-                syncError = nil
+                syncProxyRulesCoordinator.syncError = nil
             }
         } message: {
-            Text(syncError ?? "")
+            Text(syncProxyRulesCoordinator.syncError ?? "")
         }
-        .task(id: isRefreshing) {
-            if isRefreshing {
+        .task(id: syncProxyRulesCoordinator.state) {
+            if syncProxyRulesCoordinator.state == .running {
                 toolbarButtons = [
                     ContentToolbarButton(
                         title: "增加规则",
@@ -129,39 +126,11 @@ struct ProxyRulesView: View {
                         editingRule = rule
                     },
                     ContentToolbarButton(title: "同步规则", systemImage: "arrow.clockwise") {
-                        sync()
+                        syncProxyRulesCoordinator.sync()
                     }
                 ]
             }
         }
-    }
-
-    /// 下载订阅规则、合并数据库并重写 PAC，期间同步主窗口工具栏状态。
-    private func sync() {
-        guard isRefreshing == false else { return }
-
-        let now = Date.now
-        let magentProxyRuleService = self.magentProxyRuleService
-        isRefreshing = true
-        syncError = nil
-
-        localExecutor.submit(
-            priority: .utility,
-            operation: {
-                try await magentProxyRuleService.sync()
-            },
-            completion: { result in
-                isRefreshing = false
-                switch result {
-                case .success:
-                    var refreshedSettings = GeneralSettings.load()
-                    refreshedSettings.updatedAt = now
-                    refreshedSettings.save()
-                case .failure(let error):
-                    syncError = error.localizedDescription
-                }
-            }
-        )
     }
 
     /// 使用搜索条件和当前页对应的 `FetchDescriptor` 观察并展示最多 100 条代理规则。

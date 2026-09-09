@@ -1,5 +1,5 @@
 //
-//  MagentProxyRuleServiceTests.swift
+//  SyncProxyRulesCoordinatorTests.swift
 //  MagentXTests
 //
 //  Author: MarlinL
@@ -12,10 +12,10 @@ import SwiftData
 import Testing
 @testable import MagentX
 
-/// `MagentProxyRuleService` 下载、解析和数据库合并行为的单元测试。
+/// `SyncProxyRulesCoordinator` 下载、解析、数据库合并和可观察状态的单元测试。
 @MainActor
 @Suite(.serialized)
-struct MagentProxyRuleServiceTests {
+struct SyncProxyRulesCoordinatorTests {
     /// 验证同步会批量 upsert 规则、复用已有 id，并给新增规则分配未占用 id。
     @Test func syncRuleFromURLMergesDownloadedRules() async throws {
         let container = try makeContainer()
@@ -69,9 +69,19 @@ struct MagentProxyRuleServiceTests {
             }
         }
 
-        let service = MagentProxyRuleService(modelContainer: container)
-        try await service.sync()
-        try await service.sync()
+        let coordinator = SyncProxyRulesCoordinator(modelContainer: container)
+        #expect(coordinator.state == .idle)
+        coordinator.sync()
+        #expect(coordinator.state == .running)
+        await waitForSyncCompletion(coordinator)
+        #expect(coordinator.state == .idle)
+        #expect(coordinator.syncError == nil)
+
+        coordinator.sync()
+        #expect(coordinator.state == .running)
+        await waitForSyncCompletion(coordinator)
+        #expect(coordinator.state == .idle)
+        #expect(coordinator.syncError == nil)
 
         let resultContext = ModelContext(container)
         let storedRules = try resultContext.fetch(FetchDescriptor<MagentProxyRule>())
@@ -92,7 +102,7 @@ struct MagentProxyRuleServiceTests {
         #expect(rulesByValue[#"https?:\/\/.*\.sample\.com"#]?.matchType == MatchType.urlRegex.rawValue)
     }
 
-    /// 验证无效 Base64 会传播原始应用错误，且不会写入规则。
+    /// 验证无效 Base64 会写入可观察错误状态，且不会写入规则。
     @Test func syncRuleFromURLPropagatesInvalidBase64Error() async throws {
         let container = try makeContainer()
         let fileURL = FileManager.default.temporaryDirectory
@@ -112,12 +122,26 @@ struct MagentProxyRuleServiceTests {
             }
         }
 
-        let service = MagentProxyRuleService(modelContainer: container)
-        await #expect(throws: MagentXError.invalidAclBase64Data) {
-            try await service.sync()
-        }
+        let coordinator = SyncProxyRulesCoordinator(modelContainer: container)
+        coordinator.sync()
+        #expect(coordinator.state == .running)
+        await waitForSyncCompletion(coordinator)
+
+        #expect(coordinator.state == .idle)
+        #expect(coordinator.syncError == MagentXError.invalidAclBase64Data.localizedDescription)
         let resultContext = ModelContext(container)
         #expect(try resultContext.fetchCount(FetchDescriptor<MagentProxyRule>()) == 0)
+    }
+
+    /// 等待协调器结束当前同步任务，并在合理时间内未完成时记录测试失败。
+    private func waitForSyncCompletion(_ coordinator: SyncProxyRulesCoordinator) async {
+        for _ in 0..<500 {
+            if coordinator.state == .idle {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        Issue.record("Proxy rule synchronization did not finish in time")
     }
 
     /// 创建仅包含代理规则存储记录的内存 SwiftData 容器。

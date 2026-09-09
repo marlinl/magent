@@ -81,6 +81,23 @@ extension Container {
         .cached
     }
 
+    /// 提供进程内唯一的代理规则同步协调器，由所有代理规则页面共享同步状态。
+    @MainActor
+    var syncProxyRulesCoordinator: Factory<SyncProxyRulesCoordinator> {
+        self {
+            preconditionFailure("SyncProxyRulesCoordinator must be registered during application startup")
+        }
+        .onPreview {
+            do {
+                let modelContainer = try MagentXApp.makeModelContainer(isStoredInMemoryOnly: true)
+                return SyncProxyRulesCoordinator(modelContainer: modelContainer)
+            } catch {
+                preconditionFailure("Failed to create preview model container: \(error.localizedDescription)")
+            }
+        }
+        .cached
+    }
+
     /// 提供进程内唯一的 Magent 核心运行服务，由服务自身重建已关闭的底层运行时。
     @MainActor
     var magentService: Factory<MagentService> {
@@ -99,20 +116,13 @@ extension Container {
         .cached
     }
 
-    /// 提供绑定当前 SwiftData 容器的代理规则服务；应用启动时必须先注册实际实例。
+    /// 提供进程内唯一的系统网络设置服务，统一维护代理运行状态和系统网络配置。
     @MainActor
-    var magentProxyRuleService: Factory<MagentProxyRuleService> {
+    var systemNetworkSettingService: Factory<SystemNetworkSettingService> {
         self {
-            preconditionFailure("MagentProxyRuleService must be registered during application startup")
-        }
-        .onPreview {
-            do {
-                let modelContainer = try MagentXApp.makeModelContainer(isStoredInMemoryOnly: true)
-                return MagentProxyRuleService(modelContainer: modelContainer)
-            } catch {
-                preconditionFailure("Failed to create preview model container: \(error.localizedDescription)")
-            }
+            SystemNetworkSettingService()
         }
         .cached
     }
+
 }

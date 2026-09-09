@@ -8,9 +8,15 @@ Swift 类型声明必须写 `///` 文档注释，说明该类型承担的业务�
 
 MagentX app 层异常错误统一定义在 `MagentX/MagentXError.swift` 的 `MagentXError` 中。不要在 Controller、Service、Model 或 View 中新增局部 `Error`/`LocalizedError` enum；需要新错误时给 `MagentXError` 增加 case。
 
-## IoC 注入命名
+## IoC 依赖与实例生命周期
 
-使用 `@Injected` 注入的实例变量必须采用其类型名的 lowerCamelCase 形式，不得使用泛化或职责缩写名称。例如 `MagentProxyRuleService` 必须命名为 `magentProxyRuleService`，不能命名为 `service` 或 `ruleService`。
+MagentX 中带有行为和生命周期的应用层实例，包括 Service、Coordinator、Manager、Executor 等，必须统一注册在 `MagentX/MagentXContainer.swift` 的 FactoryKit `Container` 扩展中。类型自身不得通过 `static let shared`、全局变量、自建缓存或其他手写单例方式管理实例生命周期。
+
+需要在应用进程内保持唯一实例和长期状态时，由对应 Factory 使用 `.cached` 明确提供单例语义；不需要共享状态的实例由 Factory 按实际生命周期创建。生产调用方必须使用 FactoryKit 的属性包装器获取这些依赖，不得直接初始化实例，也不得绕过 Factory 访问类型自建的共享实例。普通依赖使用 `@Injected`，SwiftUI 中的 `ObservableObject` 使用 `@InjectedObject`，Observation 的 `@Observable` 使用 `@InjectedObservable`。可观察状态必须由 Factory 提供的同一实例维护。
+
+新增或迁移实例时，应同时检查它依赖的 Service、Coordinator 等是否已由 Factory 提供，不得在类型内部再建立第二套依赖或单例管理。当前任务只涉及指定类型时，不得借机迁移或重构无关的既有实例；发现既有代码不符合此规则时，应先报告并等待明确范围。
+
+使用 `@Injected`、`@InjectedObject` 或 `@InjectedObservable` 注入的实例变量必须采用其类型名的 lowerCamelCase 形式，不得使用泛化或职责缩写名称。例如 `SystemNetworkSettingService` 必须命名为 `systemNetworkSettingService`，不能命名为 `service` 或 `networkService`。
 
 ## Unit Testing & Access Control
 

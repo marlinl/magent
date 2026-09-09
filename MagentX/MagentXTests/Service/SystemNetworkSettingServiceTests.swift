@@ -1,5 +1,5 @@
 //
-//  SystemNetworkProxyServiceTests.swift
+//  SystemNetworkSettingServiceTests.swift
 //  MagentXTests
 //
 //  Author: MarlinL
@@ -9,14 +9,14 @@
 import Testing
 @testable import MagentX
 
-/// `SystemNetworkProxyService` 在服务应用成功或失败时的状态事务测试。
+/// `SystemNetworkSettingService` 在服务应用成功或失败时的状态事务测试。
 @Suite @MainActor
-struct SystemNetworkProxyServiceTests {
+struct SystemNetworkSettingServiceTests {
     /// 验证启动成功后才发布并持久化启动状态。
     @Test func startServicePublishesAndPersistsSelectionAfterSuccessfulApply() async {
         var persistedSelection = CurrentSelection(state: .stop, mode: .pac)
         var appliedSelection: CurrentSelection?
-        let service = SystemNetworkProxyService(
+        let service = SystemNetworkSettingService(
             stateApplier: { selection, _ in
                 appliedSelection = selection
             },
@@ -36,9 +36,9 @@ struct SystemNetworkProxyServiceTests {
     /// 验证启动应用失败时回滚可观察状态、保持原有持久化选择并暴露错误反馈。
     @Test func startServiceDoesNotPersistSelectionWhenApplyFails() async {
         var persistedSelection = CurrentSelection(state: .stop, mode: .pac)
-        let service = SystemNetworkProxyService(
+        let service = SystemNetworkSettingService(
             stateApplier: { _, _ in
-                throw SystemNetworkProxyServiceTestError.expected
+                throw SystemNetworkSettingServiceTestError.expected
             },
             loadCurrentSelection: { persistedSelection },
             saveCurrentSelection: { persistedSelection = $0 }
@@ -56,13 +56,13 @@ struct SystemNetworkProxyServiceTests {
     @Test func stopServiceAttemptsMagentCleanupWhenPACCleanupFails() async {
         var persistedSelection = CurrentSelection(state: .start, mode: .pac)
         var operations: [String] = []
-        let service = SystemNetworkProxyService(
+        let service = SystemNetworkSettingService(
             loadCurrentSelection: { persistedSelection },
             saveCurrentSelection: { persistedSelection = $0 },
             disableMagentProxyOperation: {},
             shudownServerOperation: {
                 operations.append("pac")
-                throw SystemNetworkProxyServiceTestError.expected
+                throw SystemNetworkSettingServiceTestError.expected
             },
             stopMagentOperation: {
                 operations.append("magent")
@@ -75,7 +75,7 @@ struct SystemNetworkProxyServiceTests {
                 generalSettings: GeneralSettings.load()
             )
             Issue.record("Expected PAC cleanup error")
-        } catch SystemNetworkProxyServiceTestError.expected {
+        } catch SystemNetworkSettingServiceTestError.expected {
             // The original PAC cleanup error must reach regular stop callers.
         } catch {
             Issue.record("Unexpected cleanup error: \(error)")
@@ -87,15 +87,15 @@ struct SystemNetworkProxyServiceTests {
     /// 验证启动失败时即使 PAC 清理失败，仍清理 Magent 并原样抛回启动错误。
     @Test func startupFailureAttemptsBothCleanupsAndPreservesStartupError() async {
         var operations: [String] = []
-        let service = SystemNetworkProxyService(
+        let service = SystemNetworkSettingService(
             disableMagentProxyOperation: {},
             shudownServerOperation: {
                 operations.append("pac")
-                throw SystemNetworkProxyServiceTestError.expected
+                throw SystemNetworkSettingServiceTestError.expected
             },
             stopMagentOperation: {
                 operations.append("magent")
-                throw SystemNetworkProxyServiceTestError.expected
+                throw SystemNetworkSettingServiceTestError.expected
             }
         )
 
@@ -116,6 +116,6 @@ struct SystemNetworkProxyServiceTests {
 }
 
 /// 定向验证服务状态事务失败路径的测试错误。
-private enum SystemNetworkProxyServiceTestError: Error {
+private enum SystemNetworkSettingServiceTestError: Error {
     case expected
 }

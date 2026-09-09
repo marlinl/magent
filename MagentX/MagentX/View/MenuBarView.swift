@@ -7,29 +7,30 @@
 //
 
 import AppKit
+import FactoryKit
 import SwiftUI
 
 /// macOS 菜单栏弹出内容，提供打开主窗口、关闭后台运行和退出操作。
 struct MenuBarView: View {
     @Environment(\.openWindow) private var openWindow
+    @InjectedObject(\.systemNetworkSettingService) private var systemNetworkSettingService
     @Binding var isMenuBarInserted: Bool
-    @ObservedObject private var systemNetworkProxyService = SystemNetworkProxyService.shared
 
     var body: some View {
         Group {
             Label(
-                systemNetworkProxyService.isServiceStarted ? "当前状态：已开启" : "当前状态：已关闭",
-                systemImage: systemNetworkProxyService.isServiceStarted ? "checkmark.circle" : "pause.circle"
+                systemNetworkSettingService.isServiceStarted ? "当前状态：已开启" : "当前状态：已关闭",
+                systemImage: systemNetworkSettingService.isServiceStarted ? "checkmark.circle" : "pause.circle"
             )
 
-            Button(systemNetworkProxyService.isServiceStarted ? "关闭代理服务" : "开启代理服务") {
+            Button(systemNetworkSettingService.isServiceStarted ? "关闭代理服务" : "开启代理服务") {
                 Task {
-                    await systemNetworkProxyService.toggleService()
+                    await systemNetworkSettingService.toggleService()
                 }
             }
-            .disabled(systemNetworkProxyService.isApplying)
+            .disabled(systemNetworkSettingService.isApplying)
 
-            if let serviceError = systemNetworkProxyService.serviceError {
+            if let serviceError = systemNetworkSettingService.serviceError {
                 Text(serviceError)
             }
 
@@ -46,9 +47,9 @@ struct MenuBarView: View {
             }
         }
         .onAppear {
-            systemNetworkProxyService.reloadCurrentSelection()
+            systemNetworkSettingService.reloadCurrentSelection()
             Task {
-                await systemNetworkProxyService.applyStoredConfigurationIfNeeded()
+                await systemNetworkSettingService.applyStoredConfigurationIfNeeded()
             }
         }
     }

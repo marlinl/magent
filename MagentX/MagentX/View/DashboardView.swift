@@ -6,12 +6,13 @@
 //  Responsibility: Displays the proxy dashboard overview.
 //
 
+import FactoryKit
 import SwiftUI
 
 /// 仪表盘页面，展示代理运行状态入口和概览空态。
 struct DashboardView: View {
     @Binding var toolbarButtons: [ContentToolbarButton]
-    @ObservedObject private var systemNetworkProxyService = SystemNetworkProxyService.shared
+    @InjectedObject(\.systemNetworkSettingService) private var systemNetworkSettingService
 
     var body: some View {
         ContentUnavailableView(
@@ -23,52 +24,52 @@ struct DashboardView: View {
         .overlay(alignment: .bottomTrailing) {
             Button {
                 Task {
-                    await systemNetworkProxyService.toggleService()
+                    await systemNetworkSettingService.toggleService()
                 }
             } label: {
                 Label(
-                    systemNetworkProxyService.isApplying
+                    systemNetworkSettingService.isApplying
                         ? "正在切换代理服务"
-                        : (systemNetworkProxyService.isServiceStarted ? "关闭代理服务" : "启动代理服务"),
-                    systemImage: systemNetworkProxyService.isApplying
+                        : (systemNetworkSettingService.isServiceStarted ? "关闭代理服务" : "启动代理服务"),
+                    systemImage: systemNetworkSettingService.isApplying
                         ? "hourglass"
-                        : (systemNetworkProxyService.isServiceStarted ? "stop.fill" : "power")
+                        : (systemNetworkSettingService.isServiceStarted ? "stop.fill" : "power")
                 )
                 .labelStyle(.iconOnly)
             }
             .buttonStyle(.borderedProminent)
             .buttonBorderShape(.circle)
             .controlSize(.large)
-            .tint(systemNetworkProxyService.isServiceStarted ? .red : .accentColor)
-            .disabled(systemNetworkProxyService.isApplying)
+            .tint(systemNetworkSettingService.isServiceStarted ? .red : .accentColor)
+            .disabled(systemNetworkSettingService.isApplying)
             .help(
-                systemNetworkProxyService.isApplying
+                systemNetworkSettingService.isApplying
                     ? "正在切换代理服务"
-                    : (systemNetworkProxyService.isServiceStarted ? "关闭代理服务" : "启动代理服务")
+                    : (systemNetworkSettingService.isServiceStarted ? "关闭代理服务" : "启动代理服务")
             )
             .accessibilityLabel(
-                systemNetworkProxyService.isApplying
+                systemNetworkSettingService.isApplying
                     ? "正在切换代理服务"
-                    : (systemNetworkProxyService.isServiceStarted ? "关闭代理服务" : "启动代理服务")
+                    : (systemNetworkSettingService.isServiceStarted ? "关闭代理服务" : "启动代理服务")
             )
             .padding(24)
         }
         .alert("代理服务操作失败", isPresented: Binding(get: {
-            systemNetworkProxyService.serviceError != nil
+            systemNetworkSettingService.serviceError != nil
         }, set: { isPresented in
             if isPresented == false {
-                systemNetworkProxyService.clearServiceError()
+                systemNetworkSettingService.clearServiceError()
             }
         })) {
             Button("好") {
-                systemNetworkProxyService.clearServiceError()
+                systemNetworkSettingService.clearServiceError()
             }
         } message: {
-            Text(systemNetworkProxyService.serviceError ?? "")
+            Text(systemNetworkSettingService.serviceError ?? "")
         }
         .onAppear {
             toolbarButtons = []
-            systemNetworkProxyService.reloadCurrentSelection()
+            systemNetworkSettingService.reloadCurrentSelection()
         }
     }
 }

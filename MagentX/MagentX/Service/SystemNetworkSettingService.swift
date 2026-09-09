@@ -1,5 +1,5 @@
 //
-//  SystemNetworkProxyService.swift
+//  SystemNetworkSettingService.swift
 //  MagentX
 //
 //  Author: MarlinL
@@ -14,10 +14,7 @@ import Combine
 
 /// 监听当前 macOS 网络服务变化，并按 `CurrentSelection` 维护系统代理配置。
 @MainActor
-final class SystemNetworkProxyService: ObservableObject {
-    /// MagentX 进程内唯一的系统代理协调服务。
-    static let shared = SystemNetworkProxyService()
-
+final class SystemNetworkSettingService: ObservableObject {
     /// 当前已持久化的后台代理服务选择，供所有界面入口共同显示。
     @Published private(set) var currentSelection: CurrentSelection
     /// 最近一次用户发起的服务切换错误，供界面显示和清除。
@@ -35,8 +32,8 @@ final class SystemNetworkProxyService: ObservableObject {
     private let loadCurrentSelection: () -> CurrentSelection
     private let saveCurrentSelection: (CurrentSelection) -> Void
     private let disableMagentProxyOperation: () throws -> Void
-    private let shudownServerOperation: @MainActor () async throws -> Void
-    private let stopMagentOperation: @MainActor () async throws -> Void
+    private let shudownServerOperation: (@MainActor () async throws -> Void)?
+    private let stopMagentOperation: (@MainActor () async throws -> Void)?
 
     /// 创建系统网络代理协调服务。
     ///
@@ -47,8 +44,8 @@ final class SystemNetworkProxyService: ObservableObject {
     ///   - loadCurrentSelection: 读取当前选择的持久化依赖。
     ///   - saveCurrentSelection: 保存当前选择的持久化依赖。
     ///   - disableMagentProxyOperation: 关闭系统代理的依赖；默认写入真实系统网络偏好。
-    ///   - shudownServerOperation: 关闭 PAC 监听器的依赖；默认调用共享 PAC 服务。
-    ///   - stopMagentOperation: 停止 Magent 核心监听器的依赖；默认调用共享 Magent 服务。
+    ///   - shudownServerOperation: 测试时替换关闭 PAC 监听器的操作；默认调用注入的 PAC 服务。
+    ///   - stopMagentOperation: 测试时替换停止 Magent 核心监听器的操作；默认调用注入的 Magent 服务。
     init(
         stateApplier: ((CurrentSelection, GeneralSettings) async throws -> Void)? = nil,
         loadCurrentSelection: @escaping () -> CurrentSelection = { CurrentSelection.load() },
@@ -57,8 +54,6 @@ final class SystemNetworkProxyService: ObservableObject {
         shudownServerOperation: (@MainActor () async throws -> Void)? = nil,
         stopMagentOperation: (@MainActor () async throws -> Void)? = nil
     ) {
-        let resolvedMagentService = Container.shared.magentService()
-        let resolvedPacService = Container.shared.pacService()
         let resolvedSystemProxyPreferences = SystemNetworkProxyPreferences()
         self.stateApplier = stateApplier
         self.loadCurrentSelection = loadCurrentSelection
@@ -67,12 +62,8 @@ final class SystemNetworkProxyService: ObservableObject {
         self.disableMagentProxyOperation = disableMagentProxyOperation ?? {
             try resolvedSystemProxyPreferences.disableMagentProxy()
         }
-        self.shudownServerOperation = shudownServerOperation ?? {
-            await resolvedPacService.shudownServer()
-        }
-        self.stopMagentOperation = stopMagentOperation ?? {
-            try await resolvedMagentService.stop()
-        }
+        self.shudownServerOperation = shudownServerOperation
+        self.stopMagentOperation = stopMagentOperation
         self.currentSelection = loadCurrentSelection()
     }
 
@@ -161,7 +152,7 @@ final class SystemNetworkProxyService: ObservableObject {
         )
         guard let store = SCDynamicStoreCreate(
             nil,
-            "MagentX.SystemNetworkProxyService" as CFString,
+            "MagentX.SystemNetworkSettingService" as CFString,
             Self.dynamicStoreDidChange,
             &context
         ) else {
@@ -298,13 +289,21 @@ final class SystemNetworkProxyService: ObservableObject {
         var firstError: Error?
 
         do {
-            try await shudownServerOperation()
+            if let shudownServerOperation {
+                try await shudownServerOperation()
+            } else {
+                await pacService.shudownServer()
+            }
         } catch {
             firstError = error
         }
 
         do {
-            try await stopMagentOperation()
+            if let stopMagentOperation {
+                try await stopMagentOperation()
+            } else {
+                try await magentService.stop()
+            }
         } catch {
             if firstError == nil {
                 firstError = error
@@ -343,10 +342,10 @@ final class SystemNetworkProxyService: ObservableObject {
         }
     }
 
-    /// 将 SystemConfiguration 的网络变化回调转交给主 actor 上的共享协调服务。
+    /// 将 SystemConfiguration 的网络变化回调转交给主 actor 上的当前设置服务。
     private static let dynamicStoreDidChange: SCDynamicStoreCallBack = { _, _, info in
         guard let info else { return }
-        let service = Unmanaged<SystemNetworkProxyService>
+        let service = Unmanaged<SystemNetworkSettingService>
             .fromOpaque(info)
             .takeUnretainedValue()
         Task { @MainActor in
