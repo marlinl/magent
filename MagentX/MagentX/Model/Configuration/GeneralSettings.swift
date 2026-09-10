@@ -8,6 +8,13 @@
 
 import Foundation
 
+/// 应用启动代理服务时使用的代理模式。
+enum ProxyMode: String, Sendable {
+    case pac
+    case global
+    case direct
+}
+
 /// 单记录常规偏好，使用 macOS 沙盒内 `UserDefaults` 作为 KV 存储。
 struct GeneralSettings {
     static let localhostAddress = "127.0.0.1"
@@ -19,6 +26,7 @@ struct GeneralSettings {
     var launchAtLogin: Bool = false
     var enableMenuBar: Bool = true
     var iCloudSyncEnabled: Bool = false
+    var proxyMode: ProxyMode = .pac
     var rulesURL: String = GeneralSettings.defaultRulesURL
     var proxyListenAddress: String = GeneralSettings.localhostAddress
     var proxyListenPort: Int = GeneralSettings.defaultProxyListenPort
@@ -32,6 +40,7 @@ struct GeneralSettings {
         launchAtLogin: Bool = false,
         enableMenuBar: Bool = true,
         iCloudSyncEnabled: Bool = false,
+        proxyMode: ProxyMode = .pac,
         rulesURL: String = GeneralSettings.defaultRulesURL,
         proxyListenAddress: String = GeneralSettings.localhostAddress,
         proxyListenPort: Int = GeneralSettings.defaultProxyListenPort,
@@ -43,6 +52,7 @@ struct GeneralSettings {
         self.launchAtLogin = launchAtLogin
         self.enableMenuBar = enableMenuBar
         self.iCloudSyncEnabled = iCloudSyncEnabled
+        self.proxyMode = proxyMode
         self.rulesURL = rulesURL
         self.proxyListenAddress = proxyListenAddress
         self.proxyListenPort = proxyListenPort
@@ -58,6 +68,7 @@ struct GeneralSettings {
             launchAtLogin: userDefaults.object(forKey: "general.launchAtLogin") as? Bool ?? false,
             enableMenuBar: userDefaults.object(forKey: "general.enableMenuBar") as? Bool ?? true,
             iCloudSyncEnabled: userDefaults.object(forKey: "general.iCloudSyncEnabled") as? Bool ?? false,
+            proxyMode: ProxyMode(rawValue: userDefaults.string(forKey: "general.proxyMode") ?? "") ?? .pac,
             rulesURL: userDefaults.string(forKey: "general.rulesURL") ?? defaultRulesURL,
             proxyListenAddress: userDefaults.string(forKey: "general.proxyListenAddress") ?? localhostAddress,
             proxyListenPort: userDefaults.object(forKey: "general.proxyListenPort") as? Int ?? defaultProxyListenPort,
@@ -73,6 +84,7 @@ struct GeneralSettings {
         userDefaults.set(launchAtLogin, forKey: "general.launchAtLogin")
         userDefaults.set(enableMenuBar, forKey: "general.enableMenuBar")
         userDefaults.set(iCloudSyncEnabled, forKey: "general.iCloudSyncEnabled")
+        userDefaults.set(proxyMode.rawValue, forKey: "general.proxyMode")
         userDefaults.set(rulesURL, forKey: "general.rulesURL")
         userDefaults.set(proxyListenAddress, forKey: "general.proxyListenAddress")
         userDefaults.set(proxyListenPort, forKey: "general.proxyListenPort")
