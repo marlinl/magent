@@ -15,7 +15,22 @@ import OSLog
 ///
 /// `Magent.close()` 会回收核心实例自己的 EventLoopGroup；本 actor 会在下一次启动时重建核心实例。
 actor MagentService {
-    private var state: State = .stopped
+    /// Magent 核心服务的当前运行状态。
+    enum State: Equatable, Sendable {
+        case running
+        case idle
+    }
+
+    /// 当前 Magent 核心服务的运行状态。
+    private(set) var state = State.idle
+    private var magent: Magent?
+    private var lifecycleOperation: LifecycleOperation?
+
+    /// 标识当前启动或关闭操作，用于在 actor 重入时复用同一个任务。
+    private struct LifecycleOperation {
+        let identifier: UUID
+        let task: Task<Void, Error>
+    }
 
     /// 使用本地代理监听端点构造默认直连配置并启动 Magent。
     ///
@@ -50,31 +65,38 @@ actor MagentService {
     /// 副作用：创建并启动 Magent 核心监听器，并向系统日志写入生命周期事件。
     func start(_ configuration: MagentConfig) async throws {
         switch state {
-        case .stopped:
-            AppLog.proxy.info("Starting Magent core service")
-            let identifier = UUID()
-            let task = Task { () throws -> Magent in
-                let threadNumber = await MainActor.run {
-                    GeneralSettings.load().proxyThreadNumber
-                }
-                guard threadNumber > 0 else {
-                    throw MagentXError.invalidProxyThreadNumber(threadNumber)
-                }
-
-                let magent = Magent(threadNumber: threadNumber)
-                try await magent.start(configuration)
-                return magent
+        case .idle:
+            if let lifecycleOperation, let magent {
+                try await completeShutdown(magent: magent, operation: lifecycleOperation)
+                try await start(configuration)
+                return
             }
-            state = .starting(identifier, task)
-            try await completeStartup(identifier: identifier, task: task)
-        case .starting(let identifier, let task):
-            try await completeStartup(identifier: identifier, task: task)
+
+            AppLog.proxy.info("Starting Magent core service")
+            let threadNumber = await MainActor.run {
+                GeneralSettings.load().proxyThreadNumber
+            }
+            guard threadNumber > 0 else {
+                throw MagentXError.invalidProxyThreadNumber(threadNumber)
+            }
+
+            let magent = Magent(threadNumber: threadNumber)
+            let operation = LifecycleOperation(
+                identifier: UUID(),
+                task: Task {
+                    try await magent.start(configuration)
+                }
+            )
+            self.magent = magent
+            state = .running
+            lifecycleOperation = operation
+            try await completeStartup(magent: magent, operation: operation)
         case .running:
-            AppLog.proxy.debug("Magent core service is already running")
-            return
-        case .stopping(let identifier, let task):
-            try await completeShutdown(identifier: identifier, task: task)
-            try await start(configuration)
+            if let lifecycleOperation, let magent {
+                try await completeStartup(magent: magent, operation: lifecycleOperation)
+            } else {
+                AppLog.proxy.debug("Magent core service is already running")
+            }
         }
     }
 
@@ -83,82 +105,91 @@ actor MagentService {
     /// 副作用：关闭 Magent 核心监听器，并向系统日志写入生命周期事件。
     func stop() async throws {
         switch state {
-        case .stopped:
-            AppLog.proxy.debug("Magent core service is already stopped")
-            return
-        case .starting(let identifier, let task):
-            try await completeStartup(identifier: identifier, task: task)
-            try await stop()
-        case .running(let magent):
-            AppLog.proxy.info("Stopping Magent core service")
-            let identifier = UUID()
-            let task = Task {
-                try await magent.close()
+        case .idle:
+            if let lifecycleOperation, let magent {
+                try await completeShutdown(magent: magent, operation: lifecycleOperation)
+            } else {
+                AppLog.proxy.debug("Magent core service is already stopped")
             }
-            state = .stopping(identifier, task)
-            try await completeShutdown(identifier: identifier, task: task)
-        case .stopping(let identifier, let task):
-            try await completeShutdown(identifier: identifier, task: task)
+        case .running:
+            guard let magent else {
+                state = .idle
+                return
+            }
+            if let lifecycleOperation {
+                try await completeStartup(magent: magent, operation: lifecycleOperation)
+                try await stop()
+                return
+            }
+
+            AppLog.proxy.info("Stopping Magent core service")
+            let operation = LifecycleOperation(
+                identifier: UUID(),
+                task: Task {
+                    try await magent.close()
+                }
+            )
+            state = .idle
+            lifecycleOperation = operation
+            try await completeShutdown(magent: magent, operation: operation)
         }
     }
 
-    /// 等待启动任务结束，并将仍属于该任务的状态更新为运行中或已停止。
+    /// 等待启动任务结束，并将仍属于该任务的失败状态恢复为空闲。
     ///
     /// - Parameters:
-    ///   - identifier: 本次启动任务的唯一标识。
-    ///   - task: 等待完成的 Magent 启动任务。
+    ///   - magent: 本次启动创建的 Magent 实例。
+    ///   - operation: 本次启动操作。
     private func completeStartup(
-        identifier: UUID,
-        task: Task<Magent, Error>
+        magent: Magent,
+        operation: LifecycleOperation
     ) async throws {
         do {
-            let magent = try await task.value
-            if case .starting(let currentIdentifier, _) = state,
-               currentIdentifier == identifier {
-                state = .running(magent)
+            try await operation.task.value
+            if lifecycleOperation?.identifier == operation.identifier {
+                lifecycleOperation = nil
                 AppLog.proxy.info("Magent core service started")
             }
         } catch {
-            if case .starting(let currentIdentifier, _) = state,
-               currentIdentifier == identifier {
-                state = .stopped
+            if lifecycleOperation?.identifier == operation.identifier {
+                lifecycleOperation = nil
+                if self.magent === magent {
+                    self.magent = nil
+                    state = .idle
+                }
             }
             AppLog.proxy.error("Magent core service failed to start")
             throw error
         }
     }
 
-    /// 等待停止任务结束，并将仍属于该任务的状态更新为已停止。
+    /// 等待关闭任务结束，并释放已关闭的 Magent 实例。
     ///
     /// - Parameters:
-    ///   - identifier: 本次停止任务的唯一标识。
-    ///   - task: 等待完成的 Magent 关闭任务。
+    ///   - magent: 本次关闭的 Magent 实例。
+    ///   - operation: 本次关闭操作。
     private func completeShutdown(
-        identifier: UUID,
-        task: Task<Void, Error>
+        magent: Magent,
+        operation: LifecycleOperation
     ) async throws {
         do {
-            try await task.value
-            if case .stopping(let currentIdentifier, _) = state,
-               currentIdentifier == identifier {
-                state = .stopped
+            try await operation.task.value
+            if lifecycleOperation?.identifier == operation.identifier {
+                lifecycleOperation = nil
+                if self.magent === magent {
+                    self.magent = nil
+                }
                 AppLog.proxy.info("Magent core service stopped")
             }
         } catch {
-            if case .stopping(let currentIdentifier, _) = state,
-               currentIdentifier == identifier {
-                state = .stopped
+            if lifecycleOperation?.identifier == operation.identifier {
+                lifecycleOperation = nil
+                if self.magent === magent {
+                    state = .running
+                }
             }
             AppLog.proxy.error("Magent core service failed to stop")
             throw error
         }
-    }
-
-    /// 串行化启动和关闭操作所需的内部生命周期状态。
-    private enum State {
-        case stopped
-        case starting(UUID, Task<Magent, Error>)
-        case running(Magent)
-        case stopping(UUID, Task<Void, Error>)
     }
 }
