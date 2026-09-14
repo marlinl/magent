@@ -23,9 +23,9 @@ struct SyncProxyRulesCoordinatorTests {
         let oldDate = Date(timeIntervalSince1970: 100)
         context.insert(MagentProxyRule(
             id: 0,
-            matchType: MatchType.domainSuffix.rawValue,
+            matchType: .domainSuffix,
             matchValue: "google.com",
-            decision: "proxy",
+            decision: .proxy,
             order: 0,
             source: "rulesUrl",
             createdAt: oldDate,
@@ -33,9 +33,9 @@ struct SyncProxyRulesCoordinatorTests {
         ))
         context.insert(MagentProxyRule(
             id: 1,
-            matchType: MatchType.domainSuffix.rawValue,
+            matchType: .domainSuffix,
             matchValue: "example.com",
-            decision: "direct",
+            decision: .direct,
             order: 0,
             source: "user",
             createdAt: oldDate,
@@ -88,18 +88,71 @@ struct SyncProxyRulesCoordinatorTests {
         let rulesByValue = Dictionary(uniqueKeysWithValues: storedRules.map { ($0.matchValue, $0) })
 
         #expect(storedRules.count == 6)
-        #expect(rulesByValue["google.com"]?.decision == "direct")
+        #expect(rulesByValue["google.com"]?.decision == .direct)
         #expect(rulesByValue["google.com"]?.order == 100)
         #expect(rulesByValue["google.com"]?.source == "rulesUrl")
-        #expect(rulesByValue["example.com"]?.decision == "proxy")
+        #expect(rulesByValue["example.com"]?.decision == .proxy)
         #expect(rulesByValue["example.com"]?.source == "rulesUrl")
         #expect(rulesByValue["example.com"]?.id == 1)
         #expect(rulesByValue["example.com"]?.createdAt == oldDate)
         #expect(rulesByValue["example.com"]?.updatedAt != oldDate)
         #expect(rulesByValue["apple.com"]?.id == 2)
-        #expect(rulesByValue["10.0.0.0/8"]?.matchType == MatchType.ipCIDR.rawValue)
-        #expect(rulesByValue["telegram"]?.matchType == MatchType.domainKeyword.rawValue)
-        #expect(rulesByValue[#"https?:\/\/.*\.sample\.com"#]?.matchType == MatchType.urlRegex.rawValue)
+        #expect(rulesByValue["10.0.0.0/8"]?.matchType == .ipCIDR)
+        #expect(rulesByValue["telegram"]?.matchType == .domainKeyword)
+        #expect(rulesByValue[#"https?:\/\/.*\.sample\.com"#]?.matchType == .urlRegex)
+    }
+
+    /// 验证同步会保留同一业务键中 id 最小的规则，并合并已有重复记录。
+    @Test func syncRuleFromURLCollapsesDuplicateStoredRules() async throws {
+        let container = try makeContainer()
+        let context = ModelContext(container)
+        let oldDate = Date(timeIntervalSince1970: 100)
+        context.insert(MagentProxyRule(
+            id: 0,
+            matchType: .domainSuffix,
+            matchValue: "example.com",
+            decision: .direct,
+            order: 0,
+            source: "user",
+            createdAt: oldDate,
+            updatedAt: oldDate
+        ))
+        context.insert(MagentProxyRule(
+            id: 1,
+            matchType: .domainSuffix,
+            matchValue: "example.com",
+            decision: .proxy,
+            order: 0,
+            source: "user",
+            createdAt: oldDate,
+            updatedAt: oldDate
+        ))
+        try context.save()
+
+        let fileURL = try makeEncodedListFile("||example.com")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let defaults = UserDefaults.standard
+        let rulesURLKey = "general.rulesURL"
+        let originalRulesURL = defaults.object(forKey: rulesURLKey)
+        defaults.set(fileURL.absoluteString, forKey: rulesURLKey)
+        defer {
+            if let originalRulesURL {
+                defaults.set(originalRulesURL, forKey: rulesURLKey)
+            } else {
+                defaults.removeObject(forKey: rulesURLKey)
+            }
+        }
+
+        let coordinator = SyncProxyRulesCoordinator(modelContainer: container)
+        coordinator.sync()
+        await waitForSyncCompletion(coordinator)
+        #expect(coordinator.syncError == nil)
+
+        let storedRules = try ModelContext(container).fetch(FetchDescriptor<MagentProxyRule>())
+        #expect(storedRules.count == 1)
+        #expect(storedRules.first?.id == 0)
+        #expect(storedRules.first?.decision == .proxy)
     }
 
     /// 验证无效 Base64 会写入可观察错误状态，且不会写入规则。

@@ -34,7 +34,7 @@ final class SyncProxyRulesCoordinator {
 
     /// 规则的业务匹配身份，用于在订阅同步时识别同一条数据库记录。
     private nonisolated struct RuleIdentity: Hashable, Sendable {
-        let matchType: String
+        let matchType: MatchType
         let matchValue: String
     }
 
@@ -78,51 +78,56 @@ final class SyncProxyRulesCoordinator {
 
                 // 3. 批量组建待写入的 [MagentProxyRule]，已有规则复用 id 和创建时间。
                 let modelContext = ModelContext(modelContainer)
-                let existingRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
-                let rulesByIdentity = Dictionary(uniqueKeysWithValues: existingRules.map { existingRule in
-                    (RuleIdentity(
+                let existingRules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>(
+                    sortBy: [SortDescriptor(\.id, order: .forward)]
+                ))
+                var rulesByIdentity: [RuleIdentity: MagentProxyRule] = [:]
+                for existingRule in existingRules {
+                    let identity = RuleIdentity(
                         matchType: existingRule.matchType,
                         matchValue: existingRule.matchValue
-                    ), existingRule)
-                })
+                    )
+                    if rulesByIdentity[identity] == nil {
+                        rulesByIdentity[identity] = existingRule
+                    } else {
+                        modelContext.delete(existingRule)
+                    }
+                }
                 var usedIDs = Set(existingRules.map(\.id))
                 var nextIDCandidate = 0
                 let now = Date.now
-                let proxyRules = downloadedRules.map { downloadedRule in
+                for downloadedRule in downloadedRules {
                     let identity = RuleIdentity(
-                        matchType: downloadedRule.matchType.rawValue,
+                        matchType: downloadedRule.matchType,
                         matchValue: downloadedRule.matchValue
                     )
-                    let existingRule = rulesByIdentity[identity]
-                    let id: Int
-                    if let existingRule {
-                        id = existingRule.id
+                    if let existingRule = rulesByIdentity[identity] {
+                        existingRule.decision = downloadedRule.isException ? .direct : .proxy
+                        existingRule.order = Self.importedRuleOrder
+                        existingRule.source = Self.source
+                        existingRule.updatedAt = now
                     } else {
                         while usedIDs.contains(nextIDCandidate) {
                             nextIDCandidate += 1
                         }
-                        id = nextIDCandidate
+                        let proxyRule = MagentProxyRule(
+                            id: nextIDCandidate,
+                            matchType: downloadedRule.matchType,
+                            matchValue: downloadedRule.matchValue,
+                            decision: downloadedRule.isException ? .direct : .proxy,
+                            order: Self.importedRuleOrder,
+                            source: Self.source,
+                            createdAt: now,
+                            updatedAt: now
+                        )
+                        modelContext.insert(proxyRule)
+                        rulesByIdentity[identity] = proxyRule
                         usedIDs.insert(nextIDCandidate)
                         nextIDCandidate += 1
                     }
-
-                    return MagentProxyRule(
-                        id: id,
-                        matchType: downloadedRule.matchType.rawValue,
-                        matchValue: downloadedRule.matchValue,
-                        decision: downloadedRule.isException ? "direct" : "proxy",
-                        order: Self.importedRuleOrder,
-                        source: Self.source,
-                        createdAt: existingRule?.createdAt ?? now,
-                        updatedAt: now
-                    )
                 }
 
-                // 4. 利用 (matchType, matchValue) 业务唯一键批量 upsert，并统一保存。
-                for proxyRule in proxyRules {
-                    modelContext.insert(proxyRule)
-                }
-
+                // 4. 利用 (matchType, matchValue) 业务唯一键合并并统一保存。
                 do {
                     try modelContext.save()
                 } catch {

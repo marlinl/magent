@@ -39,10 +39,10 @@ struct ProxyNodesView: View {
                     let node = MagentProxyNode(
                         id: MagentProxyNode.makeUUIDVersion7(at: now),
                         name: nil,
-                        type: ProxyNodeType.shadowsocks.rawValue,
+                        type: .shadowsocks,
                         address: "",
                         port: 8388,
-                        cipher: ProxyCipher.chacha20IetfPoly1305.rawValue,
+                        cipher: .chacha20IetfPoly1305,
                         password: "",
                         timeout: 30,
                         createdAt: now,
@@ -124,7 +124,7 @@ struct ProxyNodesView: View {
                         .width(min: 160, ideal: 240)
 
                         TableColumn("类型") { node in
-                            Text(node.type)
+                            Text(node.type.rawValue)
                         }
                         .width(min: 100, ideal: 140)
 
@@ -220,9 +220,9 @@ struct ProxyNodesView: View {
                     )
 
                     Picker("类型", selection: $node.type) {
-                        ForEach(ProxyNodeType.allCases, id: \.rawValue) { type in
+                        ForEach(ProxyNodeType.allCases, id: \.self) { type in
                             Text(type.rawValue)
-                                .tag(type.rawValue)
+                                .tag(type)
                         }
                     }
                     .pickerStyle(.menu)
@@ -240,9 +240,9 @@ struct ProxyNodesView: View {
                     )
 
                     Picker("加密", selection: $node.cipher) {
-                        ForEach(ProxyCipher.allCases, id: \.rawValue) { cipher in
+                        ForEach(ProxyCipher.allCases, id: \.self) { cipher in
                             Text(cipher.rawValue)
-                                .tag(cipher.rawValue)
+                                .tag(cipher)
                         }
                     }
                     .pickerStyle(.menu)

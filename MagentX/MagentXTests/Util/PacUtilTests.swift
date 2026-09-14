@@ -17,33 +17,33 @@ struct PacUtilTests {
         let pacBody = PacUtil.makePACBody(rules: [
             MagentProxyRule(
                 id: 1,
-                matchType: MatchType.domainSuffix.rawValue,
+                matchType: .domainSuffix,
                 matchValue: "example.com",
-                decision: "proxy",
+                decision: .proxy,
                 order: 100,
                 source: "user"
             ),
             MagentProxyRule(
                 id: 2,
-                matchType: MatchType.domainKeyword.rawValue,
+                matchType: .domainKeyword,
                 matchValue: "telegram",
-                decision: "direct",
+                decision: .direct,
                 order: 100,
                 source: "user"
             ),
             MagentProxyRule(
                 id: 3,
-                matchType: MatchType.ipCIDR.rawValue,
+                matchType: .ipCIDR,
                 matchValue: "10.0.0.0/8",
-                decision: "direct",
+                decision: .direct,
                 order: 100,
                 source: "user"
             ),
             MagentProxyRule(
                 id: 4,
-                matchType: MatchType.urlRegex.rawValue,
+                matchType: .urlRegex,
                 matchValue: #"https?:\/\/.*\.example\.com"#,
-                decision: "proxy",
+                decision: .proxy,
                 order: 100,
                 source: "user"
             )
