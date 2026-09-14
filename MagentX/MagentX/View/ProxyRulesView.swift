@@ -112,9 +112,9 @@ struct ProxyRulesView: View {
                         let now = Date.now
                         let rule = MagentProxyRule(
                             id: nextID,
-                            matchType: .domainSuffix,
+                            matchType: MatchType.domainSuffix.rawValue,
                             matchValue: "",
-                            decision: .proxy,
+                            decision: "proxy",
                             order: 0,
                             source: "user",
                             createdAt: now,
@@ -204,7 +204,7 @@ struct ProxyRulesView: View {
                         .width(min: 64, ideal: 280)
 
                         TableColumn("类型") { rule in
-                            Text(rule.matchType.rawValue)
+                            Text(rule.matchType)
                                 .lineLimit(1)
                         }
                         .width(min: 44, ideal: 80, max: 110)
@@ -222,7 +222,7 @@ struct ProxyRulesView: View {
                         .width(min: 44, ideal: 76, max: 100)
 
                         TableColumn("规则") { rule in
-                            Text(rule.decision.rawValue.uppercased())
+                            Text(rule.decision.uppercased())
                                 .lineLimit(1)
                         }
                         .width(min: 44, ideal: 64, max: 84)
@@ -292,16 +292,16 @@ struct ProxyRulesView: View {
             Form {
                 Section {
                     Picker("匹配类型", selection: $rule.matchType) {
-                        ForEach(MatchType.allCases, id: \.self) { matchType in
+                        ForEach(MatchType.allCases, id: \.rawValue) { matchType in
                             Text(matchType.rawValue)
-                                .tag(matchType)
+                                .tag(matchType.rawValue)
                         }
                     }
                     .pickerStyle(.menu)
 
                     Picker("动作", selection: $rule.decision) {
-                        Text("DIRECT").tag(RuleDecision.direct)
-                        Text("PROXY").tag(RuleDecision.proxy)
+                        Text("DIRECT").tag("direct")
+                        Text("PROXY").tag("proxy")
                     }
                     .pickerStyle(.menu)
 

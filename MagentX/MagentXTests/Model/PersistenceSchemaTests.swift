@@ -21,10 +21,10 @@ struct PersistenceSchemaTests {
         let node = MagentProxyNode(
             id: UUID(),
             name: nil,
-            type: .shadowsocks,
+            type: ProxyNodeType.shadowsocks.rawValue,
             address: "127.0.0.1",
             port: 8388,
-            cipher: .chacha20IetfPoly1305,
+            cipher: ProxyCipher.chacha20IetfPoly1305.rawValue,
             password: "password",
             timeout: 30,
             createdAt: .now,
@@ -32,9 +32,9 @@ struct PersistenceSchemaTests {
         )
         let rule = MagentProxyRule(
             id: 1,
-            matchType: .domainSuffix,
+            matchType: MatchType.domainSuffix.rawValue,
             matchValue: "example.com",
-            decision: .proxy,
+            decision: "proxy",
             order: 100,
             source: "user"
         )

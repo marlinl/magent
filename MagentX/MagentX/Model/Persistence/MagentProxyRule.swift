@@ -7,26 +7,18 @@
 //
 
 import Foundation
-import Magent
 import SwiftData
-
-/// MagentX 代理规则动作，以稳定字符串原始值持久化。
-nonisolated enum RuleDecision: String, Codable, Sendable, Equatable, Hashable, CaseIterable {
-    /// 使用代理转发。
-    case proxy
-
-    /// 直接连接。
-    case direct
-}
 
 /// MagentX 持久化的代理规则，对应 `magent_proxy_rules` 的基础数据列和业务唯一键。
 @Model
 final class MagentProxyRule {
+    #Unique<MagentProxyRule>([\.matchType, \.matchValue])
+
     @Attribute(.unique)
     var id: Int
-    var matchType: MatchType
+    var matchType: String
     var matchValue: String
-    var decision: RuleDecision
+    var decision: String
     var order: Int
     var source: String
     var createdAt: Date
@@ -36,18 +28,18 @@ final class MagentProxyRule {
     ///
     /// - Parameters:
     ///   - id: 规则的唯一整数业务主键。
-    ///   - matchType: 匹配方式。
+    ///   - matchType: 与 `magent_proxy_rules.match_type` 对应的匹配方式字符串。
     ///   - matchValue: 匹配值。
-    ///   - decision: 规则命中后的动作。
+    ///   - decision: 与 `magent_proxy_rules.decision` 对应的规则动作字符串。
     ///   - order: 规则顺序，数值越小优先级越高。
     ///   - source: 规则来源。
     ///   - createdAt: 创建时间。
     ///   - updatedAt: 最后更新时间。
     init(
         id: Int,
-        matchType: MatchType,
+        matchType: String,
         matchValue: String,
-        decision: RuleDecision,
+        decision: String,
         order: Int,
         source: String,
         createdAt: Date = .now,

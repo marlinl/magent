@@ -28,10 +28,10 @@ struct ProxyNodesViewModel: Identifiable, Sendable {
         MagentProxyNode(
             id: id,
             name: name,
-            type: type,
+            type: type.rawValue,
             address: address,
             port: port,
-            cipher: cipher,
+            cipher: cipher.rawValue,
             password: password,
             timeout: timeout,
             createdAt: createdAt,

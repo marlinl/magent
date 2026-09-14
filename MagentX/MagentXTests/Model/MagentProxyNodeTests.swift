@@ -28,10 +28,10 @@ struct MagentProxyNodeTests {
         let node = MagentProxyNode(
             id: identifier,
             name: "Example",
-            type: .shadowsocks,
+            type: ProxyNodeType.shadowsocks.rawValue,
             address: "127.0.0.1",
             port: 8388,
-            cipher: .chacha20IetfPoly1305,
+            cipher: ProxyCipher.chacha20IetfPoly1305.rawValue,
             password: "password",
             timeout: 30,
             createdAt: createdAt,
@@ -44,10 +44,10 @@ struct MagentProxyNodeTests {
         let storedNode = try #require(modelContext.fetch(FetchDescriptor<MagentProxyNode>()).first)
         #expect(storedNode.id == identifier)
         #expect(storedNode.name == "Example")
-        #expect(storedNode.type == .shadowsocks)
+        #expect(storedNode.type == ProxyNodeType.shadowsocks.rawValue)
         #expect(storedNode.address == "127.0.0.1")
         #expect(storedNode.port == 8388)
-        #expect(storedNode.cipher == .chacha20IetfPoly1305)
+        #expect(storedNode.cipher == ProxyCipher.chacha20IetfPoly1305.rawValue)
         #expect(storedNode.password == "password")
         #expect(storedNode.timeout == 30)
         #expect(storedNode.createdAt == createdAt)
@@ -111,10 +111,10 @@ struct MagentProxyNodeTests {
     @Test func defaultsToUUIDVersion7ID() {
         let node = MagentProxyNode(
             name: "Example",
-            type: .shadowsocks,
+            type: ProxyNodeType.shadowsocks.rawValue,
             address: "127.0.0.1",
             port: 8388,
-            cipher: .chacha20IetfPoly1305,
+            cipher: ProxyCipher.chacha20IetfPoly1305.rawValue,
             password: "password",
             timeout: 30,
             createdAt: .now,

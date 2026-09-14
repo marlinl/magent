@@ -7,7 +7,6 @@
 //
 
 import Foundation
-import Magent
 import Network
 import SwiftData
 
@@ -17,10 +16,10 @@ final class MagentProxyNode {
     @Attribute(.unique)
     var id: UUID
     var name: String?
-    var type: ProxyNodeType
+    var type: String
     var address: String
     var port: Int
-    var cipher: ProxyCipher
+    var cipher: String
     var password: String
     var timeout: TimeInterval
     var createdAt: Date
@@ -31,10 +30,10 @@ final class MagentProxyNode {
     /// - Parameters:
     ///   - id: 节点唯一业务主键，默认生成 UUIDv7。
     ///   - name: 可选的节点名称。
-    ///   - type: 节点类型。
+    ///   - type: 与 `magent_proxy_nodes.type` 对应的节点类型字符串。
     ///   - address: 代理服务器主机名或 IP 地址。
     ///   - port: 代理服务器端口。
-    ///   - cipher: 节点使用的加密方法。
+    ///   - cipher: 与 `magent_proxy_nodes.cipher` 对应的加密方法字符串。
     ///   - password: 节点密码。
     ///   - timeout: 超时时间（秒）。
     ///   - createdAt: 创建时间。
@@ -42,10 +41,10 @@ final class MagentProxyNode {
     init(
         id: UUID = MagentProxyNode.makeUUIDVersion7(),
         name: String?,
-        type: ProxyNodeType,
+        type: String,
         address: String,
         port: Int,
-        cipher: ProxyCipher,
+        cipher: String,
         password: String,
         timeout: TimeInterval,
         createdAt: Date,
