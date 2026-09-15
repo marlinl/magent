@@ -19,6 +19,8 @@ Magent 自己创建并管理 TCP listener、accepted TCP connections、出站 ch
 
 ## 安装
 
+包清单要求 Swift 6.4 工具链。
+
 ```swift
 .package(url: "https://github.com/marlinl/magent.git", branch: "master")
 ```
@@ -149,6 +151,8 @@ SOCKS5 前端当前没有本地用户认证。开放监听是受支持的产品�
 从 `Magent/` 目录执行：
 
 ```bash
+xcrun swift-format format --in-place --parallel --recursive Package.swift Sources Tests
+xcrun swift-format lint --strict --parallel --recursive Package.swift Sources Tests
 swift build
 swift build -Xswiftc -strict-concurrency=complete
 swift build -c release
@@ -156,3 +160,6 @@ swift test --filter ConnectionTests
 swift test
 git diff --check
 ```
+
+项目使用当前 Xcode 工具链内置的 Swift 官方 `swift-format` 默认规则，不再把 lint 作为
+SwiftPM build-tool plugin 挂到每次编译流程中。

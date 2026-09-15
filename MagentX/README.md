@@ -98,3 +98,17 @@ xcodebuild -project MagentX/MagentX.xcodeproj -scheme MagentX \
 xcodebuild -project MagentX/MagentX.xcodeproj -scheme MagentX \
   -destination 'platform=macOS' test
 ```
+
+## Format
+
+Format every Swift source file in the app and test targets, then run strict lint:
+
+```bash
+./script/swift_format.sh
+```
+
+Check formatting without changing files:
+
+```bash
+./script/swift_format.sh --check
+```
