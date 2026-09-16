@@ -6,14 +6,18 @@
 //  Responsibility: Displays global app settings.
 //
 
+import FactoryKit
 import Foundation
+import OSLog
 import SwiftUI
 
 /// 应用设置页面，展示并保存常规设置、本地代理监听和规则订阅配置。
 struct AppSettingsView: View {
+  @Injected(\.launchAtLoginService) private var launchAtLoginService
   @Binding var toolbarButtons: [ContentToolbarButton]
   @Binding var isMenuBarInserted: Bool
   @State private var generalSettings = GeneralSettings.load()
+  @State private var launchAtLoginError: String?
 
   private static let portFormatter: NumberFormatter = {
     let formatter = NumberFormatter()
@@ -34,7 +38,24 @@ struct AppSettingsView: View {
   var body: some View {
     Form {
       Section("常规") {
-        Toggle("开机启动", isOn: $generalSettings.launchAtLogin)
+        Toggle(
+          "开机启动",
+          isOn: Binding(
+            get: { generalSettings.launchAtLogin },
+            set: { isEnabled in
+              do {
+                try launchAtLoginService.setEnabled(isEnabled)
+                generalSettings.launchAtLogin = isEnabled
+                generalSettings.save()
+              } catch {
+                AppLog.app.error(
+                  "Failed to update launch at login: \(error.localizedDescription, privacy: .public)"
+                )
+                launchAtLoginError = error.localizedDescription
+              }
+            }
+          )
+        )
         Toggle("启用菜单栏", isOn: $generalSettings.enableMenuBar)
       }
 
@@ -75,10 +96,11 @@ struct AppSettingsView: View {
     .onAppear {
       toolbarButtons = []
       generalSettings = GeneralSettings.load()
+      if generalSettings.launchAtLogin != launchAtLoginService.isEnabled {
+        generalSettings.launchAtLogin = launchAtLoginService.isEnabled
+        generalSettings.save()
+      }
       isMenuBarInserted = generalSettings.enableMenuBar
-    }
-    .onChange(of: generalSettings.launchAtLogin) { _, _ in
-      generalSettings.save()
     }
     .onChange(of: generalSettings.enableMenuBar) { _, isEnabled in
       generalSettings.save()
@@ -104,6 +126,21 @@ struct AppSettingsView: View {
     }
     .onChange(of: generalSettings.pacListenPort) { _, _ in
       generalSettings.save()
+    }
+    .alert(
+      "无法更新开机启动",
+      isPresented: Binding(
+        get: { launchAtLoginError != nil },
+        set: { isPresented in
+          if isPresented == false {
+            launchAtLoginError = nil
+          }
+        }
+      )
+    ) {
+      Button("好", role: .cancel) {}
+    } message: {
+      Text(launchAtLoginError ?? "")
     }
   }
 }

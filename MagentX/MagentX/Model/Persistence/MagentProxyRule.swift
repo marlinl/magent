@@ -62,7 +62,7 @@ final class MagentProxyRule {
   /// - Returns: 匹配值为空或业务唯一键重复时返回对应错误，否则返回 `nil`。
   func validationError(in rules: [MagentProxyRule]) -> MagentXError? {
     guard matchValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
-      return .emptyProxyRuleMatchValue
+      return .invalidParameter(String(localized: "Match value is required"))
     }
 
     let isDuplicate = rules.contains { storedRule in

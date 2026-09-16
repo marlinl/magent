@@ -162,10 +162,12 @@ final class SyncProxyRulesCoordinator {
     let rulesURLValue = GeneralSettings.load().rulesURL
       .trimmingCharacters(in: .whitespacesAndNewlines)
     guard rulesURLValue.isEmpty == false else {
-      throw MagentXError.missingRulesURL
+      throw MagentXError.invalidParameter(String(localized: "Rules URL is required"))
     }
     guard let rulesURL = URL(string: rulesURLValue), rulesURL.scheme != nil else {
-      throw MagentXError.invalidRulesURL(rulesURLValue)
+      throw MagentXError.invalidParameter(
+        String(format: String(localized: "Invalid rules URL: %@"), rulesURLValue)
+      )
     }
 
     let responseData: Data

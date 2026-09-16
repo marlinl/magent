@@ -94,8 +94,12 @@
 "Decoded rules data is not valid UTF-8 text" = "Decoded rules data is not valid UTF-8 text.";
 "Match value is required" = "Match value is required.";
 "Decision must be direct or proxy" = "Decision must be direct or proxy.";
+"Proxy rule match type is invalid: %@" = "Proxy rule match type is invalid: %@.";
+"No available proxy rule identifier" = "No available proxy rule identifier.";
 "Address is required" = "Address is required.";
 "Address must be a hostname, IPv4 address, or IPv6 address" = "Address must be a hostname, IPv4 address, or IPv6 address.";
 "Port must be an integer from 1 to 65535" = "Port must be an integer from 1 to 65535.";
+"Proxy node type is invalid: %@" = "Proxy node type is invalid: %@.";
+"Proxy cipher is invalid: %@" = "Proxy cipher is invalid: %@.";
 "Password is required" = "Password is required.";
 "Timeout must be a positive integer" = "Timeout must be a positive integer.";

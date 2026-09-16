@@ -21,7 +21,7 @@ struct PersistenceSchemaTests {
     let modelContext = ModelContext(container)
     let node = MagentProxyNode(
       id: UUID(),
-      name: nil,
+      name: "127.0.0.1:8388",
       type: ProxyNodeType.shadowsocks.rawValue,
       address: "127.0.0.1",
       port: 8388,

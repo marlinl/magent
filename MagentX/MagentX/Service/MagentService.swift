@@ -40,10 +40,12 @@ actor MagentService {
   func start(address: String, port: Int) async throws {
     let normalizedAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
     guard normalizedAddress.isEmpty == false else {
-      throw MagentXError.invalidListenAddress(address)
+      throw MagentXError.invalidParameter(String(localized: "Listen address is required"))
     }
     guard (1...65_535).contains(port) else {
-      throw MagentXError.invalidListenPort(port)
+      throw MagentXError.invalidParameter(
+        String(format: String(localized: "Listen port is invalid: %d"), port)
+      )
     }
     let placeholderNode = try ProxyNode(
       id: UUID(),
@@ -77,7 +79,9 @@ actor MagentService {
         GeneralSettings.load().proxyThreadNumber
       }
       guard threadNumber > 0 else {
-        throw MagentXError.invalidProxyThreadNumber(threadNumber)
+        throw MagentXError.invalidParameter(
+          String(format: String(localized: "Proxy thread number is invalid: %d"), threadNumber)
+        )
       }
 
       let magent = Magent(threadNumber: threadNumber)

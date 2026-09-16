@@ -117,6 +117,15 @@ extension Container {
     .cached
   }
 
+  /// 提供进程内唯一的登录启动服务，统一维护主应用的 Service Management 注册状态。
+  @MainActor
+  var launchAtLoginService: Factory<LaunchAtLoginService> {
+    self {
+      LaunchAtLoginService()
+    }
+    .cached
+  }
+
   /// 提供进程内唯一的系统网络变化监听器，由应用生命周期统一启动和停止。
   @MainActor
   var systemNetworkChangeListsner: Factory<SystemNetworkChangeListsner> {

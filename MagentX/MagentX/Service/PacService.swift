@@ -111,7 +111,7 @@ actor PacService {
     let address = generalSettings.pacListenAddress
       .trimmingCharacters(in: .whitespacesAndNewlines)
     guard address.isEmpty == false else {
-      let error = MagentXError.invalidListenAddress(generalSettings.pacListenAddress)
+      let error = MagentXError.invalidParameter(String(localized: "Listen address is required"))
       AppLog.proxy.error(
         "Failed to start PAC HTTP service: \(error.localizedDescription, privacy: .public)"
       )
@@ -119,7 +119,9 @@ actor PacService {
     }
     let port = generalSettings.pacListenPort
     guard (1...65_535).contains(port) else {
-      let error = MagentXError.invalidListenPort(port)
+      let error = MagentXError.invalidParameter(
+        String(format: String(localized: "Listen port is invalid: %d"), port)
+      )
       AppLog.proxy.error(
         "Failed to start PAC HTTP service: \(error.localizedDescription, privacy: .public)"
       )

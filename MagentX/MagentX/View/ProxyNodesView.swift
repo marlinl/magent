@@ -17,7 +17,7 @@ struct ProxyNodesView: View {
   @Binding var toolbarButtons: [ContentToolbarButton]
   @State private var pageAt = 1
   @State private var selectedNodeID: UUID?
-  @State private var editingNode: MagentProxyNode?
+  @State private var proxyNodeViewModel: ProxyNodeViewModel?
 
   private static let pageSize = 100
 
@@ -26,38 +26,32 @@ struct ProxyNodesView: View {
       pageAt: $pageAt,
       pageSize: Self.pageSize,
       selectedNodeID: $selectedNodeID,
-      editingNode: $editingNode
+      proxyNodeViewModel: $proxyNodeViewModel
     )
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .onAppear {
       toolbarButtons = [
         ContentToolbarButton(title: "添加代理节点", systemImage: "plus") {
-          let existingNodeCount =
-            (try? modelContext.fetchCount(
-              FetchDescriptor<MagentProxyNode>()
-            )) ?? 0
-          let now = Date.now
-          let node = MagentProxyNode(
-            id: MagentProxyNode.makeUUIDVersion7(at: now),
-            name: nil,
-            type: ProxyNodeType.shadowsocks.rawValue,
-            address: "",
-            port: 8388,
-            cipher: ProxyCipher.chacha20IetfPoly1305.rawValue,
-            password: "",
-            timeout: 30,
-            createdAt: now,
-            updatedAt: now
+          proxyNodeViewModel = ProxyNodeViewModel(
+            modelContainer: modelContext.container
           )
-          modelContext.insert(node)
-          pageAt = existingNodeCount / Self.pageSize + 1
-          selectedNodeID = node.id
-          editingNode = node
         }
       ]
     }
-    .sheet(item: $editingNode) { node in
-      ProxyNodeFormView(node: node)
+    .sheet(item: $proxyNodeViewModel) { viewModel in
+      ProxyNodeFormView(
+        proxyNodeViewModel: viewModel,
+        onSaved: { nodeID in
+          selectedNodeID = nodeID
+          if viewModel.isNew,
+            let storedNodeCount = try? modelContext.fetchCount(
+              FetchDescriptor<MagentProxyNode>()
+            )
+          {
+            pageAt = max(1, (storedNodeCount - 1) / Self.pageSize + 1)
+          }
+        }
+      )
     }
   }
 
@@ -67,7 +61,8 @@ struct ProxyNodesView: View {
     @Query private var nodes: [MagentProxyNode]
     @Binding private var pageAt: Int
     @Binding private var selectedNodeID: UUID?
-    @Binding private var editingNode: MagentProxyNode?
+    @Binding private var proxyNodeViewModel: ProxyNodeViewModel?
+    @State private var editError: String?
 
     private let pageSize: Int
 
@@ -76,7 +71,7 @@ struct ProxyNodesView: View {
       pageAt: Binding<Int>,
       pageSize: Int,
       selectedNodeID: Binding<UUID?>,
-      editingNode: Binding<MagentProxyNode?>
+      proxyNodeViewModel: Binding<ProxyNodeViewModel?>
     ) {
       precondition(pageAt.wrappedValue >= 1, "pageAt must start at 1")
       precondition(pageSize > 0, "pageSize must be greater than 0")
@@ -89,7 +84,7 @@ struct ProxyNodesView: View {
       _nodes = Query(descriptor)
       _pageAt = pageAt
       _selectedNodeID = selectedNodeID
-      _editingNode = editingNode
+      _proxyNodeViewModel = proxyNodeViewModel
       self.pageSize = pageSize
     }
 
@@ -105,11 +100,7 @@ struct ProxyNodesView: View {
           Table(Array(nodes.prefix(pageSize)), selection: $selectedNodeID) {
             TableColumn("名称") { node in
               Label(
-                node.name.flatMap { name in
-                  name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? nil
-                    : name
-                } ?? node.address,
+                node.name,
                 systemImage: "server.rack"
               )
               .lineLimit(1)
@@ -128,18 +119,24 @@ struct ProxyNodesView: View {
             .width(min: 100, ideal: 140)
 
             TableColumn("操作") { node in
-              ControlGroup {
+              Menu {
                 Button {
-                  editingNode = node
+                  do {
+                    proxyNodeViewModel = try ProxyNodeViewModel(
+                      modelContainer: modelContext.container,
+                      nodeID: node.id
+                    )
+                    editError = nil
+                  } catch {
+                    editError = error.localizedDescription
+                  }
                 } label: {
                   Label("修改节点", systemImage: "pencil")
-                    .labelStyle(.iconOnly)
                 }
-                .help("修改节点")
 
                 Button(role: .destructive) {
-                  if editingNode?.id == node.id {
-                    editingNode = nil
+                  if proxyNodeViewModel?.id == node.id {
+                    proxyNodeViewModel = nil
                   }
                   if selectedNodeID == node.id {
                     selectedNodeID = nil
@@ -147,11 +144,12 @@ struct ProxyNodesView: View {
                   modelContext.delete(node)
                 } label: {
                   Label("删除节点", systemImage: "trash")
-                    .labelStyle(.iconOnly)
                 }
-                .help("删除节点")
+              } label: {
+                Label("节点操作", systemImage: "ellipsis.circle")
+                  .labelStyle(.iconOnly)
               }
-              .controlSize(.small)
+              .help("节点操作")
             }
             .width(min: 100, ideal: 140)
           }
@@ -182,13 +180,32 @@ struct ProxyNodesView: View {
           .padding(.vertical, 6)
         }
       }
+      .alert(
+        "读取代理节点失败",
+        isPresented: Binding(
+          get: { editError != nil },
+          set: { isPresented in
+            if isPresented == false {
+              editError = nil
+            }
+          }
+        )
+      ) {
+        Button("好", role: .cancel) {
+          editError = nil
+        }
+      } message: {
+        Text(editError ?? "")
+      }
     }
   }
 
-  /// 直接编辑 SwiftData 代理节点的原生表单页面。
+  /// 直接编辑独立 SwiftData 上下文中的代理节点，并内化保存与取消交互。
   private struct ProxyNodeFormView: View {
     @Environment(\.dismiss) private var dismiss
-    @Bindable var node: MagentProxyNode
+    let proxyNodeViewModel: ProxyNodeViewModel
+    let onSaved: (UUID) -> Void
+    @State private var saveError: String?
 
     private static let portRange = 1...65_535
     private static let timeoutFormatter: NumberFormatter = {
@@ -200,30 +217,22 @@ struct ProxyNodesView: View {
     }()
 
     var body: some View {
+      @Bindable var node = proxyNodeViewModel.node
       let normalizedAddress = node.address.trimmingCharacters(in: .whitespacesAndNewlines)
       let addressError: MagentXError? =
         if normalizedAddress.isEmpty {
-          .emptyAddress
+          .invalidParameter(String(localized: "Address is required"))
         } else if MagentProxyNode.isValidAddress(node.address) {
           nil
         } else {
-          .invalidAddress
+          .invalidParameter(
+            String(localized: "Address must be a hostname, IPv4 address, or IPv6 address")
+          )
         }
 
       Form {
         Section {
-          TextField(
-            "名称（可选）",
-            text: Binding(
-              get: { node.name ?? "" },
-              set: { newValue in
-                node.name =
-                  newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                  ? node.address
-                  : newValue
-              }
-            )
-          )
+          TextField("名称（可选）", text: $node.name)
 
           Picker("类型", selection: $node.type) {
             ForEach(ProxyNodeType.allCases, id: \.rawValue) { type in
@@ -262,49 +271,57 @@ struct ProxyNodesView: View {
       }
       .formStyle(.grouped)
       .toolbar {
-        ToolbarItem(placement: .confirmationAction) {
-          Button("完成") {
+        ToolbarItem(placement: .cancellationAction) {
+          Button("取消", role: .cancel) {
+            proxyNodeViewModel.rollback()
             dismiss()
           }
+          .keyboardShortcut(.cancelAction)
+        }
+
+        ToolbarItem(placement: .confirmationAction) {
+          Button("保存") {
+            do {
+              try proxyNodeViewModel.save()
+              saveError = nil
+              onSaved(proxyNodeViewModel.id)
+              dismiss()
+            } catch {
+              saveError = error.localizedDescription
+            }
+          }
+          .keyboardShortcut(.defaultAction)
           .disabled(addressError != nil)
         }
-      }
-      .interactiveDismissDisabled(addressError != nil)
-      .onAppear {
-        if node.name?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-          node.name = node.address
-        }
-      }
-      .onChange(of: node.name) { _, _ in
-        node.updatedAt = .now
-      }
-      .onChange(of: node.type) { _, _ in
-        node.updatedAt = .now
-      }
-      .onChange(of: node.address) { oldValue, newValue in
-        if node.name?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
-          || node.name == oldValue
-        {
-          node.name = newValue
-        }
-        node.updatedAt = .now
       }
       .onChange(of: node.port) { _, newValue in
         node.port = min(
           max(newValue, Self.portRange.lowerBound),
           Self.portRange.upperBound
         )
-        node.updatedAt = .now
-      }
-      .onChange(of: node.cipher) { _, _ in
-        node.updatedAt = .now
-      }
-      .onChange(of: node.password) { _, _ in
-        node.updatedAt = .now
       }
       .onChange(of: node.timeout) { _, newValue in
         node.timeout = max(1, newValue)
-        node.updatedAt = .now
+      }
+      .alert(
+        "保存代理节点失败",
+        isPresented: Binding(
+          get: { saveError != nil },
+          set: { isPresented in
+            if isPresented == false {
+              saveError = nil
+            }
+          }
+        )
+      ) {
+        Button("好", role: .cancel) {
+          saveError = nil
+        }
+      } message: {
+        Text(saveError ?? "")
+      }
+      .onDisappear {
+        proxyNodeViewModel.rollback()
       }
     }
   }

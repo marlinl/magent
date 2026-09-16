@@ -31,7 +31,7 @@ struct MagentServiceTests {
       try await service.start(address: " ", port: 1086)
       Issue.record("Expected an invalid listen address error")
     } catch let error as MagentXError {
-      #expect(error == .invalidListenAddress(" "))
+      #expect(error == .invalidParameter(String(localized: "Listen address is required")))
     } catch {
       Issue.record("Unexpected error: \(error)")
     }

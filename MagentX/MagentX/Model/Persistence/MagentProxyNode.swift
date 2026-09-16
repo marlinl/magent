@@ -15,7 +15,7 @@ import SwiftData
 final class MagentProxyNode {
   @Attribute(.unique)
   var id: UUID
-  var name: String?
+  var name: String = ""
   var type: String
   var address: String
   var port: Int
@@ -29,7 +29,7 @@ final class MagentProxyNode {
   ///
   /// - Parameters:
   ///   - id: 节点唯一业务主键，默认生成 UUIDv7。
-  ///   - name: 可选的节点名称。
+  ///   - name: 节点名称；表单保存时会为留空的名称生成地址与端口组合。
   ///   - type: 与 `magent_proxy_nodes.type` 对应的节点类型字符串。
   ///   - address: 代理服务器主机名或 IP 地址。
   ///   - port: 代理服务器端口。
@@ -40,7 +40,7 @@ final class MagentProxyNode {
   ///   - updatedAt: 最后更新时间。
   init(
     id: UUID = MagentProxyNode.makeUUIDVersion7(),
-    name: String?,
+    name: String,
     type: String,
     address: String,
     port: Int,

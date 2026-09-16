@@ -20,7 +20,8 @@ struct ProxyRulesView: View {
   @Binding var toolbarButtons: [ContentToolbarButton]
   @State private var searchText = ""
   @State private var pageAt = 1
-  @State private var editingRule: MagentProxyRule?
+  @State private var proxyRuleViewModel: ProxyRuleViewModel?
+  @State private var formError: String?
 
   private static let pageSize = 100
 
@@ -31,7 +32,7 @@ struct ProxyRulesView: View {
       pageAt: $pageAt,
       pageSize: Self.pageSize,
       isRefreshing: syncProxyRulesCoordinator.state == .running,
-      editingRule: $editingRule
+      proxyRuleViewModel: $proxyRuleViewModel
     )
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .searchable(
@@ -45,8 +46,37 @@ struct ProxyRulesView: View {
       placement: .toolbar,
       prompt: "搜索规则"
     )
-    .sheet(item: $editingRule) { rule in
-      ProxyRuleFormView(rule: rule)
+    .sheet(item: $proxyRuleViewModel) { viewModel in
+      ProxyRuleFormView(
+        proxyRuleViewModel: viewModel,
+        onSaved: { _ in
+          searchText = ""
+          if viewModel.isNew,
+            let storedRuleCount = try? modelContext.fetchCount(
+              FetchDescriptor<MagentProxyRule>()
+            )
+          {
+            pageAt = max(1, (storedRuleCount - 1) / Self.pageSize + 1)
+          }
+        }
+      )
+    }
+    .alert(
+      "打开规则表单失败",
+      isPresented: Binding(
+        get: { formError != nil },
+        set: { isPresented in
+          if isPresented == false {
+            formError = nil
+          }
+        }
+      )
+    ) {
+      Button("好", role: .cancel) {
+        formError = nil
+      }
+    } message: {
+      Text(formError ?? "")
     }
     .alert(
       "规则同步失败",
@@ -83,47 +113,14 @@ struct ProxyRulesView: View {
       } else {
         toolbarButtons = [
           ContentToolbarButton(title: "增加规则", systemImage: "plus") {
-            var unfinishedRuleDescriptor = FetchDescriptor<MagentProxyRule>(
-              predicate: #Predicate<MagentProxyRule> { rule in
-                rule.matchValue == ""
-              }
-            )
-            unfinishedRuleDescriptor.fetchLimit = 1
-            if let unfinishedRule = try? modelContext.fetch(unfinishedRuleDescriptor).first {
-              editingRule = unfinishedRule
-              return
+            do {
+              proxyRuleViewModel = try ProxyRuleViewModel(
+                modelContainer: modelContext.container
+              )
+              formError = nil
+            } catch {
+              formError = error.localizedDescription
             }
-
-            var lastRuleDescriptor = FetchDescriptor<MagentProxyRule>(
-              sortBy: [SortDescriptor(\.id, order: .reverse)]
-            )
-            lastRuleDescriptor.fetchLimit = 1
-            guard let storedRules = try? modelContext.fetch(lastRuleDescriptor),
-              storedRules.first?.id != Int.max
-            else {
-              return
-            }
-
-            let existingRuleCount =
-              (try? modelContext.fetchCount(
-                FetchDescriptor<MagentProxyRule>()
-              )) ?? 0
-            let nextID = storedRules.first.map { $0.id + 1 } ?? 0
-            let now = Date.now
-            let rule = MagentProxyRule(
-              id: nextID,
-              matchType: MatchType.domainSuffix.rawValue,
-              matchValue: "",
-              decision: "proxy",
-              order: 0,
-              source: "user",
-              createdAt: now,
-              updatedAt: now
-            )
-            modelContext.insert(rule)
-            searchText = ""
-            pageAt = existingRuleCount / Self.pageSize + 1
-            editingRule = rule
           },
           ContentToolbarButton(title: "同步规则", systemImage: "arrow.clockwise") {
             syncProxyRulesCoordinator.sync()
@@ -138,7 +135,8 @@ struct ProxyRulesView: View {
     @Environment(\.modelContext) private var modelContext
     @Query private var rules: [MagentProxyRule]
     @Binding private var pageAt: Int
-    @Binding private var editingRule: MagentProxyRule?
+    @Binding private var proxyRuleViewModel: ProxyRuleViewModel?
+    @State private var editError: String?
 
     private let searchText: String
     private let pageSize: Int
@@ -150,7 +148,7 @@ struct ProxyRulesView: View {
       pageAt: Binding<Int>,
       pageSize: Int,
       isRefreshing: Bool,
-      editingRule: Binding<MagentProxyRule?>
+      proxyRuleViewModel: Binding<ProxyRuleViewModel?>
     ) {
       precondition(pageAt.wrappedValue >= 1, "pageAt must start at 1")
       precondition(pageSize > 0, "pageSize must be greater than 0")
@@ -172,7 +170,7 @@ struct ProxyRulesView: View {
       descriptor.fetchOffset = (pageAt.wrappedValue - 1) * pageSize
       _rules = Query(descriptor)
       _pageAt = pageAt
-      _editingRule = editingRule
+      _proxyRuleViewModel = proxyRuleViewModel
       self.searchText = searchText
       self.pageSize = pageSize
       self.isRefreshing = isRefreshing
@@ -227,27 +225,34 @@ struct ProxyRulesView: View {
             .width(min: 44, ideal: 64, max: 84)
 
             TableColumn("操作") { rule in
-              ControlGroup {
+              Menu {
                 Button {
-                  editingRule = rule
+                  do {
+                    proxyRuleViewModel = try ProxyRuleViewModel(
+                      modelContainer: modelContext.container,
+                      ruleID: rule.id
+                    )
+                    editError = nil
+                  } catch {
+                    editError = error.localizedDescription
+                  }
                 } label: {
                   Label("编辑规则", systemImage: "pencil")
-                    .labelStyle(.iconOnly)
                 }
-                .help("编辑规则")
 
                 Button(role: .destructive) {
-                  if editingRule?.id == rule.id {
-                    editingRule = nil
+                  if proxyRuleViewModel?.id == rule.id {
+                    proxyRuleViewModel = nil
                   }
                   modelContext.delete(rule)
                 } label: {
                   Label("删除规则", systemImage: "trash")
-                    .labelStyle(.iconOnly)
                 }
-                .help("删除规则")
+              } label: {
+                Label("规则操作", systemImage: "ellipsis.circle")
+                  .labelStyle(.iconOnly)
               }
-              .controlSize(.small)
+              .help("规则操作")
             }
             .width(min: 72, ideal: 88, max: 96)
           }
@@ -278,17 +283,41 @@ struct ProxyRulesView: View {
           .padding(.vertical, 6)
         }
       }
+      .alert(
+        "读取代理规则失败",
+        isPresented: Binding(
+          get: { editError != nil },
+          set: { isPresented in
+            if isPresented == false {
+              editError = nil
+            }
+          }
+        )
+      ) {
+        Button("好", role: .cancel) {
+          editError = nil
+        }
+      } message: {
+        Text(editError ?? "")
+      }
     }
   }
 
-  /// 直接编辑 SwiftData 代理规则的原生表单页面。
+  /// 直接编辑独立 SwiftData 上下文中的代理规则，并内化保存与取消交互。
   private struct ProxyRuleFormView: View {
     @Environment(\.dismiss) private var dismiss
-    @Query private var rules: [MagentProxyRule]
-    @Bindable var rule: MagentProxyRule
+    let proxyRuleViewModel: ProxyRuleViewModel
+    let onSaved: (Int) -> Void
+    @State private var saveError: String?
 
     var body: some View {
-      let formError = rule.validationError(in: rules)
+      @Bindable var rule = proxyRuleViewModel.rule
+      let matchValueError: MagentXError? =
+        if rule.matchValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          .invalidParameter(String(localized: "Match value is required"))
+        } else {
+          nil
+        }
 
       Form {
         Section {
@@ -307,10 +336,13 @@ struct ProxyRulesView: View {
           .pickerStyle(.menu)
 
           TextField("匹配值", text: $rule.matchValue)
-          if let formError {
-            Label(formError.localizedDescription, systemImage: "exclamationmark.triangle.fill")
-              .font(.caption)
-              .foregroundStyle(.red)
+          if let matchValueError {
+            Label(
+              matchValueError.localizedDescription,
+              systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.red)
           }
         } header: {
           Text("规则配置")
@@ -319,25 +351,48 @@ struct ProxyRulesView: View {
       }
       .formStyle(.grouped)
       .toolbar {
-        ToolbarItem(placement: .confirmationAction) {
-          Button("完成") {
+        ToolbarItem(placement: .cancellationAction) {
+          Button("取消", role: .cancel) {
+            proxyRuleViewModel.rollback()
             dismiss()
           }
-          .disabled(formError != nil)
+          .keyboardShortcut(.cancelAction)
+        }
+
+        ToolbarItem(placement: .confirmationAction) {
+          Button("保存") {
+            do {
+              try proxyRuleViewModel.save()
+              saveError = nil
+              onSaved(proxyRuleViewModel.id)
+              dismiss()
+            } catch {
+              saveError = error.localizedDescription
+            }
+          }
+          .keyboardShortcut(.defaultAction)
+          .disabled(matchValueError != nil)
         }
       }
-      .interactiveDismissDisabled(formError != nil)
-      .onChange(of: rule.matchType) { _, _ in
-        rule.source = "user"
-        rule.updatedAt = .now
+      .alert(
+        "保存代理规则失败",
+        isPresented: Binding(
+          get: { saveError != nil },
+          set: { isPresented in
+            if isPresented == false {
+              saveError = nil
+            }
+          }
+        )
+      ) {
+        Button("好", role: .cancel) {
+          saveError = nil
+        }
+      } message: {
+        Text(saveError ?? "")
       }
-      .onChange(of: rule.decision) { _, _ in
-        rule.source = "user"
-        rule.updatedAt = .now
-      }
-      .onChange(of: rule.matchValue) { _, _ in
-        rule.source = "user"
-        rule.updatedAt = .now
+      .onDisappear {
+        proxyRuleViewModel.rollback()
       }
     }
   }

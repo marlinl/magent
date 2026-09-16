@@ -6,6 +6,7 @@
 //  Responsibility: Defines the macOS navigation shell and routes sections to page views.
 //
 
+import AppKit
 import SwiftData
 import SwiftUI
 
@@ -133,6 +134,13 @@ struct ContentView: View {
     }
     .onChange(of: currentSection) { _, _ in
       toolbarButtons = []
+    }
+    .onAppear {
+      NSApplication.shared.setActivationPolicy(.regular)
+      NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+    .onDisappear {
+      NSApplication.shared.setActivationPolicy(.accessory)
     }
   }
 

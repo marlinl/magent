@@ -415,10 +415,12 @@ private struct SystemNetworkProxyEndpoint {
   init(address: String, port: Int) throws {
     let normalizedAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
     guard normalizedAddress.isEmpty == false else {
-      throw MagentXError.invalidListenAddress(address)
+      throw MagentXError.invalidParameter(String(localized: "Listen address is required"))
     }
     guard (1...65535).contains(port) else {
-      throw MagentXError.invalidListenPort(port)
+      throw MagentXError.invalidParameter(
+        String(format: String(localized: "Listen port is invalid: %d"), port)
+      )
     }
 
     self.address = normalizedAddress
