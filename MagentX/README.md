@@ -37,7 +37,7 @@ MagentX/MagentX/
 │   ├── ProxyNodesView.swift
 │   ├── ProxyPolicyView.swift
 │   ├── ProxyRulesView.swift
-│   └── AppSettingsView.swift
+│   └── SettingsView.swift
 └── Assets.xcassets/
 ```
 

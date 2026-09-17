@@ -1,5 +1,5 @@
 //
-//  AppSettingsView.swift
+//  SettingsView.swift
 //  MagentX
 //
 //  Author: MarlinL
@@ -12,7 +12,7 @@ import OSLog
 import SwiftUI
 
 /// 应用设置页面，展示并保存常规设置、本地代理监听和规则订阅配置。
-struct AppSettingsView: View {
+struct SettingsView: View {
   @Injected(\.launchAtLoginService) private var launchAtLoginService
   @Binding var toolbarButtons: [ContentToolbarButton]
   @Binding var isMenuBarInserted: Bool

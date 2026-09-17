@@ -173,7 +173,7 @@ struct ContentView: View {
     case .proxyPolicy:
       ProxyPolicyView(toolbarButtons: $toolbarButtons)
     case .settings:
-      AppSettingsView(
+      SettingsView(
         toolbarButtons: $toolbarButtons,
         isMenuBarInserted: $isMenuBarInserted
       )
