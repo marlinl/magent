@@ -15,17 +15,15 @@ import SwiftUI
 struct ProxyNodesView: View {
   @Environment(\.modelContext) private var modelContext
   @Binding var toolbarButtons: [ContentToolbarButton]
-  @State private var pageAt = 1
-  @State private var selectedNodeID: UUID?
+  @State private var selectedNodeIDs: Set<UUID> = []
   @State private var proxyNodeViewModel: ProxyNodeViewModel?
 
-  private static let pageSize = 100
+  private static let maximumCachedModelCount = 300
 
   var body: some View {
-    ProxyNodePageView(
-      pageAt: $pageAt,
-      pageSize: Self.pageSize,
-      selectedNodeID: $selectedNodeID,
+    ProxyNodeTableView(
+      maximumCachedModelCount: Self.maximumCachedModelCount,
+      selectedNodeIDs: $selectedNodeIDs,
       proxyNodeViewModel: $proxyNodeViewModel
     )
     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -42,50 +40,35 @@ struct ProxyNodesView: View {
       ProxyNodeFormView(
         proxyNodeViewModel: viewModel,
         onSaved: { nodeID in
-          selectedNodeID = nodeID
-          if viewModel.isNew,
-            let storedNodeCount = try? modelContext.fetchCount(
-              FetchDescriptor<MagentProxyNode>()
-            )
-          {
-            pageAt = max(1, (storedNodeCount - 1) / Self.pageSize + 1)
-          }
+          selectedNodeIDs.insert(nodeID)
         }
       )
     }
   }
 
-  /// 使用当前页对应的 `FetchDescriptor` 观察并展示最多 100 个代理节点。
-  private struct ProxyNodePageView: View {
+  /// 观察有数量上限的代理节点模型，并由系统表格管理可见行及缓冲区。
+  private struct ProxyNodeTableView: View {
     @Environment(\.modelContext) private var modelContext
     @Query private var nodes: [MagentProxyNode]
-    @Binding private var pageAt: Int
-    @Binding private var selectedNodeID: UUID?
+    @Binding private var selectedNodeIDs: Set<UUID>
     @Binding private var proxyNodeViewModel: ProxyNodeViewModel?
     @State private var editError: String?
 
-    private let pageSize: Int
-
-    /// 为指定页创建按节点 id 正序排列的 SwiftData 查询。
+    /// 创建按节点 id 正序排列且数量有上限的 SwiftData 查询。
     init(
-      pageAt: Binding<Int>,
-      pageSize: Int,
-      selectedNodeID: Binding<UUID?>,
+      maximumCachedModelCount: Int,
+      selectedNodeIDs: Binding<Set<UUID>>,
       proxyNodeViewModel: Binding<ProxyNodeViewModel?>
     ) {
-      precondition(pageAt.wrappedValue >= 1, "pageAt must start at 1")
-      precondition(pageSize > 0, "pageSize must be greater than 0")
+      precondition(maximumCachedModelCount > 0, "maximumCachedModelCount must be positive")
 
       var descriptor = FetchDescriptor<MagentProxyNode>(
         sortBy: [SortDescriptor(\.id, order: .forward)]
       )
-      descriptor.fetchLimit = pageSize + 1
-      descriptor.fetchOffset = (pageAt.wrappedValue - 1) * pageSize
+      descriptor.fetchLimit = maximumCachedModelCount
       _nodes = Query(descriptor)
-      _pageAt = pageAt
-      _selectedNodeID = selectedNodeID
+      _selectedNodeIDs = selectedNodeIDs
       _proxyNodeViewModel = proxyNodeViewModel
-      self.pageSize = pageSize
     }
 
     var body: some View {
@@ -94,10 +77,10 @@ struct ProxyNodesView: View {
           ContentUnavailableView(
             "暂无代理节点",
             systemImage: "server.rack",
-            description: Text(pageAt == 1 ? "添加代理节点后会显示在这里" : "当前页没有节点")
+            description: Text("添加代理节点后会显示在这里")
           )
         } else {
-          Table(Array(nodes.prefix(pageSize)), selection: $selectedNodeID) {
+          Table(nodes, selection: $selectedNodeIDs) {
             TableColumn("名称") { node in
               Label(
                 node.name,
@@ -138,9 +121,7 @@ struct ProxyNodesView: View {
                   if proxyNodeViewModel?.id == node.id {
                     proxyNodeViewModel = nil
                   }
-                  if selectedNodeID == node.id {
-                    selectedNodeID = nil
-                  }
+                  selectedNodeIDs.remove(node.id)
                   modelContext.delete(node)
                 } label: {
                   Label("删除节点", systemImage: "trash")
@@ -153,31 +134,6 @@ struct ProxyNodesView: View {
             }
             .width(min: 100, ideal: 140)
           }
-        }
-      }
-      .safeAreaInset(edge: .bottom) {
-        if pageAt > 1 || nodes.count > pageSize {
-          ControlGroup {
-            Button {
-              pageAt -= 1
-            } label: {
-              Label("上一页", systemImage: "chevron.backward")
-                .labelStyle(.iconOnly)
-            }
-            .disabled(pageAt <= 1)
-            .help("上一页")
-
-            Button {
-              pageAt += 1
-            } label: {
-              Label("下一页", systemImage: "chevron.forward")
-                .labelStyle(.iconOnly)
-            }
-            .disabled(nodes.count <= pageSize)
-            .help("下一页")
-          }
-          .controlSize(.small)
-          .padding(.vertical, 6)
         }
       }
       .alert(

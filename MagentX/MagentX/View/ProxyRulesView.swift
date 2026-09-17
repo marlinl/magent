@@ -19,45 +19,30 @@ struct ProxyRulesView: View {
   @InjectedObservable(\.syncProxyRulesCoordinator) private var syncProxyRulesCoordinator
   @Binding var toolbarButtons: [ContentToolbarButton]
   @State private var searchText = ""
-  @State private var pageAt = 1
+  @State private var selectedRuleIDs: Set<Int> = []
   @State private var proxyRuleViewModel: ProxyRuleViewModel?
   @State private var formError: String?
 
-  private static let pageSize = 100
+  private static let maximumCachedModelCount = 1_000
 
   var body: some View {
     let normalizedSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-    ProxyRulePageView(
+    ProxyRuleTableView(
       searchText: normalizedSearchText,
-      pageAt: $pageAt,
-      pageSize: Self.pageSize,
+      maximumCachedModelCount: Self.maximumCachedModelCount,
       isRefreshing: syncProxyRulesCoordinator.state == .running,
+      selectedRuleIDs: $selectedRuleIDs,
       proxyRuleViewModel: $proxyRuleViewModel
     )
+    .id(normalizedSearchText)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .searchable(
-      text: Binding(
-        get: { searchText },
-        set: { newValue in
-          searchText = newValue
-          pageAt = 1
-        }
-      ),
-      placement: .toolbar,
-      prompt: "搜索规则"
-    )
+    .searchable(text: $searchText, placement: .toolbar, prompt: "搜索规则")
     .sheet(item: $proxyRuleViewModel) { viewModel in
       ProxyRuleFormView(
         proxyRuleViewModel: viewModel,
-        onSaved: { _ in
+        onSaved: { ruleID in
+          selectedRuleIDs.insert(ruleID)
           searchText = ""
-          if viewModel.isNew,
-            let storedRuleCount = try? modelContext.fetchCount(
-              FetchDescriptor<MagentProxyRule>()
-            )
-          {
-            pageAt = max(1, (storedRuleCount - 1) / Self.pageSize + 1)
-          }
         }
       )
     }
@@ -130,28 +115,26 @@ struct ProxyRulesView: View {
     }
   }
 
-  /// 使用搜索条件和当前页对应的 `FetchDescriptor` 观察并展示最多 100 条代理规则。
-  private struct ProxyRulePageView: View {
+  /// 观察有数量上限的代理规则模型，并由系统表格管理可见行及缓冲区。
+  private struct ProxyRuleTableView: View {
     @Environment(\.modelContext) private var modelContext
     @Query private var rules: [MagentProxyRule]
-    @Binding private var pageAt: Int
+    @Binding private var selectedRuleIDs: Set<Int>
     @Binding private var proxyRuleViewModel: ProxyRuleViewModel?
     @State private var editError: String?
 
     private let searchText: String
-    private let pageSize: Int
     private let isRefreshing: Bool
 
-    /// 为指定搜索条件和页码创建按规则 id 正序排列的 SwiftData 查询。
+    /// 为指定搜索条件创建按规则 id 正序排列且数量有上限的 SwiftData 查询。
     init(
       searchText: String,
-      pageAt: Binding<Int>,
-      pageSize: Int,
+      maximumCachedModelCount: Int,
       isRefreshing: Bool,
+      selectedRuleIDs: Binding<Set<Int>>,
       proxyRuleViewModel: Binding<ProxyRuleViewModel?>
     ) {
-      precondition(pageAt.wrappedValue >= 1, "pageAt must start at 1")
-      precondition(pageSize > 0, "pageSize must be greater than 0")
+      precondition(maximumCachedModelCount > 0, "maximumCachedModelCount must be positive")
 
       let sortDescriptors = [SortDescriptor(\MagentProxyRule.id, order: .forward)]
       var descriptor: FetchDescriptor<MagentProxyRule>
@@ -166,13 +149,11 @@ struct ProxyRulesView: View {
           sortBy: sortDescriptors
         )
       }
-      descriptor.fetchLimit = pageSize + 1
-      descriptor.fetchOffset = (pageAt.wrappedValue - 1) * pageSize
+      descriptor.fetchLimit = maximumCachedModelCount
       _rules = Query(descriptor)
-      _pageAt = pageAt
+      _selectedRuleIDs = selectedRuleIDs
       _proxyRuleViewModel = proxyRuleViewModel
       self.searchText = searchText
-      self.pageSize = pageSize
       self.isRefreshing = isRefreshing
     }
 
@@ -188,12 +169,12 @@ struct ProxyRulesView: View {
               : "magnifyingglass",
             description: Text(
               searchText.isEmpty
-                ? (pageAt == 1 ? "添加或同步规则后会显示在这里" : "当前页没有规则")
+                ? "添加或同步规则后会显示在这里"
                 : searchText
             )
           )
         } else {
-          Table(Array(rules.prefix(pageSize))) {
+          Table(rules, selection: $selectedRuleIDs) {
             TableColumn("匹配值") { rule in
               Text(rule.matchValue)
                 .lineLimit(1)
@@ -244,6 +225,7 @@ struct ProxyRulesView: View {
                   if proxyRuleViewModel?.id == rule.id {
                     proxyRuleViewModel = nil
                   }
+                  selectedRuleIDs.remove(rule.id)
                   modelContext.delete(rule)
                 } label: {
                   Label("删除规则", systemImage: "trash")
@@ -256,31 +238,6 @@ struct ProxyRulesView: View {
             }
             .width(min: 72, ideal: 88, max: 96)
           }
-        }
-      }
-      .safeAreaInset(edge: .bottom) {
-        if pageAt > 1 || rules.count > pageSize {
-          ControlGroup {
-            Button {
-              pageAt -= 1
-            } label: {
-              Label("上一页", systemImage: "chevron.backward")
-                .labelStyle(.iconOnly)
-            }
-            .disabled(pageAt <= 1)
-            .help("上一页")
-
-            Button {
-              pageAt += 1
-            } label: {
-              Label("下一页", systemImage: "chevron.forward")
-                .labelStyle(.iconOnly)
-            }
-            .disabled(rules.count <= pageSize)
-            .help("下一页")
-          }
-          .controlSize(.small)
-          .padding(.vertical, 6)
         }
       }
       .alert(
