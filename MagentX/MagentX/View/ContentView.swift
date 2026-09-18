@@ -83,9 +83,9 @@ struct ContentToolbarButton: Identifiable {
 
 /// 主窗口布局常量。
 private enum ContentMetrics {
-  static let sidebarWidth: CGFloat = 220
-  static let detailMinimumWidth: CGFloat = 360
-  static let detailIdealWidth: CGFloat = 600
+  static let sidebarWidth: CGFloat = 180
+  static let detailMinimumWidth: CGFloat = 640
+  static let detailIdealWidth: CGFloat = 640
 }
 
 /// MagentX 主窗口导航壳，负责侧边栏选择、页面路由和页面级工具栏。
@@ -179,17 +179,4 @@ struct ContentView: View {
       )
     }
   }
-}
-
-#Preview {
-  ContentView(isMenuBarInserted: .constant(true))
-    .modelContainer(
-      for: [
-        MagentProxyNode.self,
-        MagentProxyRule.self,
-        MagentProxyPolicy.self,
-        MagentProxyPolicyRule.self,
-      ], inMemory: true
-    )
-    .frame(width: 1184, height: 760)
 }

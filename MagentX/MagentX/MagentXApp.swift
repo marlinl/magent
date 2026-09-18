@@ -19,7 +19,6 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
   static var keepsRunningAfterLastWindowClosed = true
 
   @Injected(\.systemNetworkChangeListsner) private var systemNetworkChangeListsner
-  @Injected(\.systemNetworkSettingService) private var systemNetworkSettingService
 
   /// 应用设置中的后台运行偏好。
   static func applyBackgroundPreference(_ isEnabled: Bool) {
@@ -36,7 +35,7 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
     }
     Task { @MainActor in
       do {
-        try await systemNetworkSettingService.applyStoredConfiguration()
+        try await systemNetworkChangeListsner.applyStoredConfiguration()
       } catch {
         AppLog.network.error("Failed to restore stored proxy configuration at launch")
       }
@@ -48,7 +47,7 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
     AppLog.app.info("Application will terminate")
     systemNetworkChangeListsner.stop()
     Task { @MainActor in
-      await systemNetworkSettingService.deactivateRuntimeServices()
+      await systemNetworkChangeListsner.deactivateRuntimeServices()
       sender.reply(toApplicationShouldTerminate: true)
     }
     return .terminateLater

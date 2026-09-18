@@ -27,6 +27,10 @@ struct ProxyNodesView: View {
       proxyNodeViewModel: $proxyNodeViewModel
     )
     .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .padding(.top, 1)
+    .overlay(alignment: .top) {
+      Divider()
+    }
     .onAppear {
       toolbarButtons = [
         ContentToolbarButton(title: "添加代理节点", systemImage: "plus") {
@@ -49,92 +53,90 @@ struct ProxyNodesView: View {
   /// 观察有数量上限的代理节点模型，并由系统表格管理可见行及缓冲区。
   private struct ProxyNodeTableView: View {
     @Environment(\.modelContext) private var modelContext
-    @Query private var nodes: [MagentProxyNode]
     @Binding private var selectedNodeIDs: Set<UUID>
     @Binding private var proxyNodeViewModel: ProxyNodeViewModel?
     @State private var editError: String?
+    private let maximumCachedModelCount: Int
 
-    /// 创建按节点 id 正序排列且数量有上限的 SwiftData 查询。
+    /// 接收节点页面持有的选择和编辑绑定，并将查询条件交给公共表格。
     init(
       maximumCachedModelCount: Int,
       selectedNodeIDs: Binding<Set<UUID>>,
       proxyNodeViewModel: Binding<ProxyNodeViewModel?>
     ) {
-      precondition(maximumCachedModelCount > 0, "maximumCachedModelCount must be positive")
-
-      var descriptor = FetchDescriptor<MagentProxyNode>(
-        sortBy: [SortDescriptor(\.id, order: .forward)]
-      )
-      descriptor.fetchLimit = maximumCachedModelCount
-      _nodes = Query(descriptor)
       _selectedNodeIDs = selectedNodeIDs
       _proxyNodeViewModel = proxyNodeViewModel
+      self.maximumCachedModelCount = maximumCachedModelCount
     }
 
     var body: some View {
-      Group {
-        if nodes.isEmpty {
-          ContentUnavailableView(
-            "暂无代理节点",
-            systemImage: "server.rack",
-            description: Text("添加代理节点后会显示在这里")
+      let descriptor = FetchDescriptor<MagentProxyNode>(
+        sortBy: [SortDescriptor(\.id, order: .forward)]
+      )
+
+      ScrollTableView(
+        selection: $selectedNodeIDs,
+        descriptor: descriptor,
+        maximumCachedModelCount: maximumCachedModelCount,
+      ) {
+        ContentUnavailableView(
+          "暂无代理节点",
+          systemImage: "server.rack",
+          description: Text("添加代理节点后会显示在这里")
+        )
+      } columns: {
+        TableColumn("名称") { node in
+          Label(
+            node.name,
+            systemImage: "server.rack"
           )
-        } else {
-          Table(nodes, selection: $selectedNodeIDs) {
-            TableColumn("名称") { node in
-              Label(
-                node.name,
-                systemImage: "server.rack"
-              )
-              .lineLimit(1)
-            }
-            .width(min: 140, ideal: 220)
-
-            TableColumn("地址") { node in
-              Text(verbatim: "\(node.address):\(node.port)")
-                .lineLimit(1)
-            }
-            .width(min: 160, ideal: 240)
-
-            TableColumn("类型") { node in
-              Text(node.type)
-            }
-            .width(min: 100, ideal: 140)
-
-            TableColumn("操作") { node in
-              Menu {
-                Button {
-                  do {
-                    proxyNodeViewModel = try ProxyNodeViewModel(
-                      modelContainer: modelContext.container,
-                      nodeID: node.id
-                    )
-                    editError = nil
-                  } catch {
-                    editError = error.localizedDescription
-                  }
-                } label: {
-                  Label("修改节点", systemImage: "pencil")
-                }
-
-                Button(role: .destructive) {
-                  if proxyNodeViewModel?.id == node.id {
-                    proxyNodeViewModel = nil
-                  }
-                  selectedNodeIDs.remove(node.id)
-                  modelContext.delete(node)
-                } label: {
-                  Label("删除节点", systemImage: "trash")
-                }
-              } label: {
-                Label("节点操作", systemImage: "ellipsis.circle")
-                  .labelStyle(.iconOnly)
-              }
-              .help("节点操作")
-            }
-            .width(min: 100, ideal: 140)
-          }
+          .lineLimit(1)
         }
+        .width(min: 140, ideal: 220)
+
+        TableColumn("地址") { node in
+          Text(verbatim: "\(node.address):\(node.port)")
+            .lineLimit(1)
+        }
+        .width(min: 160, ideal: 240)
+
+        TableColumn("类型") { node in
+          Text(node.type)
+        }
+        .width(min: 100, ideal: 140)
+
+        TableColumn("操作") { node in
+          Menu {
+            Button {
+              do {
+                proxyNodeViewModel = try ProxyNodeViewModel(
+                  modelContainer: modelContext.container,
+                  nodeID: node.id
+                )
+                editError = nil
+              } catch {
+                editError = error.localizedDescription
+              }
+            } label: {
+              Label("修改节点", systemImage: "pencil")
+            }
+
+            Button(role: .destructive) {
+              if proxyNodeViewModel?.id == node.id {
+                proxyNodeViewModel = nil
+              }
+              selectedNodeIDs.remove(node.id)
+              modelContext.delete(node)
+            } label: {
+              Label("删除节点", systemImage: "trash")
+            }
+          } label: {
+            Label("节点操作", systemImage: "ellipsis.circle")
+              .labelStyle(.iconOnly)
+          }
+          .help("节点操作")
+        }
+        .width(min: 100, ideal: 140)
       }
       .alert(
         "读取代理节点失败",

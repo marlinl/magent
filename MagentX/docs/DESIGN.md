@@ -1,5 +1,79 @@
 # Design
 
+## Main Window Layout Framework
+
+### Required Structure
+
+- `ContentView` is the single owner of the main-window layout and must use one native
+  `NavigationSplitView`.
+- The leading column is the application navigation sidebar. It must use a sidebar-styled `List`
+  and contain navigation items only unless a product design explicitly requires another native
+  sidebar control.
+- The detail column has one consistent vertical hierarchy for every routed page:
+  1. The native window title and toolbar area, containing the sidebar toggle, page search, or
+     page-level common actions.
+  2. The selected detail View, containing the page's actual display and editing interface.
+- The toolbar area is part of the shared window shell even when a page has no search field or
+  page-level action. A detail View must not hide it, replace it, or draw a placeholder toolbar.
+- `ContentView` owns page routing, the selected section, page title and subtitle presentation,
+  toolbar placement, and toolbar background. A detail View must not repeat those shell elements.
+
+The intended hierarchy is:
+
+```text
+ContentView
+└── NavigationSplitView
+    ├── Sidebar List
+    └── Detail column
+        ├── Native window title and toolbar
+        └── Routed detail View
+```
+
+### Toolbar Ownership and Page Contributions
+
+- There is exactly one main-window toolbar. `ContentView` defines it with SwiftUI's native
+  `.toolbar` and `.toolbarBackground` APIs and renders page-level common action items in that
+  shared location.
+- A detail View owns the state and behavior specific to its page. It may contribute:
+  - Search through `.searchable(..., placement: .toolbar, ...)`, with the search text and filtering
+    behavior kept in that detail View.
+  - Page-level common actions through the toolbar contribution interface supplied by
+    `ContentView`, with the action implementation kept in the detail View or its responsible Model,
+    Service, or Coordinator.
+- A modifier such as `.searchable` may be declared by a detail View while the resulting search
+  field is displayed in the shared window toolbar. This is native SwiftUI toolbar composition; it
+  does not make the detail View the owner of a second toolbar.
+- Every View routed by `ContentView` must use this contribution model. Do not let some pages build
+  an in-content toolbar while other pages use the window toolbar.
+- The boundary between the shared toolbar and detail content must remain visible on every page.
+  Prefer the separator supplied by the page's native root component. If a native `Table` or other
+  root component does not expose that separator, add the standard page-boundary treatment directly
+  to the routed detail View:
+
+  ```swift
+  .padding(.top, 1)
+  .overlay(alignment: .top) {
+    Divider()
+  }
+  ```
+
+  Do not customize the separator's color, thickness, or material.
+- Keep toolbar contents page-appropriate. Pages are not required to invent an action solely to
+  fill the toolbar, but they must preserve the same shell and content hierarchy.
+
+### Boundaries
+
+- Do not move page search text, filters, selection, loading state, persistence operations, or
+  business actions into `ContentView` merely because their controls appear in the shared toolbar.
+- Do not place a `VStack`, `HStack`, `GroupBox`, custom background, or custom-styled separator at the
+  top of a detail View to imitate the window toolbar. The documented native `Divider` boundary is
+  the only exception and must not contain toolbar controls.
+- Do not set page-specific navigation titles, window-toolbar backgrounds, sidebar geometry, or
+  window chrome inside a routed detail View.
+- A toolbar inside a sheet or another independently presented scene belongs to that presentation's
+  lifecycle and may provide native cancellation and confirmation actions. It is not a second
+  main-window toolbar.
+
 ## MagentX UI Native Components
 
 ### Use

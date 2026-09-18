@@ -19,6 +19,7 @@ struct ProxyRulesView: View {
   @InjectedObservable(\.syncProxyRulesCoordinator) private var syncProxyRulesCoordinator
   @Binding var toolbarButtons: [ContentToolbarButton]
   @State private var searchText = ""
+  @FocusState private var isSearchFocused: Bool
   @State private var selectedRuleIDs: Set<Int> = []
   @State private var proxyRuleViewModel: ProxyRuleViewModel?
   @State private var formError: String?
@@ -27,16 +28,30 @@ struct ProxyRulesView: View {
 
   var body: some View {
     let normalizedSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-    ProxyRuleTableView(
+    let content = ProxyRuleTableView(
       searchText: normalizedSearchText,
       maximumCachedModelCount: Self.maximumCachedModelCount,
       isRefreshing: syncProxyRulesCoordinator.state == .running,
       selectedRuleIDs: $selectedRuleIDs,
       proxyRuleViewModel: $proxyRuleViewModel
     )
-    .id(normalizedSearchText)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .searchable(text: $searchText, placement: .toolbar, prompt: "搜索规则")
+    .padding(.top, 1)
+    .overlay(alignment: .top) {
+      Divider()
+    }
+
+    Group {
+      content
+        .simultaneousGesture(
+          TapGesture()
+            .onEnded {
+              isSearchFocused = false
+            }
+        )
+        .searchable(text: $searchText, placement: .toolbar, prompt: "搜索规则")
+        .searchFocused($isSearchFocused)
+    }
     .sheet(item: $proxyRuleViewModel) { viewModel in
       ProxyRuleFormView(
         proxyRuleViewModel: viewModel,
@@ -118,15 +133,15 @@ struct ProxyRulesView: View {
   /// 观察有数量上限的代理规则模型，并由系统表格管理可见行及缓冲区。
   private struct ProxyRuleTableView: View {
     @Environment(\.modelContext) private var modelContext
-    @Query private var rules: [MagentProxyRule]
     @Binding private var selectedRuleIDs: Set<Int>
     @Binding private var proxyRuleViewModel: ProxyRuleViewModel?
     @State private var editError: String?
 
     private let searchText: String
+    private let maximumCachedModelCount: Int
     private let isRefreshing: Bool
 
-    /// 为指定搜索条件创建按规则 id 正序排列且数量有上限的 SwiftData 查询。
+    /// 接收规则页面持有的选择和编辑绑定，并将查询条件交给公共表格。
     init(
       searchText: String,
       maximumCachedModelCount: Int,
@@ -134,34 +149,37 @@ struct ProxyRulesView: View {
       selectedRuleIDs: Binding<Set<Int>>,
       proxyRuleViewModel: Binding<ProxyRuleViewModel?>
     ) {
-      precondition(maximumCachedModelCount > 0, "maximumCachedModelCount must be positive")
+      _selectedRuleIDs = selectedRuleIDs
+      _proxyRuleViewModel = proxyRuleViewModel
+      self.searchText = searchText
+      self.maximumCachedModelCount = maximumCachedModelCount
+      self.isRefreshing = isRefreshing
+    }
 
+    var body: some View {
       let sortDescriptors = [SortDescriptor(\MagentProxyRule.id, order: .forward)]
-      var descriptor: FetchDescriptor<MagentProxyRule>
-      if searchText.isEmpty {
-        descriptor = FetchDescriptor<MagentProxyRule>(sortBy: sortDescriptors)
-      } else {
+      let descriptor: FetchDescriptor<MagentProxyRule> = {
+        if searchText.isEmpty {
+          return FetchDescriptor<MagentProxyRule>(sortBy: sortDescriptors)
+        }
+
         let query = searchText
-        descriptor = FetchDescriptor<MagentProxyRule>(
+        return FetchDescriptor<MagentProxyRule>(
           predicate: #Predicate<MagentProxyRule> { rule in
             rule.matchValue.contains(query)
           },
           sortBy: sortDescriptors
         )
-      }
-      descriptor.fetchLimit = maximumCachedModelCount
-      _rules = Query(descriptor)
-      _selectedRuleIDs = selectedRuleIDs
-      _proxyRuleViewModel = proxyRuleViewModel
-      self.searchText = searchText
-      self.isRefreshing = isRefreshing
-    }
+      }()
 
-    var body: some View {
-      Group {
-        if isRefreshing, rules.isEmpty {
+      ScrollTableView(
+        selection: $selectedRuleIDs,
+        descriptor: descriptor,
+        maximumCachedModelCount: maximumCachedModelCount,
+      ) {
+        if isRefreshing {
           ProgressView("正在同步规则")
-        } else if rules.isEmpty {
+        } else {
           ContentUnavailableView(
             searchText.isEmpty ? "暂无规则" : "未找到规则",
             systemImage: searchText.isEmpty
@@ -173,72 +191,70 @@ struct ProxyRulesView: View {
                 : searchText
             )
           )
-        } else {
-          Table(rules, selection: $selectedRuleIDs) {
-            TableColumn("匹配值") { rule in
-              Text(rule.matchValue)
-                .lineLimit(1)
-            }
-            .width(min: 64, ideal: 280)
-
-            TableColumn("类型") { rule in
-              Text(rule.matchType)
-                .lineLimit(1)
-            }
-            .width(min: 44, ideal: 80, max: 110)
-
-            TableColumn("顺序") { rule in
-              Text(rule.order, format: .number)
-                .lineLimit(1)
-            }
-            .width(min: 40, ideal: 56, max: 72)
-
-            TableColumn("来源") { rule in
-              Text(rule.source.isEmpty ? "-" : rule.source)
-                .lineLimit(1)
-            }
-            .width(min: 44, ideal: 76, max: 100)
-
-            TableColumn("规则") { rule in
-              Text(rule.decision.uppercased())
-                .lineLimit(1)
-            }
-            .width(min: 44, ideal: 64, max: 84)
-
-            TableColumn("操作") { rule in
-              Menu {
-                Button {
-                  do {
-                    proxyRuleViewModel = try ProxyRuleViewModel(
-                      modelContainer: modelContext.container,
-                      ruleID: rule.id
-                    )
-                    editError = nil
-                  } catch {
-                    editError = error.localizedDescription
-                  }
-                } label: {
-                  Label("编辑规则", systemImage: "pencil")
-                }
-
-                Button(role: .destructive) {
-                  if proxyRuleViewModel?.id == rule.id {
-                    proxyRuleViewModel = nil
-                  }
-                  selectedRuleIDs.remove(rule.id)
-                  modelContext.delete(rule)
-                } label: {
-                  Label("删除规则", systemImage: "trash")
-                }
-              } label: {
-                Label("规则操作", systemImage: "ellipsis.circle")
-                  .labelStyle(.iconOnly)
-              }
-              .help("规则操作")
-            }
-            .width(min: 72, ideal: 88, max: 96)
-          }
         }
+      } columns: {
+        TableColumn("匹配值") { rule in
+          Text(rule.matchValue)
+            .lineLimit(1)
+        }
+        .width(min: 64, ideal: 280)
+
+        TableColumn("类型") { rule in
+          Text(rule.matchType)
+            .lineLimit(1)
+        }
+        .width(min: 44, ideal: 80, max: 110)
+
+        TableColumn("顺序") { rule in
+          Text(rule.order, format: .number)
+            .lineLimit(1)
+        }
+        .width(min: 40, ideal: 56, max: 72)
+
+        TableColumn("来源") { rule in
+          Text(rule.source.isEmpty ? "-" : rule.source)
+            .lineLimit(1)
+        }
+        .width(min: 44, ideal: 76, max: 100)
+
+        TableColumn("规则") { rule in
+          Text(rule.decision.uppercased())
+            .lineLimit(1)
+        }
+        .width(min: 44, ideal: 64, max: 84)
+
+        TableColumn("操作") { rule in
+          Menu {
+            Button {
+              do {
+                proxyRuleViewModel = try ProxyRuleViewModel(
+                  modelContainer: modelContext.container,
+                  ruleID: rule.id
+                )
+                editError = nil
+              } catch {
+                editError = error.localizedDescription
+              }
+            } label: {
+              Label("编辑规则", systemImage: "pencil")
+            }
+
+            Button(role: .destructive) {
+              if proxyRuleViewModel?.id == rule.id {
+                proxyRuleViewModel = nil
+              }
+              selectedRuleIDs.remove(rule.id)
+              modelContext.delete(rule)
+            } label: {
+              Label("删除规则", systemImage: "trash")
+            }
+          } label: {
+            Label("规则操作", systemImage: "ellipsis.circle")
+              .labelStyle(.iconOnly)
+          }
+          .help("规则操作")
+        }
+        .width(min: 72, ideal: 88, max: 96)
       }
       .alert(
         "读取代理规则失败",

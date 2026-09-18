@@ -126,7 +126,7 @@ extension Container {
     .cached
   }
 
-  /// 提供进程内唯一的系统网络变化监听器，由应用生命周期统一启动和停止。
+  /// 提供进程内唯一的系统网络变化监听器，统一维护代理服务与系统网络配置。
   @MainActor
   var systemNetworkChangeListsner: Factory<SystemNetworkChangeListsner> {
     self {
@@ -134,14 +134,4 @@ extension Container {
     }
     .cached
   }
-
-  /// 提供进程内唯一的系统网络设置服务，统一维护代理运行状态和系统网络配置。
-  @MainActor
-  var systemNetworkSettingService: Factory<SystemNetworkSettingService> {
-    self {
-      SystemNetworkSettingService()
-    }
-    .cached
-  }
-
 }

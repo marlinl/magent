@@ -17,9 +17,9 @@
 
 - Use Swift 6.0 language mode for every MagentX app and test target and for every build
   configuration.
-- Support macOS 14.0 and later. Treat macOS 14.0 as the minimum deployment target.
-- Use APIs available on macOS 14.0, or add an availability check and a valid macOS 14 fallback.
-- Dependencies must support Swift 6.0 and macOS 14.0.
+- Support macOS 15.0 and later. Treat macOS 15.0 as the minimum deployment target.
+- Use APIs available on macOS 15.0, or add an availability check and a valid macOS 15 fallback.
+- Dependencies must support Swift 6.0 and macOS 15.0.
 - Do not change the Swift language version or minimum deployment target without an explicit user
   request.
 

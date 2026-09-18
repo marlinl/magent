@@ -45,7 +45,7 @@ final class MagentProxyPolicy {
 
 /// 代理策略与规则的关联记录，一个规则只能对应一条关联记录。
 ///
-/// `ruleID` 的单字段唯一约束同时保证 `(policyID, ruleID)` 不会重复，兼容 macOS 14 SwiftData。
+/// `ruleID` 的单字段唯一约束同时保证 `(policyID, ruleID)` 不会重复。
 @Model
 final class MagentProxyPolicyRule {
   var policyID: Int

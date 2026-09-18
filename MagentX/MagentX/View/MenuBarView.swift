@@ -13,25 +13,25 @@ import SwiftUI
 /// macOS 菜单栏弹出内容，提供打开主窗口、关闭后台运行和退出操作。
 struct MenuBarView: View {
   @Environment(\.openWindow) private var openWindow
-  @InjectedObject(\.systemNetworkSettingService) private var systemNetworkSettingService
+  @InjectedObject(\.systemNetworkChangeListsner) private var systemNetworkChangeListsner
   @Binding var isMenuBarInserted: Bool
 
   var body: some View {
     Group {
       Label(
-        systemNetworkSettingService.isServiceStarted ? "当前状态：已开启" : "当前状态：已关闭",
-        systemImage: systemNetworkSettingService.isServiceStarted
+        systemNetworkChangeListsner.isServiceStarted ? "当前状态：已开启" : "当前状态：已关闭",
+        systemImage: systemNetworkChangeListsner.isServiceStarted
           ? "checkmark.circle" : "pause.circle"
       )
 
-      Button(systemNetworkSettingService.isServiceStarted ? "关闭代理服务" : "开启代理服务") {
+      Button(systemNetworkChangeListsner.isServiceStarted ? "关闭代理服务" : "开启代理服务") {
         Task {
-          await systemNetworkSettingService.toggleService()
+          await systemNetworkChangeListsner.toggleService()
         }
       }
-      .disabled(systemNetworkSettingService.isApplying)
+      .disabled(systemNetworkChangeListsner.isApplying)
 
-      if let serviceError = systemNetworkSettingService.serviceError {
+      if let serviceError = systemNetworkChangeListsner.serviceError {
         Text(serviceError)
       }
 
@@ -48,9 +48,9 @@ struct MenuBarView: View {
       }
     }
     .onAppear {
-      systemNetworkSettingService.reloadCurrentSelection()
+      systemNetworkChangeListsner.reloadCurrentSelection()
       Task {
-        await systemNetworkSettingService.applyStoredConfigurationIfNeeded()
+        await systemNetworkChangeListsner.applyStoredConfigurationIfNeeded()
       }
     }
   }

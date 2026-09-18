@@ -11,8 +11,7 @@ import SwiftData
 
 /// MagentX 持久化的代理规则，对应 `magent_proxy_rules` 的基础数据列和业务唯一键。
 ///
-/// macOS 14 的 SwiftData 不支持复合 `#Unique`，调用方通过 `validationError(in:)` 和同步合并流程
-/// 维护 `(matchType, matchValue)` 业务唯一性。
+/// 调用方通过 `validationError(in:)` 和同步合并流程维护 `(matchType, matchValue)` 业务唯一性。
 @Model
 final class MagentProxyRule {
   @Attribute(.unique)

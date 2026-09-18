@@ -10,73 +10,61 @@ import AppKit
 import SwiftData
 import SwiftUI
 
-/// 代理策略页面，在自适应双列表格中管理规则归属和代理策略。
+/// 代理策略页面，在规则表格和策略卡片中管理规则归属和代理策略。
 @MainActor
 struct ProxyPolicyView: View {
   @Environment(\.modelContext) private var modelContext
   @Binding var toolbarButtons: [ContentToolbarButton]
   @State private var searchText = ""
-  @State private var pageAt = 1
+  @FocusState private var isSearchFocused: Bool
   @State private var selectedRuleIDs: Set<Int> = []
-  @State private var selectedPolicyIDs: Set<Int> = []
   @State private var proxyPolicyViewModel: ProxyPolicyViewModel?
   @State private var formError: String?
 
-  private static let pageSize = 100
-  private static let maximumCachedModelCount = pageSize + 1
+  private static let maximumCachedModelCount = 1_000
 
   var body: some View {
     let normalizedSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
 
-    HSplitView {
-      ProxyPolicyRulePageView(
-        searchText: normalizedSearchText,
-        pageAt: $pageAt,
-        pageSize: Self.pageSize,
-        maximumCachedModelCount: Self.maximumCachedModelCount,
-        selectedRuleIDs: $selectedRuleIDs
-      )
-      .id(normalizedSearchText)
-      .frame(
-        minWidth: 520,
-        idealWidth: 760,
-        maxWidth: .infinity,
-        maxHeight: .infinity
-      )
-      .layoutPriority(2)
+    let content = GeometryReader { geometry in
+      HSplitView {
+        ProxyPolicyRulePageView(
+          searchText: normalizedSearchText,
+          maximumCachedModelCount: Self.maximumCachedModelCount,
+          selectedRuleIDs: $selectedRuleIDs
+        )
+        .frame(width: geometry.size.width * 0.6)
+        .frame(maxHeight: .infinity)
 
-      ProxyPolicyTableView(
-        maximumCachedModelCount: Self.maximumCachedModelCount,
-        selectedPolicyIDs: $selectedPolicyIDs,
-        proxyPolicyViewModel: $proxyPolicyViewModel
-      )
-      .frame(
-        minWidth: 280,
-        idealWidth: 360,
-        maxWidth: .infinity,
-        maxHeight: .infinity
-      )
-      .layoutPriority(1)
+        ProxyPolicyGridView(
+          maximumCachedModelCount: Self.maximumCachedModelCount
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .searchable(
-      text: Binding(
-        get: { searchText },
-        set: { newValue in
-          searchText = newValue
-          pageAt = 1
-        }
-      ),
-      placement: .toolbar,
-      prompt: "搜索规则"
-    )
+    .padding(.top, 1)
+    .overlay(alignment: .top) {
+      Divider()
+    }
+
+    Group {
+      content
+        .simultaneousGesture(
+          TapGesture()
+            .onEnded {
+              isSearchFocused = false
+            }
+        )
+        .searchable(
+          text: $searchText,
+          placement: .toolbar,
+          prompt: "搜索规则"
+        )
+        .searchFocused($isSearchFocused)
+    }
     .sheet(item: $proxyPolicyViewModel) { viewModel in
-      ProxyPolicyFormView(
-        proxyPolicyViewModel: viewModel,
-        onSaved: { policyID in
-          selectedPolicyIDs.insert(policyID)
-        }
-      )
+      ProxyPolicyFormView(proxyPolicyViewModel: viewModel)
     }
     .alert(
       "打开策略表单失败",
@@ -111,49 +99,21 @@ struct ProxyPolicyView: View {
     }
   }
 
-  /// 观察当前规则页和策略集合，并提供平台对应的分页交互。
+  /// 观察有限规则和策略集合，并将规则表格交给公共原生表格。
   private struct ProxyPolicyRulePageView: View {
-    @Query private var rules: [MagentProxyRule]
     @Query private var policies: [MagentProxyPolicy]
-    @Binding private var pageAt: Int
     @Binding private var selectedRuleIDs: Set<Int>
     @State private var associationError: String?
 
     private let searchText: String
-    private let pageSize: Int
+    private let maximumCachedModelCount: Int
 
-    /// 创建按规则 id 分页、按策略名称排序且数量有上限的 SwiftData 查询。
+    /// 创建按规则 id 稳定排序且数量有上限的 SwiftData 查询。
     init(
       searchText: String,
-      pageAt: Binding<Int>,
-      pageSize: Int,
       maximumCachedModelCount: Int,
       selectedRuleIDs: Binding<Set<Int>>
     ) {
-      precondition(pageAt.wrappedValue >= 1, "pageAt must start at 1")
-      precondition(pageSize > 0, "pageSize must be greater than 0")
-      precondition(
-        maximumCachedModelCount == pageSize + 1,
-        "maximumCachedModelCount must include one lookahead model"
-      )
-
-      let ruleSortDescriptors = [SortDescriptor(\MagentProxyRule.id, order: .forward)]
-      var ruleDescriptor: FetchDescriptor<MagentProxyRule>
-      if searchText.isEmpty {
-        ruleDescriptor = FetchDescriptor<MagentProxyRule>(sortBy: ruleSortDescriptors)
-      } else {
-        let query = searchText
-        ruleDescriptor = FetchDescriptor<MagentProxyRule>(
-          predicate: #Predicate<MagentProxyRule> { rule in
-            rule.matchValue.contains(query)
-          },
-          sortBy: ruleSortDescriptors
-        )
-      }
-      ruleDescriptor.fetchLimit = maximumCachedModelCount
-      ruleDescriptor.fetchOffset = (pageAt.wrappedValue - 1) * pageSize
-      _rules = Query(ruleDescriptor)
-
       var policyDescriptor = FetchDescriptor<MagentProxyPolicy>(
         sortBy: [
           SortDescriptor(\MagentProxyPolicy.name, order: .forward),
@@ -163,36 +123,70 @@ struct ProxyPolicyView: View {
       policyDescriptor.fetchLimit = maximumCachedModelCount
       _policies = Query(policyDescriptor)
 
-      _pageAt = pageAt
       _selectedRuleIDs = selectedRuleIDs
       self.searchText = searchText
-      self.pageSize = pageSize
+      self.maximumCachedModelCount = maximumCachedModelCount
     }
 
     var body: some View {
-      Group {
-        if rules.isEmpty {
-          ContentUnavailableView(
-            searchText.isEmpty ? "暂无规则" : "未找到规则",
-            systemImage: searchText.isEmpty
-              ? "arrow.triangle.branch"
-              : "magnifyingglass",
-            description: Text(
-              searchText.isEmpty
-                ? (pageAt == 1 ? "添加或同步规则后会显示在这里" : "当前页没有规则")
-                : searchText
-            )
+      let sortDescriptors = [SortDescriptor(\MagentProxyRule.id, order: .forward)]
+      let descriptor: FetchDescriptor<MagentProxyRule> = {
+        if searchText.isEmpty {
+          return FetchDescriptor<MagentProxyRule>(sortBy: sortDescriptors)
+        }
+
+        let query = searchText
+        return FetchDescriptor<MagentProxyRule>(
+          predicate: #Predicate<MagentProxyRule> { rule in
+            rule.matchValue.contains(query)
+          },
+          sortBy: sortDescriptors
+        )
+      }()
+
+      ScrollTableView(
+        selection: $selectedRuleIDs,
+        descriptor: descriptor,
+        maximumCachedModelCount: maximumCachedModelCount,
+      ) {
+        ContentUnavailableView(
+          searchText.isEmpty ? "暂无规则" : "未找到规则",
+          systemImage: searchText.isEmpty
+            ? "arrow.triangle.branch"
+            : "magnifyingglass",
+          description: Text(
+            searchText.isEmpty
+              ? "添加或同步规则后会显示在这里"
+              : searchText
           )
-        } else {
-          ProxyPolicyScrollingRuleTable(
-            rules: rules,
+        )
+      } columns: {
+        TableColumn("匹配值") { rule in
+          Text(rule.matchValue)
+            .lineLimit(1)
+        }
+        .width(min: 80, ideal: 140)
+
+        TableColumn("类型") { rule in
+          Text(rule.matchType)
+            .lineLimit(1)
+        }
+        .width(56)
+
+        TableColumn("规则") { rule in
+          Text(rule.decision)
+            .lineLimit(1)
+        }
+        .width(56)
+
+        TableColumn("策略") { rule in
+          ProxyPolicyPickerView(
+            ruleID: rule.id,
             policies: policies,
-            pageAt: $pageAt,
-            pageSize: pageSize,
-            selectedRuleIDs: $selectedRuleIDs,
             associationError: $associationError
           )
         }
+        .width(min: 80, ideal: 100, max: 120)
       }
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .alert(
@@ -211,287 +205,6 @@ struct ProxyPolicyView: View {
         }
       } message: {
         Text(associationError ?? "")
-      }
-    }
-  }
-
-  /// 通过原生表格滚动到顶部或底部切换规则页。
-  private struct ProxyPolicyScrollingRuleTable: View {
-    let rules: [MagentProxyRule]
-    let policies: [MagentProxyPolicy]
-    @Binding var pageAt: Int
-    let pageSize: Int
-    @Binding var selectedRuleIDs: Set<Int>
-    @Binding var associationError: String?
-    @State private var requestedPageAt: Int?
-    @State private var requestedScrollEdge: ProxyPolicyTableScrollEdge?
-    @State private var scrollRequest: ProxyPolicyTableScrollRequest?
-    @State private var canUnlockRequestedPage = false
-
-    var body: some View {
-      let visibleRules = Array(rules.prefix(pageSize))
-
-      Table(visibleRules, selection: $selectedRuleIDs) {
-        TableColumn("匹配值") { rule in
-          Text(rule.matchValue)
-            .lineLimit(1)
-        }
-        .width(min: 120, ideal: 300)
-
-        TableColumn("类型") { rule in
-          Text(rule.matchType)
-            .lineLimit(1)
-        }
-        .width(min: 80, ideal: 120, max: 160)
-
-        TableColumn("规则") { rule in
-          Text(rule.decision)
-            .lineLimit(1)
-        }
-        .width(min: 70, ideal: 90, max: 120)
-
-        TableColumn("策略") { rule in
-          ProxyPolicyPickerView(
-            ruleID: rule.id,
-            policies: policies,
-            associationError: $associationError
-          )
-        }
-        .width(min: 140, ideal: 220)
-      }
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .background {
-        ProxyPolicyTableScrollObserver(scrollRequest: scrollRequest) { boundary in
-          if requestedPageAt != nil {
-            if canUnlockRequestedPage, boundary == .middle {
-              requestedPageAt = nil
-              requestedScrollEdge = nil
-              canUnlockRequestedPage = false
-            }
-            return
-          }
-
-          switch boundary {
-          case .top where pageAt > 1:
-            let targetPageAt = pageAt - 1
-            canUnlockRequestedPage = false
-            requestedPageAt = targetPageAt
-            requestedScrollEdge = .bottom
-            pageAt = targetPageAt
-          case .bottom where rules.count > pageSize:
-            let targetPageAt = pageAt + 1
-            canUnlockRequestedPage = false
-            requestedPageAt = targetPageAt
-            requestedScrollEdge = .top
-            pageAt = targetPageAt
-          default:
-            break
-          }
-        }
-      }
-      .onChange(of: rules.first?.id) { _, _ in
-        guard let requestedScrollEdge else { return }
-        scrollRequest = ProxyPolicyTableScrollRequest(
-          pageAt: pageAt,
-          edge: requestedScrollEdge
-        )
-        let targetPageAt = requestedPageAt
-        Task { @MainActor in
-          do {
-            try await Task.sleep(for: .milliseconds(350))
-          } catch {
-            return
-          }
-          guard self.requestedPageAt == targetPageAt else { return }
-          canUnlockRequestedPage = true
-        }
-      }
-    }
-  }
-
-  private enum ProxyPolicyTableScrollBoundary: Equatable {
-    case top
-    case middle
-    case bottom
-  }
-
-  private enum ProxyPolicyTableScrollEdge: Equatable {
-    case top
-    case bottom
-  }
-
-  private struct ProxyPolicyTableScrollRequest: Equatable {
-    let pageAt: Int
-    let edge: ProxyPolicyTableScrollEdge
-  }
-
-  /// 观察 SwiftUI Table 内部原生滚动区，并在分页后恢复到指定边界。
-  private struct ProxyPolicyTableScrollObserver: NSViewRepresentable {
-    let scrollRequest: ProxyPolicyTableScrollRequest?
-    let onBoundary: (ProxyPolicyTableScrollBoundary) -> Void
-
-    func makeCoordinator() -> Coordinator {
-      Coordinator(onBoundary: onBoundary)
-    }
-
-    func makeNSView(context: Context) -> ProbeView {
-      let view = ProbeView()
-      view.coordinator = context.coordinator
-      return view
-    }
-
-    func updateNSView(_ nsView: ProbeView, context: Context) {
-      context.coordinator.onBoundary = onBoundary
-      context.coordinator.scrollRequest = scrollRequest
-      context.coordinator.attach(from: nsView)
-    }
-
-    static func dismantleNSView(_ nsView: ProbeView, coordinator: Coordinator) {
-      coordinator.stopObserving()
-    }
-
-    final class ProbeView: NSView {
-      weak var coordinator: Coordinator?
-
-      override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        coordinator?.attach(from: self)
-      }
-
-      override func layout() {
-        super.layout()
-        coordinator?.attach(from: self)
-      }
-    }
-
-    @MainActor
-    final class Coordinator: NSObject {
-      var onBoundary: (ProxyPolicyTableScrollBoundary) -> Void
-      var scrollRequest: ProxyPolicyTableScrollRequest? {
-        didSet {
-          applyScrollRequestIfNeeded()
-        }
-      }
-
-      private weak var scrollView: NSScrollView?
-      private var appliedScrollRequest: ProxyPolicyTableScrollRequest?
-      private var reportedBoundary: ProxyPolicyTableScrollBoundary?
-
-      init(onBoundary: @escaping (ProxyPolicyTableScrollBoundary) -> Void) {
-        self.onBoundary = onBoundary
-      }
-
-      func attach(from probeView: NSView) {
-        guard let candidate = findTableScrollView(containing: probeView) else { return }
-        if scrollView !== candidate {
-          stopObserving()
-          scrollView = candidate
-          candidate.contentView.postsBoundsChangedNotifications = true
-          NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(scrollBoundsDidChange(_:)),
-            name: NSView.boundsDidChangeNotification,
-            object: candidate.contentView
-          )
-        }
-        applyScrollRequestIfNeeded()
-      }
-
-      func stopObserving() {
-        NotificationCenter.default.removeObserver(
-          self,
-          name: NSView.boundsDidChangeNotification,
-          object: scrollView?.contentView
-        )
-        scrollView = nil
-        reportedBoundary = nil
-      }
-
-      @objc private func scrollBoundsDidChange(_ notification: Notification) {
-        guard let scrollView, let documentView = scrollView.documentView else { return }
-        let visibleRect = scrollView.contentView.documentVisibleRect
-        let documentBounds = documentView.bounds
-        let boundary: ProxyPolicyTableScrollBoundary
-
-        if visibleRect.minY <= documentBounds.minY + 1 {
-          boundary = .top
-        } else if visibleRect.maxY >= documentBounds.maxY - 1 {
-          boundary = .bottom
-        } else {
-          boundary = .middle
-        }
-        guard boundary != reportedBoundary else { return }
-        reportedBoundary = boundary
-        onBoundary(boundary)
-      }
-
-      private func applyScrollRequestIfNeeded() {
-        guard let scrollRequest, scrollRequest != appliedScrollRequest,
-          let scrollView, scrollView.documentView != nil
-        else {
-          return
-        }
-        appliedScrollRequest = scrollRequest
-
-        Task { @MainActor [weak self] in
-          do {
-            try await Task.sleep(for: .milliseconds(50))
-          } catch {
-            return
-          }
-          guard self?.appliedScrollRequest == scrollRequest else { return }
-          self?.scroll(to: scrollRequest)
-        }
-      }
-
-      private func scroll(to scrollRequest: ProxyPolicyTableScrollRequest) {
-        guard let scrollView, let documentView = scrollView.documentView else { return }
-        let documentBounds = documentView.bounds
-        let targetRect: NSRect =
-          switch scrollRequest.edge {
-          case .top:
-            NSRect(
-              x: documentBounds.minX,
-              y: documentBounds.minY,
-              width: 1,
-              height: 1
-            )
-          case .bottom:
-            NSRect(
-              x: documentBounds.minX,
-              y: max(documentBounds.minY, documentBounds.maxY - 1),
-              width: 1,
-              height: 1
-            )
-          }
-        documentView.scrollToVisible(targetRect)
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-      }
-
-      private func findTableScrollView(containing probeView: NSView) -> NSScrollView? {
-        guard let contentView = probeView.window?.contentView else { return nil }
-        let probeCenter = probeView.convert(
-          NSPoint(x: probeView.bounds.midX, y: probeView.bounds.midY),
-          to: nil
-        )
-        var candidates: [NSScrollView] = []
-
-        func collectCandidates(in view: NSView) {
-          if let scrollView = view as? NSScrollView,
-            scrollView.documentView != nil,
-            scrollView.convert(scrollView.bounds, to: nil).contains(probeCenter)
-          {
-            candidates.append(scrollView)
-          }
-          for subview in view.subviews {
-            collectCandidates(in: subview)
-          }
-        }
-
-        collectCandidates(in: contentView)
-        return candidates.min { lhs, rhs in
-          lhs.bounds.width * lhs.bounds.height < rhs.bounds.width * rhs.bounds.height
-        }
       }
     }
   }
@@ -578,32 +291,30 @@ struct ProxyPolicyView: View {
     }
   }
 
-  /// 展示现有代理策略，并提供修改和级联删除操作。
-  private struct ProxyPolicyTableView: View {
-    @Environment(\.modelContext) private var modelContext
+  /// 以双列卡片网格展示代理策略，并承载卡片内的直接修改。
+  private struct ProxyPolicyGridView: View {
     @Query private var policies: [MagentProxyPolicy]
-    @Binding private var selectedPolicyIDs: Set<Int>
-    @Binding private var proxyPolicyViewModel: ProxyPolicyViewModel?
+    @Query private var nodes: [MagentProxyNode]
     @State private var actionError: String?
 
-    /// 创建按名称和 id 稳定排序且数量有上限的策略查询。
-    init(
-      maximumCachedModelCount: Int,
-      selectedPolicyIDs: Binding<Set<Int>>,
-      proxyPolicyViewModel: Binding<ProxyPolicyViewModel?>
-    ) {
+    /// 创建按 id 稳定排序且数量有上限的策略与节点查询。
+    init(maximumCachedModelCount: Int) {
       precondition(maximumCachedModelCount > 0, "maximumCachedModelCount must be positive")
 
       var descriptor = FetchDescriptor<MagentProxyPolicy>(
-        sortBy: [
-          SortDescriptor(\MagentProxyPolicy.name, order: .forward),
-          SortDescriptor(\MagentProxyPolicy.id, order: .forward),
-        ]
+        sortBy: [SortDescriptor(\MagentProxyPolicy.id, order: .forward)]
       )
       descriptor.fetchLimit = maximumCachedModelCount
       _policies = Query(descriptor)
-      _selectedPolicyIDs = selectedPolicyIDs
-      _proxyPolicyViewModel = proxyPolicyViewModel
+
+      var nodeDescriptor = FetchDescriptor<MagentProxyNode>(
+        sortBy: [
+          SortDescriptor(\MagentProxyNode.name, order: .forward),
+          SortDescriptor(\MagentProxyNode.id, order: .forward),
+        ]
+      )
+      nodeDescriptor.fetchLimit = maximumCachedModelCount
+      _nodes = Query(nodeDescriptor)
     }
 
     var body: some View {
@@ -615,75 +326,29 @@ struct ProxyPolicyView: View {
             description: Text("点击工具栏的增加策略按钮后会显示在这里")
           )
         } else {
-          Table(policies, selection: $selectedPolicyIDs) {
-            TableColumn("名称") { policy in
-              Text(policy.name)
-                .lineLimit(1)
-            }
-            .width(min: 100, ideal: 160)
-
-            TableColumn("节点 ID") { policy in
-              Text(policy.nodeID.uuidString)
-                .font(.system(.body, design: .monospaced))
-                .lineLimit(1)
-                .truncationMode(.middle)
-            }
-            .width(min: 120, ideal: 220)
-
-            TableColumn("操作") { policy in
-              Menu {
-                Button {
-                  do {
-                    proxyPolicyViewModel = try ProxyPolicyViewModel(
-                      modelContainer: modelContext.container,
-                      policyID: policy.id
-                    )
-                    actionError = nil
-                  } catch {
-                    actionError = error.localizedDescription
-                  }
-                } label: {
-                  Label("编辑策略", systemImage: "pencil")
-                }
-
-                Button(role: .destructive) {
-                  do {
-                    let targetPolicyID = policy.id
-                    let descriptor = FetchDescriptor<MagentProxyPolicyRule>(
-                      predicate: #Predicate<MagentProxyPolicyRule> { policyRule in
-                        policyRule.policyID == targetPolicyID
-                      }
-                    )
-                    for policyRule in try modelContext.fetch(descriptor) {
-                      modelContext.delete(policyRule)
-                    }
-                    if proxyPolicyViewModel?.id == policy.id {
-                      proxyPolicyViewModel = nil
-                    }
-                    selectedPolicyIDs.remove(policy.id)
-                    modelContext.delete(policy)
-                    try modelContext.save()
-                    actionError = nil
-                  } catch {
-                    modelContext.rollback()
-                    actionError = error.localizedDescription
-                  }
-                } label: {
-                  Label("删除策略", systemImage: "trash")
-                }
-              } label: {
-                Label("策略操作", systemImage: "ellipsis.circle")
-                  .labelStyle(.iconOnly)
+          ScrollView {
+            LazyVGrid(
+              columns: [
+                GridItem(.flexible(minimum: 0), spacing: 12, alignment: .top),
+                GridItem(.flexible(minimum: 0), spacing: 12, alignment: .top),
+              ],
+              spacing: 12
+            ) {
+              ForEach(policies) { policy in
+                ProxyPolicyCardView(
+                  policy: policy,
+                  nodes: nodes,
+                  actionError: $actionError
+                )
               }
-              .help("策略操作")
             }
-            .width(min: 72, ideal: 88, max: 96)
+            .padding(12)
           }
         }
       }
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .alert(
-        "读取代理策略失败",
+        "操作代理策略失败",
         isPresented: Binding(
           get: { actionError != nil },
           set: { isPresented in
@@ -702,6 +367,249 @@ struct ProxyPolicyView: View {
     }
   }
 
+  /// 在标题输入框存在期间监听发生在其原生边界之外的鼠标点击。
+  private struct ProxyPolicyNameEditingBoundary: NSViewRepresentable {
+    let onClickOutside: () -> Void
+
+    func makeNSView(context: Context) -> ProxyPolicyNameEditingProbeView {
+      let probeView = ProxyPolicyNameEditingProbeView()
+      probeView.onClickOutside = onClickOutside
+      probeView.startMonitoring()
+      return probeView
+    }
+
+    func updateNSView(_ nsView: ProxyPolicyNameEditingProbeView, context: Context) {
+      nsView.onClickOutside = onClickOutside
+      nsView.startMonitoring()
+    }
+
+    static func dismantleNSView(
+      _ nsView: ProxyPolicyNameEditingProbeView,
+      coordinator: Void
+    ) {
+      nsView.stopMonitoring()
+    }
+  }
+
+  /// 以标题输入框的原生边界判断一次鼠标点击是否发生在输入框外。
+  @MainActor
+  private final class ProxyPolicyNameEditingProbeView: NSView {
+    var onClickOutside: () -> Void = {}
+    private var localMouseMonitor: Any?
+    private var windowDidResignObserver: NSObjectProtocol?
+
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      if window == nil {
+        stopMonitoring()
+      } else {
+        startMonitoring()
+      }
+    }
+
+    func startMonitoring() {
+      observeWindowResignation()
+      guard localMouseMonitor == nil else { return }
+
+      localMouseMonitor = NSEvent.addLocalMonitorForEvents(
+        matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+      ) { [weak self] event in
+        guard let self else { return event }
+
+        if let window, event.window === window,
+          bounds.contains(convert(event.locationInWindow, from: nil))
+        {
+          return event
+        }
+
+        Task { @MainActor [weak self] in
+          self?.onClickOutside()
+        }
+        return event
+      }
+    }
+
+    func stopMonitoring() {
+      if let localMouseMonitor {
+        NSEvent.removeMonitor(localMouseMonitor)
+        self.localMouseMonitor = nil
+      }
+      if let windowDidResignObserver {
+        NotificationCenter.default.removeObserver(windowDidResignObserver)
+        self.windowDidResignObserver = nil
+      }
+    }
+
+    private func observeWindowResignation() {
+      guard let window, windowDidResignObserver == nil else { return }
+      windowDidResignObserver = NotificationCenter.default.addObserver(
+        forName: NSWindow.didResignKeyNotification,
+        object: window,
+        queue: .main
+      ) { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.onClickOutside()
+        }
+      }
+    }
+  }
+
+  /// 展示一条策略的名称和节点，并在卡片内完成修改与删除。
+  private struct ProxyPolicyCardView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Bindable var policy: MagentProxyPolicy
+    let nodes: [MagentProxyNode]
+    @Binding var actionError: String?
+    @State private var draftName = ""
+    @State private var isEditingName = false
+    @FocusState private var isNameFocused: Bool
+
+    var body: some View {
+      let finishNameEditing = {
+        guard isEditingName else { return }
+        defer { isEditingName = false }
+
+        isNameFocused = false
+        let name = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard name.isEmpty == false else {
+          draftName = policy.name
+          actionError =
+            MagentXError.invalidParameter(
+              String(localized: "Name is required")
+            ).localizedDescription
+          return
+        }
+        guard name != policy.name else { return }
+
+        policy.name = name
+        policy.updatedAt = .now
+        do {
+          try modelContext.save()
+          actionError = nil
+        } catch {
+          modelContext.rollback()
+          draftName = policy.name
+          actionError = error.localizedDescription
+        }
+      }
+
+      let deleteAction = {
+        do {
+          let targetPolicyID = policy.id
+          let descriptor = FetchDescriptor<MagentProxyPolicyRule>(
+            predicate: #Predicate<MagentProxyPolicyRule> { policyRule in
+              policyRule.policyID == targetPolicyID
+            }
+          )
+          for policyRule in try modelContext.fetch(descriptor) {
+            modelContext.delete(policyRule)
+          }
+          modelContext.delete(policy)
+          try modelContext.save()
+          actionError = nil
+        } catch {
+          modelContext.rollback()
+          actionError = error.localizedDescription
+        }
+      }
+
+      GroupBox {
+        if isEditingName {
+          TextField("名称", text: $draftName)
+            .focused($isNameFocused)
+            .onAppear {
+              Task { @MainActor in
+                isNameFocused = true
+              }
+            }
+            .background {
+              ProxyPolicyNameEditingBoundary(onClickOutside: finishNameEditing)
+                .allowsHitTesting(false)
+            }
+            .onSubmit {
+              finishNameEditing()
+            }
+        } else {
+          Button {
+            draftName = policy.name
+            isEditingName = true
+          } label: {
+            Text(policy.name)
+              .font(.headline)
+              .lineLimit(1)
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+          .help("点击修改名称")
+        }
+
+        Text("代理节点")
+          .font(.subheadline.weight(.semibold))
+          .frame(maxWidth: .infinity, alignment: .leading)
+
+        Picker(
+          "代理节点",
+          selection: Binding(
+            get: { policy.nodeID },
+            set: { nodeID in
+              guard nodeID != policy.nodeID else { return }
+
+              do {
+                let targetNodeID = nodeID
+                let targetPolicyID = policy.id
+                let descriptor = FetchDescriptor<MagentProxyPolicy>(
+                  predicate: #Predicate<MagentProxyPolicy> { storedPolicy in
+                    storedPolicy.nodeID == targetNodeID && storedPolicy.id != targetPolicyID
+                  }
+                )
+                guard try modelContext.fetchCount(descriptor) == 0 else {
+                  throw MagentXError.invalidParameter(
+                    String(localized: "Proxy node already belongs to another policy")
+                  )
+                }
+
+                policy.nodeID = nodeID
+                policy.updatedAt = .now
+                try modelContext.save()
+                actionError = nil
+              } catch {
+                modelContext.rollback()
+                actionError = error.localizedDescription
+              }
+            }
+          )
+        ) {
+          ForEach(nodes) { node in
+            Text(node.name)
+              .tag(node.id)
+          }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .frame(maxWidth: .infinity, alignment: .leading)
+
+        Divider()
+
+        if #available(macOS 26.0, *) {
+          Button(role: .destructive, action: deleteAction) {
+            Label("删除策略", systemImage: "trash")
+          }
+          .buttonStyle(.glass)
+          .tint(.red)
+          .help("删除策略")
+        } else {
+          Button(role: .destructive, action: deleteAction) {
+            Label("删除策略", systemImage: "trash")
+          }
+          .buttonStyle(.bordered)
+          .tint(.red)
+          .help("删除策略")
+        }
+      }
+    }
+  }
+
   /// 在独立 SwiftData 上下文中编辑代理策略，并提供原生表单保存和取消语义。
   private struct ProxyPolicyFormView: View {
     @Environment(\.dismiss) private var dismiss
@@ -712,7 +620,6 @@ struct ProxyPolicyView: View {
       ]
     ) private var nodes: [MagentProxyNode]
     let proxyPolicyViewModel: ProxyPolicyViewModel
-    let onSaved: (Int) -> Void
     @State private var saveError: String?
 
     var body: some View {
@@ -762,7 +669,6 @@ struct ProxyPolicyView: View {
             do {
               try proxyPolicyViewModel.save()
               saveError = nil
-              onSaved(proxyPolicyViewModel.id)
               dismiss()
             } catch {
               saveError = error.localizedDescription

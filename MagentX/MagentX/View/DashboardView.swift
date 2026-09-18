@@ -12,7 +12,7 @@ import SwiftUI
 /// 仪表盘页面，展示代理运行状态入口和概览空态。
 struct DashboardView: View {
   @Binding var toolbarButtons: [ContentToolbarButton]
-  @InjectedObject(\.systemNetworkSettingService) private var systemNetworkSettingService
+  @InjectedObject(\.systemNetworkChangeListsner) private var systemNetworkChangeListsner
 
   var body: some View {
     ContentUnavailableView(
@@ -24,33 +24,33 @@ struct DashboardView: View {
     .overlay(alignment: .bottomTrailing) {
       Button {
         Task {
-          await systemNetworkSettingService.toggleService()
+          await systemNetworkChangeListsner.toggleService()
         }
       } label: {
         Label(
-          systemNetworkSettingService.isApplying
+          systemNetworkChangeListsner.isApplying
             ? "正在切换代理服务"
-            : (systemNetworkSettingService.isServiceStarted ? "关闭代理服务" : "启动代理服务"),
-          systemImage: systemNetworkSettingService.isApplying
+            : (systemNetworkChangeListsner.isServiceStarted ? "关闭代理服务" : "启动代理服务"),
+          systemImage: systemNetworkChangeListsner.isApplying
             ? "hourglass"
-            : (systemNetworkSettingService.isServiceStarted ? "stop.fill" : "power")
+            : (systemNetworkChangeListsner.isServiceStarted ? "stop.fill" : "power")
         )
         .labelStyle(.iconOnly)
       }
       .buttonStyle(.borderedProminent)
       .buttonBorderShape(.circle)
       .controlSize(.large)
-      .tint(systemNetworkSettingService.isServiceStarted ? .red : .accentColor)
-      .disabled(systemNetworkSettingService.isApplying)
+      .tint(systemNetworkChangeListsner.isServiceStarted ? .red : .accentColor)
+      .disabled(systemNetworkChangeListsner.isApplying)
       .help(
-        systemNetworkSettingService.isApplying
+        systemNetworkChangeListsner.isApplying
           ? "正在切换代理服务"
-          : (systemNetworkSettingService.isServiceStarted ? "关闭代理服务" : "启动代理服务")
+          : (systemNetworkChangeListsner.isServiceStarted ? "关闭代理服务" : "启动代理服务")
       )
       .accessibilityLabel(
-        systemNetworkSettingService.isApplying
+        systemNetworkChangeListsner.isApplying
           ? "正在切换代理服务"
-          : (systemNetworkSettingService.isServiceStarted ? "关闭代理服务" : "启动代理服务")
+          : (systemNetworkChangeListsner.isServiceStarted ? "关闭代理服务" : "启动代理服务")
       )
       .padding(24)
     }
@@ -58,23 +58,23 @@ struct DashboardView: View {
       "代理服务操作失败",
       isPresented: Binding(
         get: {
-          systemNetworkSettingService.serviceError != nil
+          systemNetworkChangeListsner.serviceError != nil
         },
         set: { isPresented in
           if isPresented == false {
-            systemNetworkSettingService.clearServiceError()
+            systemNetworkChangeListsner.clearServiceError()
           }
         })
     ) {
       Button("好") {
-        systemNetworkSettingService.clearServiceError()
+        systemNetworkChangeListsner.clearServiceError()
       }
     } message: {
-      Text(systemNetworkSettingService.serviceError ?? "")
+      Text(systemNetworkChangeListsner.serviceError ?? "")
     }
     .onAppear {
       toolbarButtons = []
-      systemNetworkSettingService.reloadCurrentSelection()
+      systemNetworkChangeListsner.reloadCurrentSelection()
     }
   }
 }

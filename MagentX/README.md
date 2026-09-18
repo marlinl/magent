@@ -25,7 +25,8 @@ MagentX/MagentX/
 │   └── MagentProxyRule.swift
 ├── Service/
 │   ├── MagentService.swift
-│   └── SystemNetworkSettingService.swift
+├── Listener/
+│   └── SystemNetworkChangeListsner.swift
 ├── Coordinator/
 │   └── SyncProxyRulesCoordinator.swift
 ├── Controller/
@@ -68,7 +69,7 @@ Network
 
 `SyncProxyRulesCoordinator` is a Factory-managed process singleton. It owns the observable synchronization state, downloads and parses the configured rule subscription, then merges imported rules tagged with `source = "rulesUrl"` into SwiftData without blocking the main actor.
 
-`MagentService` manages the local Magent proxy runtime. `SystemNetworkSettingService` coordinates runtime activation and system network proxy settings.
+`MagentService` manages the local Magent proxy runtime. `SystemNetworkChangeListsner` coordinates runtime activation, system network proxy settings, and network-change monitoring.
 
 ## Controllers
 

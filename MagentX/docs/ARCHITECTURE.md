@@ -55,7 +55,7 @@
 - Keep changes within the requested scope. Report unrelated violations and wait for explicit
   approval before migrating or refactoring them.
 - Name injected properties using the `lowerCamelCase` form of their type name. For example, use
-  `systemNetworkSettingService` for `SystemNetworkSettingService`, not `service` or
+  `systemNetworkChangeListsner` for `SystemNetworkChangeListsner`, not `service` or
   `networkService`.
 
 ## Libraries and Custom Implementations

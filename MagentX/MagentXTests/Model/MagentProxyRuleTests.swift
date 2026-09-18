@@ -2,7 +2,7 @@
 //  MagentProxyRuleTests.swift
 //  MagentXTests
 //
-//  Responsibility: Verifies proxy-rule business identity validation on macOS 14 SwiftData.
+//  Responsibility: Verifies proxy-rule business identity validation in SwiftData.
 //
 
 import Magent
