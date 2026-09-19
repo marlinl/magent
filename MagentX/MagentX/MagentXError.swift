@@ -21,7 +21,6 @@ enum MagentXError: LocalizedError, Equatable {
   case modelContainerCreationFailed(String)
   case proxyNotRunning
   case systemNetworkProxyConfigurationFailed(String)
-  case tunnelModeNotImplemented
 
   var errorDescription: String? {
     switch self {
@@ -50,8 +49,6 @@ enum MagentXError: LocalizedError, Equatable {
     case .systemNetworkProxyConfigurationFailed(let reason):
       return String(
         format: String(localized: "Failed to configure system network proxy: %@"), reason)
-    case .tunnelModeNotImplemented:
-      return String(localized: "Tunnel mode is not implemented yet")
     }
   }
 }

@@ -25,20 +25,13 @@ final class MagentXAppDelegate: NSObject, NSApplicationDelegate {
     keepsRunningAfterLastWindowClosed = isEnabled
   }
 
-  /// 应用启动后启动进程级网络监听，并按持久化状态恢复本地代理和系统代理配置。
+  /// 应用启动后启动进程级网络监听。
   func applicationDidFinishLaunching(_ notification: Notification) {
     AppLog.app.info("Application did finish launching")
     do {
       try systemNetworkChangeListsner.start()
     } catch {
       AppLog.network.error("Failed to start system network change listener")
-    }
-    Task { @MainActor in
-      do {
-        try await systemNetworkChangeListsner.applyStoredConfiguration()
-      } catch {
-        AppLog.network.error("Failed to restore stored proxy configuration at launch")
-      }
     }
   }
 

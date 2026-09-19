@@ -85,7 +85,7 @@ struct ContentToolbarButton: Identifiable {
 private enum ContentMetrics {
   static let sidebarWidth: CGFloat = 180
   static let detailMinimumWidth: CGFloat = 640
-  static let detailIdealWidth: CGFloat = 640
+  static let detailIdealWidth: CGFloat = 780
 }
 
 /// MagentX 主窗口导航壳，负责侧边栏选择、页面路由和页面级工具栏。

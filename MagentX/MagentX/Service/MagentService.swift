@@ -75,16 +75,7 @@ actor MagentService {
       }
 
       AppLog.proxy.info("Starting Magent core service")
-      let threadNumber = await MainActor.run {
-        GeneralSettings.load().proxyThreadNumber
-      }
-      guard threadNumber > 0 else {
-        throw MagentXError.invalidParameter(
-          String(format: String(localized: "Proxy thread number is invalid: %d"), threadNumber)
-        )
-      }
-
-      let magent = Magent(threadNumber: threadNumber)
+      let magent = Magent(threadNumber: 2)
       let operation = LifecycleOperation(
         identifier: UUID(),
         task: Task {

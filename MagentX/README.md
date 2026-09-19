@@ -19,7 +19,6 @@ MagentX/MagentX/
 ├── MagentXApp.swift
 ├── MagentXError.swift
 ├── Model/
-│   ├── CurrentSelection.swift
 │   ├── GeneralSettings.swift
 │   ├── MagentNode.swift
 │   └── MagentProxyRule.swift
@@ -62,7 +61,6 @@ Network
 
 - `ProxyNode`: persisted proxy node configuration. The first supported node type is Shadowsocks.
 - `GeneralSettings`: persisted global app configuration, including launch-at-login, menu bar behavior, local proxy listening, optional iCloud sync preference, and the rules subscription URL.
-- `CurrentSelection`: persisted selection state for the active proxy node.
 - `MagentProxyRule`: persisted proxy rule used directly by `ProxyRulesView`, including typed direct/proxy decisions.
 
 ## Coordinators and Services

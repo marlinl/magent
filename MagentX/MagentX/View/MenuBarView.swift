@@ -47,11 +47,5 @@ struct MenuBarView: View {
         NSApplication.shared.terminate(nil)
       }
     }
-    .onAppear {
-      systemNetworkChangeListsner.reloadCurrentSelection()
-      Task {
-        await systemNetworkChangeListsner.applyStoredConfigurationIfNeeded()
-      }
-    }
   }
 }

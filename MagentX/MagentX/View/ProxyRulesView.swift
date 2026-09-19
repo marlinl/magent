@@ -20,7 +20,7 @@ struct ProxyRulesView: View {
   @Binding var toolbarButtons: [ContentToolbarButton]
   @State private var searchText = ""
   @FocusState private var isSearchFocused: Bool
-  @State private var selectedRuleIDs: Set<Int> = []
+  @State private var selectedRuleID: Int?
   @State private var proxyRuleViewModel: ProxyRuleViewModel?
   @State private var formError: String?
 
@@ -31,8 +31,7 @@ struct ProxyRulesView: View {
     let content = ProxyRuleTableView(
       searchText: normalizedSearchText,
       maximumCachedModelCount: Self.maximumCachedModelCount,
-      isRefreshing: syncProxyRulesCoordinator.state == .running,
-      selectedRuleIDs: $selectedRuleIDs,
+      selectedRuleID: $selectedRuleID,
       proxyRuleViewModel: $proxyRuleViewModel
     )
     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -56,7 +55,7 @@ struct ProxyRulesView: View {
       ProxyRuleFormView(
         proxyRuleViewModel: viewModel,
         onSaved: { ruleID in
-          selectedRuleIDs.insert(ruleID)
+          selectedRuleID = ruleID
           searchText = ""
         }
       )
@@ -133,27 +132,24 @@ struct ProxyRulesView: View {
   /// 观察有数量上限的代理规则模型，并由系统表格管理可见行及缓冲区。
   private struct ProxyRuleTableView: View {
     @Environment(\.modelContext) private var modelContext
-    @Binding private var selectedRuleIDs: Set<Int>
+    @Binding private var selectedRuleID: Int?
     @Binding private var proxyRuleViewModel: ProxyRuleViewModel?
     @State private var editError: String?
 
     private let searchText: String
     private let maximumCachedModelCount: Int
-    private let isRefreshing: Bool
 
     /// 接收规则页面持有的选择和编辑绑定，并将查询条件交给公共表格。
     init(
       searchText: String,
       maximumCachedModelCount: Int,
-      isRefreshing: Bool,
-      selectedRuleIDs: Binding<Set<Int>>,
+      selectedRuleID: Binding<Int?>,
       proxyRuleViewModel: Binding<ProxyRuleViewModel?>
     ) {
-      _selectedRuleIDs = selectedRuleIDs
+      _selectedRuleID = selectedRuleID
       _proxyRuleViewModel = proxyRuleViewModel
       self.searchText = searchText
       self.maximumCachedModelCount = maximumCachedModelCount
-      self.isRefreshing = isRefreshing
     }
 
     var body: some View {
@@ -173,26 +169,11 @@ struct ProxyRulesView: View {
       }()
 
       ScrollTableView(
-        selection: $selectedRuleIDs,
+        selection: $selectedRuleID,
         descriptor: descriptor,
+        queryID: searchText,
         maximumCachedModelCount: maximumCachedModelCount,
       ) {
-        if isRefreshing {
-          ProgressView("正在同步规则")
-        } else {
-          ContentUnavailableView(
-            searchText.isEmpty ? "暂无规则" : "未找到规则",
-            systemImage: searchText.isEmpty
-              ? "arrow.triangle.branch"
-              : "magnifyingglass",
-            description: Text(
-              searchText.isEmpty
-                ? "添加或同步规则后会显示在这里"
-                : searchText
-            )
-          )
-        }
-      } columns: {
         TableColumn("匹配值") { rule in
           Text(rule.matchValue)
             .lineLimit(1)
@@ -243,7 +224,7 @@ struct ProxyRulesView: View {
               if proxyRuleViewModel?.id == rule.id {
                 proxyRuleViewModel = nil
               }
-              selectedRuleIDs.remove(rule.id)
+              if selectedRuleID == rule.id { selectedRuleID = nil }
               modelContext.delete(rule)
             } label: {
               Label("删除规则", systemImage: "trash")

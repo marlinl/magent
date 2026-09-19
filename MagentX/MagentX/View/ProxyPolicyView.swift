@@ -17,7 +17,7 @@ struct ProxyPolicyView: View {
   @Binding var toolbarButtons: [ContentToolbarButton]
   @State private var searchText = ""
   @FocusState private var isSearchFocused: Bool
-  @State private var selectedRuleIDs: Set<Int> = []
+  @State private var selectedRuleID: Int?
   @State private var proxyPolicyViewModel: ProxyPolicyViewModel?
   @State private var formError: String?
 
@@ -31,7 +31,7 @@ struct ProxyPolicyView: View {
         ProxyPolicyRulePageView(
           searchText: normalizedSearchText,
           maximumCachedModelCount: Self.maximumCachedModelCount,
-          selectedRuleIDs: $selectedRuleIDs
+          selectedRuleID: $selectedRuleID
         )
         .frame(width: geometry.size.width * 0.6)
         .frame(maxHeight: .infinity)
@@ -102,7 +102,7 @@ struct ProxyPolicyView: View {
   /// 观察有限规则和策略集合，并将规则表格交给公共原生表格。
   private struct ProxyPolicyRulePageView: View {
     @Query private var policies: [MagentProxyPolicy]
-    @Binding private var selectedRuleIDs: Set<Int>
+    @Binding private var selectedRuleID: Int?
     @State private var associationError: String?
 
     private let searchText: String
@@ -112,7 +112,7 @@ struct ProxyPolicyView: View {
     init(
       searchText: String,
       maximumCachedModelCount: Int,
-      selectedRuleIDs: Binding<Set<Int>>
+      selectedRuleID: Binding<Int?>
     ) {
       var policyDescriptor = FetchDescriptor<MagentProxyPolicy>(
         sortBy: [
@@ -123,7 +123,7 @@ struct ProxyPolicyView: View {
       policyDescriptor.fetchLimit = maximumCachedModelCount
       _policies = Query(policyDescriptor)
 
-      _selectedRuleIDs = selectedRuleIDs
+      _selectedRuleID = selectedRuleID
       self.searchText = searchText
       self.maximumCachedModelCount = maximumCachedModelCount
     }
@@ -145,22 +145,11 @@ struct ProxyPolicyView: View {
       }()
 
       ScrollTableView(
-        selection: $selectedRuleIDs,
+        selection: $selectedRuleID,
         descriptor: descriptor,
+        queryID: searchText,
         maximumCachedModelCount: maximumCachedModelCount,
       ) {
-        ContentUnavailableView(
-          searchText.isEmpty ? "暂无规则" : "未找到规则",
-          systemImage: searchText.isEmpty
-            ? "arrow.triangle.branch"
-            : "magnifyingglass",
-          description: Text(
-            searchText.isEmpty
-              ? "添加或同步规则后会显示在这里"
-              : searchText
-          )
-        )
-      } columns: {
         TableColumn("匹配值") { rule in
           Text(rule.matchValue)
             .lineLimit(1)

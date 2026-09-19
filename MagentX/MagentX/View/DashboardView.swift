@@ -74,7 +74,6 @@ struct DashboardView: View {
     }
     .onAppear {
       toolbarButtons = []
-      systemNetworkChangeListsner.reloadCurrentSelection()
     }
   }
 }

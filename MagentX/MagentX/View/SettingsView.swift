@@ -27,14 +27,6 @@ struct SettingsView: View {
     formatter.maximum = 65_535
     return formatter
   }()
-  private static let positiveIntegerFormatter: NumberFormatter = {
-    let formatter = NumberFormatter()
-    formatter.numberStyle = .none
-    formatter.allowsFloats = false
-    formatter.minimum = 1
-    return formatter
-  }()
-
   var body: some View {
     Form {
       Section("常规") {
@@ -74,11 +66,6 @@ struct SettingsView: View {
           value: $generalSettings.proxyListenPort,
           formatter: Self.portFormatter
         )
-        TextField(
-          "代理线程数",
-          value: $generalSettings.proxyThreadNumber,
-          formatter: Self.positiveIntegerFormatter
-        )
       }
 
       Section("PAC") {
@@ -116,9 +103,6 @@ struct SettingsView: View {
       generalSettings.save()
     }
     .onChange(of: generalSettings.proxyListenPort) { _, _ in
-      generalSettings.save()
-    }
-    .onChange(of: generalSettings.proxyThreadNumber) { _, _ in
       generalSettings.save()
     }
     .onChange(of: generalSettings.pacListenAddress) { _, _ in
