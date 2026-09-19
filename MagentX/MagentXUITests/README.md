@@ -37,9 +37,39 @@ xcodebuild -project MagentX.xcodeproj \
   -only-testing:MagentXUITests/ProxyNodesViewUITests test
 ```
 
+公共可编辑字段及节点页接入的回归使用：
+
+```sh
+xcodebuild -project MagentX.xcodeproj \
+  -scheme MagentX -destination 'platform=macOS' \
+  -only-testing:MagentXUITests/EditableFieldFormViewUITests \
+  -only-testing:MagentXUITests/ProxyNodesViewUITests test
+```
+
+`View/Common/EditableFieldFormFixture.swift` 通过真实公共组件验证调用方自定义的
+展示、文本、安全文本和菜单编辑器，以及只读权限、自动聚焦、失焦恢复和每次会话
+仅一次结束通知。保存回调使用夹具自己的 SwiftData context，并从另一 context
+读取确认落库；公共组件不依赖 SwiftData。节点页另覆盖名称实时绑定、菜单绑定、
+校验草稿的提交时机、非法输入恢复、跨节点草稿归属和编辑中删除。
+
+已有节点的名称、类型和加密方法使用 `@Bindable`；地址、端口、密码和超时在各自
+草稿校验通过后才修改模型。节点详情用节点 ID 隔离草稿状态；页面保留 `add`、
+`delete`，已移除集中字符串 `update` 分发。字段保存仍使用页面传入的 context，
+校验失败不回滚同一 context 中其他已绑定的修改。下方迁移记录保留了当时的实现。
+
 最低部署目标为 macOS 15，Swift 语言模式为 6。测试时会操作隔离宿主的窗口；
 请避免同时手动操作该窗口。启动参数禁用宿主的窗口恢复，避免用例之间互相影响。
 不要删除或改动 MagentX 的真实数据库来制造测试故障。
+
+## 节点详情绑定验证（2026-09-20）
+
+- 新增6个 UI 用例，覆盖实时名称绑定及默认名、草稿延迟提交、切换时校验失败、
+  地址/密码/超时校验、菜单绑定和带草稿删除；合计16个定向节点页用例通过。
+- 首轮15个通过；余下1个用例适配输入法组合文本的提交及系统密码掩码字符后，
+  单独复测通过。正式页面代码未因这两项测试断言适配再次修改。
+- 正式应用与隔离宿主构建、全项目格式检查、`git diff --check` 通过。
+- 本轮未重跑节点分页及通用组件测试；使用 macOS 27 内存宿主，未验证 macOS 15
+  实机或磁盘保存失败。详情保存失败会展示错误并保留待保存修改。
 
 ## 工程集成验证（2026-09-19）
 

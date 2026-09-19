@@ -6,7 +6,6 @@
 //  Responsibility: Provides the proxy node list and direct SwiftData CRUD UI.
 //
 
-import AppKit
 import Magent
 import SwiftData
 import SwiftUI
@@ -19,39 +18,62 @@ struct ProxyNodesView: View {
   @State private var selectedNode: MagentProxyNode?
   @State private var proxyNodeViewModel: ProxyNodeViewModel?
   @State private var actionError: String?
-  @State private var draftValue = ""
-  @State private var editingNodeID: UUID?
-  @State private var editingField: ProxyNodeEditableField?
-  @FocusState private var isFieldFocused: Bool
 
   private static let maximumCachedModelCount = 300
 
   var body: some View {
     HSplitView {
-      ProxyNodeTableView(
-        maximumCachedModelCount: Self.maximumCachedModelCount,
-        selectedNodeID: selectedNode?.id
-      ) { nodeID in
-        guard update() else { return }
-        guard let nodeID else {
-          selectedNode = nil
-          return
-        }
-        do {
-          // 表格只暴露单选标识；详情按需读取一条，不再保留第二份节点列表。
-          var descriptor = FetchDescriptor<MagentProxyNode>(
-            predicate: #Predicate { $0.id == nodeID }
-          )
-          descriptor.fetchLimit = 1
-          guard let node = try modelContext.fetch(descriptor).first else {
-            throw MagentXError.missingMagentProxyNode(nodeID)
+      ScrollTableView(
+        selection: Binding(
+          get: { selectedNode?.id },
+          set: { nodeID in
+            guard nodeID != selectedNode?.id else { return }
+            guard let nodeID else {
+              selectedNode = nil
+              return
+            }
+            do {
+              // 表格只暴露单选标识；详情按需读取一条，不再保留第二份节点列表。
+              var descriptor = FetchDescriptor<MagentProxyNode>(
+                predicate: #Predicate { $0.id == nodeID }
+              )
+              descriptor.fetchLimit = 1
+              guard let node = try modelContext.fetch(descriptor).first else {
+                throw MagentXError.missingMagentProxyNode(nodeID)
+              }
+              selectedNode = node
+            } catch {
+              actionError = error.localizedDescription
+            }
           }
-          selectedNode = node
-          actionError = nil
-        } catch {
-          actionError = error.localizedDescription
+        ),
+        // id 排序保持不变；300 只限制缓存，不能作为可浏览结果的总上限。
+        descriptor: FetchDescriptor<MagentProxyNode>(
+          sortBy: [SortDescriptor(\MagentProxyNode.id, order: .forward)]
+        ),
+        queryID: "proxy-nodes",
+        maximumCachedModelCount: Self.maximumCachedModelCount
+      ) {
+        TableColumn("名称") { node in
+          Label(node.name, systemImage: "server.rack")
+            .lineLimit(1)
         }
+        .width(min: 90, ideal: 140, max: 180)
+
+        TableColumn("地址") { node in
+          Text(verbatim: "\(node.address):\(node.port)")
+            .lineLimit(1)
+        }
+        .width(min: 100, ideal: 160, max: 200)
+
+        TableColumn("类型") { node in
+          Text(node.type)
+            .lineLimit(1)
+        }
+        .width(min: 64, ideal: 90, max: 120)
       }
+      .accessibilityIdentifier("proxy-nodes-table")
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
       .frame(minWidth: 240, idealWidth: 432, maxWidth: 440, maxHeight: .infinity)
 
       Group {
@@ -72,6 +94,7 @@ struct ProxyNodesView: View {
           Form {
             Section("节点配置") {
               TextField("名称（可选）", text: $node.name)
+                .accessibilityIdentifier("new-node-name")
 
               Picker("类型", selection: $node.type) {
                 ForEach(ProxyNodeType.allCases, id: \.rawValue) { type in
@@ -82,6 +105,7 @@ struct ProxyNodesView: View {
               .pickerStyle(.menu)
 
               TextField("地址", text: $node.address)
+                .accessibilityIdentifier("new-node-address")
               if let addressError {
                 Label(
                   addressError.localizedDescription,
@@ -102,6 +126,7 @@ struct ProxyNodesView: View {
               .pickerStyle(.menu)
 
               SecureField("密码", text: $node.password)
+                .accessibilityIdentifier("new-node-password")
               TextField("超时", value: $node.timeout, format: .number.grouping(.never))
             }
           }
@@ -210,330 +235,10 @@ struct ProxyNodesView: View {
             .background(.bar)
           }
         } else if let selectedNode {
-          let formattedTimeout = selectedNode.timeout.formatted(
-            .number.grouping(.never).precision(.fractionLength(0...3))
-          )
-
-          Form {
-            Section("节点详情") {
-              LabeledContent("名称") {
-                if editingField == .name {
-                  TextField("名称", text: $draftValue)
-                    .accessibilityIdentifier("node-name")
-                    .labelsHidden()
-                    .focused($isFieldFocused)
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .onAppear {
-                      Task { @MainActor in
-                        isFieldFocused = true
-                      }
-                    }
-                    .background {
-                      ProxyNodeFieldEditingBoundary(onClickOutside: {
-                        if editingField == .name {
-                          _ = update()
-                        }
-                      })
-                      .allowsHitTesting(false)
-                    }
-                    .onSubmit {
-                      _ = update()
-                    }
-                    .onChange(of: isFieldFocused) { _, isFocused in
-                      if isFocused == false {
-                        _ = update()
-                      }
-                    }
-                } else {
-                  Button {
-                    if update() {
-                      draftValue = selectedNode.name
-                      editingNodeID = selectedNode.id
-                      editingField = .name
-                    }
-                  } label: {
-                    Text(selectedNode.name)
-                      .frame(maxWidth: .infinity, alignment: .trailing)
-                      .contentShape(Rectangle())
-                  }
-                  .buttonStyle(.plain)
-                  .help("点击修改名称")
-                  .accessibilityIdentifier("node-name")
-                }
-              }
-
-              LabeledContent("类型") {
-                Picker(
-                  "类型",
-                  selection: Binding(
-                    get: { selectedNode.type },
-                    set: { type in
-                      guard type != selectedNode.type, update() else { return }
-                      draftValue = type
-                      editingNodeID = selectedNode.id
-                      editingField = .type
-                      _ = update()
-                    }
-                  )
-                ) {
-                  ForEach(ProxyNodeType.allCases, id: \.rawValue) { type in
-                    Text(type.rawValue)
-                      .tag(type.rawValue)
-                  }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-              }
-            }
-
-            Section("连接") {
-              LabeledContent("地址") {
-                if editingField == .address {
-                  TextField("地址", text: $draftValue)
-                    .labelsHidden()
-                    .focused($isFieldFocused)
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .onAppear {
-                      Task { @MainActor in
-                        isFieldFocused = true
-                      }
-                    }
-                    .background {
-                      ProxyNodeFieldEditingBoundary(onClickOutside: {
-                        if editingField == .address {
-                          _ = update()
-                        }
-                      })
-                      .allowsHitTesting(false)
-                    }
-                    .onSubmit {
-                      _ = update()
-                    }
-                    .onChange(of: isFieldFocused) { _, isFocused in
-                      if isFocused == false {
-                        _ = update()
-                      }
-                    }
-                } else {
-                  Button {
-                    if update() {
-                      draftValue = selectedNode.address
-                      editingNodeID = selectedNode.id
-                      editingField = .address
-                    }
-                  } label: {
-                    Text(selectedNode.address)
-                      .frame(maxWidth: .infinity, alignment: .trailing)
-                      .contentShape(Rectangle())
-                  }
-                  .buttonStyle(.plain)
-                  .help("点击修改地址")
-                }
-              }
-
-              LabeledContent("端口") {
-                if editingField == .port {
-                  TextField("端口", text: $draftValue)
-                    .accessibilityIdentifier("node-port")
-                    .labelsHidden()
-                    .focused($isFieldFocused)
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .onAppear {
-                      Task { @MainActor in
-                        isFieldFocused = true
-                      }
-                    }
-                    .background {
-                      ProxyNodeFieldEditingBoundary(onClickOutside: {
-                        if editingField == .port {
-                          _ = update()
-                        }
-                      })
-                      .allowsHitTesting(false)
-                    }
-                    .onSubmit {
-                      _ = update()
-                    }
-                    .onChange(of: isFieldFocused) { _, isFocused in
-                      if isFocused == false {
-                        _ = update()
-                      }
-                    }
-                } else {
-                  Button {
-                    if update() {
-                      draftValue = String(selectedNode.port)
-                      editingNodeID = selectedNode.id
-                      editingField = .port
-                    }
-                  } label: {
-                    Text(verbatim: String(selectedNode.port))
-                      .frame(maxWidth: .infinity, alignment: .trailing)
-                      .contentShape(Rectangle())
-                  }
-                  .buttonStyle(.plain)
-                  .help("点击修改端口")
-                  .accessibilityIdentifier("node-port")
-                }
-              }
-              LabeledContent("加密方法") {
-                Picker(
-                  "加密方法",
-                  selection: Binding(
-                    get: { selectedNode.cipher },
-                    set: { cipher in
-                      guard cipher != selectedNode.cipher, update() else { return }
-                      draftValue = cipher
-                      editingNodeID = selectedNode.id
-                      editingField = .cipher
-                      _ = update()
-                    }
-                  )
-                ) {
-                  ForEach(ProxyCipher.allCases, id: \.rawValue) { cipher in
-                    Text(cipher.rawValue)
-                      .tag(cipher.rawValue)
-                  }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-              }
-              LabeledContent("密码") {
-                if editingField == .password {
-                  SecureField("密码", text: $draftValue)
-                    .labelsHidden()
-                    .focused($isFieldFocused)
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .onAppear {
-                      Task { @MainActor in
-                        isFieldFocused = true
-                      }
-                    }
-                    .background {
-                      ProxyNodeFieldEditingBoundary(onClickOutside: {
-                        if editingField == .password {
-                          _ = update()
-                        }
-                      })
-                      .allowsHitTesting(false)
-                    }
-                    .onSubmit {
-                      _ = update()
-                    }
-                    .onChange(of: isFieldFocused) { _, isFocused in
-                      if isFocused == false {
-                        _ = update()
-                      }
-                    }
-                } else {
-                  Button {
-                    if update() {
-                      draftValue = selectedNode.password
-                      editingNodeID = selectedNode.id
-                      editingField = .password
-                    }
-                  } label: {
-                    Text("••••••••")
-                      .frame(maxWidth: .infinity, alignment: .trailing)
-                      .contentShape(Rectangle())
-                  }
-                  .buttonStyle(.plain)
-                  .help("点击修改密码")
-                }
-              }
-              LabeledContent("超时") {
-                if editingField == .timeout {
-                  TextField("超时", text: $draftValue)
-                    .labelsHidden()
-                    .focused($isFieldFocused)
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .onAppear {
-                      Task { @MainActor in
-                        isFieldFocused = true
-                      }
-                    }
-                    .background {
-                      ProxyNodeFieldEditingBoundary(onClickOutside: {
-                        if editingField == .timeout {
-                          _ = update()
-                        }
-                      })
-                      .allowsHitTesting(false)
-                    }
-                    .onSubmit {
-                      _ = update()
-                    }
-                    .onChange(of: isFieldFocused) { _, isFocused in
-                      if isFocused == false {
-                        _ = update()
-                      }
-                    }
-                } else {
-                  Button {
-                    if update() {
-                      draftValue = formattedTimeout
-                      editingNodeID = selectedNode.id
-                      editingField = .timeout
-                    }
-                  } label: {
-                    Text("\(formattedTimeout) 秒")
-                      .frame(maxWidth: .infinity, alignment: .trailing)
-                      .contentShape(Rectangle())
-                  }
-                  .buttonStyle(.plain)
-                  .help("点击修改超时")
-                }
-              }
-            }
+          ProxyNodeDetailView(node: selectedNode, actionError: $actionError) {
+            delete(selectedNode)
           }
-          .formStyle(.grouped)
-          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-          .safeAreaInset(edge: .bottom) {
-            HStack {
-              Spacer()
-
-              if #available(macOS 26.0, *) {
-                Button(role: .destructive) {
-                  if update() {
-                    delete(selectedNode)
-                  }
-                } label: {
-                  Label("删除节点", systemImage: "trash")
-                }
-                .labelStyle(.iconOnly)
-                .buttonStyle(.glass)
-                .controlSize(.small)
-                .buttonBorderShape(.circle)
-                .tint(.red)
-                .help("删除节点")
-                .accessibilityLabel("删除节点")
-              } else {
-                Button(role: .destructive) {
-                  if update() {
-                    delete(selectedNode)
-                  }
-                } label: {
-                  Label("删除节点", systemImage: "trash")
-                }
-                .labelStyle(.iconOnly)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .buttonBorderShape(.circle)
-                .tint(.red)
-                .help("删除节点")
-                .accessibilityLabel("删除节点")
-              }
-            }
-            .padding()
-            .background(.bar)
-          }
+          .id(selectedNode.id)
         } else {
           ContentUnavailableView(
             "选择代理节点",
@@ -581,124 +286,11 @@ struct ProxyNodesView: View {
     }
   }
 
-  /// 打开右侧的新节点表单，并在进入前提交正在编辑的节点字段。
+  /// 打开使用独立 context 的新节点表单，支持保存前取消。
   private func add() {
-    guard update() else { return }
-
     proxyNodeViewModel?.rollback()
     proxyNodeViewModel = ProxyNodeViewModel(modelContainer: modelContext.container)
     actionError = nil
-  }
-
-  /// 提交稳定编辑标识对应节点字段的修改，并在持久化失败时恢复原有节点数据。
-  ///
-  /// - Returns: 未编辑或提交成功时返回 true；查找或保存失败时返回 false。
-  private func update() -> Bool {
-    guard let editingNodeID, let editingField else { return true }
-    defer {
-      self.editingNodeID = nil
-      self.editingField = nil
-      isFieldFocused = false
-    }
-
-    do {
-      let targetNodeID = editingNodeID
-      let descriptor = FetchDescriptor<MagentProxyNode>(
-        predicate: #Predicate<MagentProxyNode> { node in
-          node.id == targetNodeID
-        }
-      )
-      guard let editingNode = try modelContext.fetch(descriptor).first else {
-        throw MagentXError.missingMagentProxyNode(editingNodeID)
-      }
-
-      let value =
-        if editingField == .password {
-          draftValue
-        } else {
-          draftValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-      switch editingField {
-      case .name:
-        let resolvedName = value.isEmpty ? "\(editingNode.address):\(editingNode.port)" : value
-        guard resolvedName != editingNode.name else { return true }
-        editingNode.name = resolvedName
-      case .address:
-        guard value.isEmpty == false, MagentProxyNode.isValidAddress(value) else {
-          throw MagentXError.invalidParameter(
-            String(localized: "Address must be a hostname, IPv4 address, or IPv6 address")
-          )
-        }
-        guard value != editingNode.address else { return true }
-        editingNode.address = value
-      case .type:
-        guard ProxyNodeType(rawValue: value) != nil else {
-          throw MagentXError.invalidParameter(
-            String(format: String(localized: "Proxy node type is invalid: %@"), value)
-          )
-        }
-        guard value != editingNode.type else { return true }
-        editingNode.type = value
-      case .port:
-        guard let port = Int(value), (1...65_535).contains(port) else {
-          throw MagentXError.invalidParameter(
-            String(localized: "Port must be an integer from 1 to 65535")
-          )
-        }
-        guard port != editingNode.port else { return true }
-        editingNode.port = port
-      case .cipher:
-        guard ProxyCipher(rawValue: value) != nil else {
-          throw MagentXError.invalidParameter(
-            String(format: String(localized: "Proxy cipher is invalid: %@"), value)
-          )
-        }
-        guard value != editingNode.cipher else { return true }
-        editingNode.cipher = value
-      case .password:
-        guard value.isEmpty == false else {
-          throw MagentXError.invalidParameter(String(localized: "Password is required"))
-        }
-        guard value != editingNode.password else { return true }
-        editingNode.password = value
-      case .timeout:
-        guard let timeout = TimeInterval(value), timeout.isFinite, timeout >= 1 else {
-          throw MagentXError.invalidParameter(
-            String(localized: "Timeout must be a positive integer")
-          )
-        }
-        guard timeout != editingNode.timeout else { return true }
-        editingNode.timeout = timeout
-      }
-      editingNode.updatedAt = .now
-      try modelContext.save()
-      draftValue =
-        switch editingField {
-        case .name:
-          editingNode.name
-        case .address:
-          editingNode.address
-        case .type:
-          editingNode.type
-        case .port:
-          String(editingNode.port)
-        case .cipher:
-          editingNode.cipher
-        case .password:
-          editingNode.password
-        case .timeout:
-          editingNode.timeout.formatted(
-            .number.grouping(.never).precision(.fractionLength(0...3))
-          )
-        }
-      actionError = nil
-      return true
-    } catch {
-      modelContext.rollback()
-      draftValue = ""
-      actionError = error.localizedDescription
-      return false
-    }
   }
 
   /// 删除未被策略引用的节点；若节点仍被引用则保留数据并报告原有保护错误。
@@ -719,162 +311,273 @@ struct ProxyNodesView: View {
       modelContext.delete(node)
       try modelContext.save()
       selectedNode = nil
-      editingNodeID = nil
-      editingField = nil
       actionError = nil
     } catch {
-      modelContext.rollback()
+      if node.isDeleted {
+        modelContext.rollback()
+      }
       actionError = error.localizedDescription
     }
   }
+}
 
-  /// 标识当前右侧详情中正在以内联控件修改的节点字段。
-  private enum ProxyNodeEditableField {
-    case name
-    case address
-    case type
-    case port
-    case cipher
-    case password
-    case timeout
-  }
+/// 单个已有节点的绑定详情；仅需要校验的字段持有草稿，状态随节点标识重建。
+@MainActor
+private struct ProxyNodeDetailView: View {
+  @Environment(\.modelContext) private var modelContext
+  @Bindable var node: MagentProxyNode
+  @Binding var actionError: String?
+  let onDelete: () -> Void
+  @State private var addressDraft = ""
+  @State private var portDraft = ""
+  @State private var passwordDraft = ""
+  @State private var timeoutDraft = ""
 
-  /// 以有限查询窗口双向浏览节点，并将单项选择交给父级详情区域。
-  private struct ProxyNodeTableView: View {
-    let maximumCachedModelCount: Int
-    let selectedNodeID: UUID?
-    let onSelectionChange: (UUID?) -> Void
-
-    var body: some View {
-      ScrollTableView(
-        selection: Binding(
-          get: { selectedNodeID },
-          set: { nodeID in
-            guard nodeID != selectedNodeID else { return }
-            onSelectionChange(nodeID)
+  var body: some View {
+    Form {
+      Section("节点详情") {
+        LabeledContent("名称") {
+          EditableFieldFormView(
+            onEditingEnded: {
+              save {
+                let trimmedName = node.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                let name = trimmedName.isEmpty ? "\(node.address):\(node.port)" : trimmedName
+                if node.name != name {
+                  node.name = name
+                  node.updatedAt = .now
+                }
+              }
+            }
+          ) {
+            Text(node.name)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          } editor: { focus, _ in
+            TextField("名称", text: $node.name)
+              .labelsHidden()
+              .focused(focus)
+              .multilineTextAlignment(.trailing)
+              .frame(maxWidth: .infinity, alignment: .trailing)
           }
-        ),
-        // id 排序保持不变；300 只限制缓存，不能作为可浏览结果的总上限。
-        descriptor: FetchDescriptor<MagentProxyNode>(
-          sortBy: [SortDescriptor(\MagentProxyNode.id, order: .forward)]
-        ),
-        queryID: "proxy-nodes",
-        maximumCachedModelCount: maximumCachedModelCount
-      ) {
-        TableColumn("名称") { node in
-          Label(node.name, systemImage: "server.rack")
-            .lineLimit(1)
+          .onChange(of: node.name) { _, _ in
+            guard node.modelContext != nil, !node.isDeleted else { return }
+            node.updatedAt = .now
+          }
+          .help("点击修改名称")
+          .accessibilityIdentifier("node-name")
         }
-        .width(min: 90, ideal: 140, max: 180)
 
-        TableColumn("地址") { node in
-          Text(verbatim: "\(node.address):\(node.port)")
-            .lineLimit(1)
+        LabeledContent("类型") {
+          Picker("类型", selection: $node.type) {
+            ForEach(ProxyNodeType.allCases, id: \.rawValue) { type in
+              Text(type.rawValue)
+                .tag(type.rawValue)
+            }
+          }
+          .labelsHidden()
+          .pickerStyle(.menu)
+          .frame(maxWidth: .infinity, alignment: .trailing)
+          .onChange(of: node.type) { _, _ in
+            save { node.updatedAt = .now }
+          }
+          .accessibilityIdentifier("node-type")
         }
-        .width(min: 100, ideal: 160, max: 200)
-
-        TableColumn("类型") { node in
-          Text(node.type)
-            .lineLimit(1)
-        }
-        .width(min: 64, ideal: 90, max: 120)
       }
-      .accessibilityIdentifier("proxy-nodes-table")
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+      Section("连接") {
+        LabeledContent("地址") {
+          EditableFieldFormView(
+            onEditingBegan: {
+              addressDraft = node.address
+              return true
+            },
+            onEditingEnded: {
+              save {
+                let address = addressDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !address.isEmpty, MagentProxyNode.isValidAddress(address) else {
+                  throw MagentXError.invalidParameter(
+                    String(localized: "Address must be a hostname, IPv4 address, or IPv6 address")
+                  )
+                }
+                guard node.address != address else { return }
+                node.address = address
+                node.updatedAt = .now
+              }
+            }
+          ) {
+            Text(node.address)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          } editor: { focus, _ in
+            TextField("地址", text: $addressDraft)
+              .labelsHidden()
+              .focused(focus)
+              .multilineTextAlignment(.trailing)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          }
+          .help("点击修改地址")
+          .accessibilityIdentifier("node-address")
+        }
+
+        LabeledContent("端口") {
+          EditableFieldFormView(
+            onEditingBegan: {
+              portDraft = String(node.port)
+              return true
+            },
+            onEditingEnded: {
+              save {
+                let value = portDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let port = Int(value), (1...65_535).contains(port) else {
+                  throw MagentXError.invalidParameter(
+                    String(localized: "Port must be an integer from 1 to 65535")
+                  )
+                }
+                guard node.port != port else { return }
+                node.port = port
+                node.updatedAt = .now
+              }
+            }
+          ) {
+            Text(verbatim: String(node.port))
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          } editor: { focus, _ in
+            TextField("端口", text: $portDraft)
+              .labelsHidden()
+              .focused(focus)
+              .multilineTextAlignment(.trailing)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          }
+          .help("点击修改端口")
+          .accessibilityIdentifier("node-port")
+        }
+
+        LabeledContent("加密方法") {
+          Picker("加密方法", selection: $node.cipher) {
+            ForEach(ProxyCipher.allCases, id: \.rawValue) { cipher in
+              Text(cipher.rawValue)
+                .tag(cipher.rawValue)
+            }
+          }
+          .labelsHidden()
+          .pickerStyle(.menu)
+          .frame(maxWidth: .infinity, alignment: .trailing)
+          .onChange(of: node.cipher) { _, _ in
+            save { node.updatedAt = .now }
+          }
+          .accessibilityIdentifier("node-cipher")
+        }
+
+        LabeledContent("密码") {
+          EditableFieldFormView(
+            onEditingBegan: {
+              passwordDraft = node.password
+              return true
+            },
+            onEditingEnded: {
+              save {
+                guard !passwordDraft.isEmpty else {
+                  throw MagentXError.invalidParameter(String(localized: "Password is required"))
+                }
+                guard node.password != passwordDraft else { return }
+                node.password = passwordDraft
+                node.updatedAt = .now
+              }
+            }
+          ) {
+            Text("••••••••")
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          } editor: { focus, _ in
+            SecureField("密码", text: $passwordDraft)
+              .labelsHidden()
+              .focused(focus)
+              .multilineTextAlignment(.trailing)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          }
+          .help("点击修改密码")
+          .accessibilityIdentifier("node-password")
+        }
+
+        LabeledContent("超时") {
+          EditableFieldFormView(
+            onEditingBegan: {
+              timeoutDraft = String(node.timeout)
+              return true
+            },
+            onEditingEnded: {
+              save {
+                let value = timeoutDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let timeout = TimeInterval(value), timeout.isFinite, timeout >= 1 else {
+                  throw MagentXError.invalidParameter(
+                    String(localized: "Timeout must be a positive integer")
+                  )
+                }
+                guard node.timeout != timeout else { return }
+                node.timeout = timeout
+                node.updatedAt = .now
+              }
+            }
+          ) {
+            Text(
+              "\(node.timeout.formatted(.number.grouping(.never).precision(.fractionLength(0...3)))) 秒"
+            )
+            .frame(maxWidth: .infinity, alignment: .trailing)
+          } editor: { focus, _ in
+            TextField("超时", text: $timeoutDraft)
+              .labelsHidden()
+              .focused(focus)
+              .multilineTextAlignment(.trailing)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          }
+          .help("点击修改超时")
+          .accessibilityIdentifier("node-timeout")
+        }
+      }
+    }
+    .formStyle(.grouped)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    .safeAreaInset(edge: .bottom) {
+      HStack {
+        Spacer()
+
+        if #available(macOS 26.0, *) {
+          Button(role: .destructive, action: onDelete) {
+            Label("删除节点", systemImage: "trash")
+          }
+          .labelStyle(.iconOnly)
+          .buttonStyle(.glass)
+          .controlSize(.small)
+          .buttonBorderShape(.circle)
+          .tint(.red)
+          .help("删除节点")
+          .accessibilityLabel("删除节点")
+        } else {
+          Button(role: .destructive, action: onDelete) {
+            Label("删除节点", systemImage: "trash")
+          }
+          .labelStyle(.iconOnly)
+          .buttonStyle(.bordered)
+          .controlSize(.small)
+          .buttonBorderShape(.circle)
+          .tint(.red)
+          .help("删除节点")
+          .accessibilityLabel("删除节点")
+        }
+      }
+      .padding()
+      .background(.bar)
     }
   }
 
-  /// 在节点字段输入框存在期间监听发生在其原生边界之外的鼠标点击。
-  private struct ProxyNodeFieldEditingBoundary: NSViewRepresentable {
-    let onClickOutside: () -> Void
-
-    /// 创建并启动原生点击探针。
-    func makeNSView(context: Context) -> ProxyNodeFieldEditingProbeView {
-      let probeView = ProxyNodeFieldEditingProbeView()
-      probeView.onClickOutside = onClickOutside
-      probeView.startMonitoring()
-      return probeView
-    }
-
-    /// 更新点击回调，确保重建后的 SwiftUI 闭包仍被调用。
-    func updateNSView(_ nsView: ProxyNodeFieldEditingProbeView, context: Context) {
-      nsView.onClickOutside = onClickOutside
-      nsView.startMonitoring()
-    }
-
-    /// 在输入框移除时释放本地鼠标与窗口焦点监听。
-    static func dismantleNSView(
-      _ nsView: ProxyNodeFieldEditingProbeView,
-      coordinator: Void
-    ) {
-      nsView.stopMonitoring()
-    }
-  }
-
-  /// 以节点字段输入框的原生边界判断一次鼠标点击是否发生在输入框外。
-  @MainActor
-  private final class ProxyNodeFieldEditingProbeView: NSView {
-    var onClickOutside: () -> Void = {}
-    private var localMouseMonitor: Any?
-    private var windowDidResignObserver: NSObjectProtocol?
-
-    /// 在视图加入或移出窗口时同步点击监听的生命周期。
-    override func viewDidMoveToWindow() {
-      super.viewDidMoveToWindow()
-      if window == nil {
-        stopMonitoring()
-      } else {
-        startMonitoring()
+  /// 在当前详情的保存边界执行字段校验和提交，错误交给页面展示，保留其他已绑定修改。
+  private func save(_ changes: () throws -> Void) {
+    // 删除后可能仍有旧编辑控件的失焦通知；先检查生命周期再读取或修改模型字段。
+    guard node.modelContext != nil, !node.isDeleted else { return }
+    do {
+      try changes()
+      if modelContext.hasChanges {
+        try modelContext.save()
       }
-    }
-
-    /// 开始监听同一窗口外的鼠标按下和窗口失焦事件。
-    func startMonitoring() {
-      observeWindowResignation()
-      guard localMouseMonitor == nil else { return }
-
-      localMouseMonitor = NSEvent.addLocalMonitorForEvents(
-        matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
-      ) { [weak self] event in
-        guard let self else { return event }
-
-        if let window, event.window === window,
-          bounds.contains(convert(event.locationInWindow, from: nil))
-        {
-          return event
-        }
-
-        Task { @MainActor [weak self] in
-          self?.onClickOutside()
-        }
-        return event
-      }
-    }
-
-    /// 停止鼠标与窗口失焦监听并释放关联资源。
-    func stopMonitoring() {
-      if let localMouseMonitor {
-        NSEvent.removeMonitor(localMouseMonitor)
-        self.localMouseMonitor = nil
-      }
-      if let windowDidResignObserver {
-        NotificationCenter.default.removeObserver(windowDidResignObserver)
-        self.windowDidResignObserver = nil
-      }
-    }
-
-    /// 观察宿主窗口失去键盘焦点并提交字段编辑。
-    private func observeWindowResignation() {
-      guard let window, windowDidResignObserver == nil else { return }
-      windowDidResignObserver = NotificationCenter.default.addObserver(
-        forName: NSWindow.didResignKeyNotification,
-        object: window,
-        queue: .main
-      ) { [weak self] _ in
-        Task { @MainActor [weak self] in
-          self?.onClickOutside()
-        }
-      }
+    } catch {
+      actionError = error.localizedDescription
     }
   }
 }

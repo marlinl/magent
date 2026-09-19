@@ -24,7 +24,9 @@ struct ScrollTableHost: App {
   /// 按启动环境准备隔离内存模型；仅故障用例使用可抛错的快照 DataStore。
   init() {
     do {
-      if ProcessInfo.processInfo.environment["UI_TEST_VIEW"] == "proxy-nodes" {
+      if ProcessInfo.processInfo.environment["UI_TEST_VIEW"] == "proxy-nodes"
+        || ProcessInfo.processInfo.environment["UI_TEST_VIEW"] == "editable-field"
+      {
         container = try ProxyNodesFixture.makeContainer()
         return
       }
@@ -55,6 +57,8 @@ struct ScrollTableHost: App {
       Group {
         if ProcessInfo.processInfo.environment["UI_TEST_VIEW"] == "proxy-nodes" {
           ProxyNodesFixture()
+        } else if ProcessInfo.processInfo.environment["UI_TEST_VIEW"] == "editable-field" {
+          EditableFieldFormFixture()
         } else {
           ScrollTableFixture(faults: faults)
         }
