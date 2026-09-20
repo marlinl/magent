@@ -21,6 +21,7 @@ final class HttpForwardConnectionTests: XCTestCase {
     XCTAssertFalse(channel.isActive)
   }
 
+  /// HTTP forward 直连请求和响应遵循手动读取流控。
   func testHTTPForwardDirectRequestAndResponseUseManualReadFlow() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -48,15 +49,9 @@ final class HttpForwardConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -99,6 +94,7 @@ final class HttpForwardConnectionTests: XCTestCase {
     XCTAssertEqual(try clientResponsePromise.futureResult.wait(), response)
   }
 
+  /// HTTP forward 代理请求之前先发送 Shadowsocks 握手。
   func testHTTPForwardProxyWritesShadowsocksHandshakeBeforeRequest() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -141,8 +137,7 @@ final class HttpForwardConnectionTests: XCTestCase {
     )
     let core = try MagentCore(
       defaultDecision: .proxy(defaultNode.id),
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [defaultNode],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -166,6 +161,7 @@ final class HttpForwardConnectionTests: XCTestCase {
     channels.append(try proxyNodeAcceptedPromise.futureResult.wait())
   }
 
+  /// HTTP forward 直连失败时只发送一次网关错误响应。
   func testHTTPForwardReturnsSingleBadGatewayWhenDirectConnectFails() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -182,15 +178,9 @@ final class HttpForwardConnectionTests: XCTestCase {
     let unavailablePort = try XCTUnwrap(unavailableServer.localAddress?.port)
     try unavailableServer.close().wait()
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -225,6 +215,7 @@ final class HttpForwardConnectionTests: XCTestCase {
     wait(for: [clientClosed], timeout: 2)
   }
 
+  /// HTTP forward 客户端半关闭后仍接收目标服务器响应。
   func testHTTPForwardProxyHalfCloseStillAllowsTargetResponse() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -248,15 +239,9 @@ final class HttpForwardConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -294,6 +279,7 @@ final class HttpForwardConnectionTests: XCTestCase {
     XCTAssertTrue(targetChannel.isActive)
   }
 
+  /// HTTP forward 向客户端写入完成后才读取下一批目标响应。
   func testHTTPForwardWaitsForProxyWriteBeforeReadingNextTargetBatch() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -321,15 +307,9 @@ final class HttpForwardConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )

@@ -33,24 +33,19 @@ final class MagentTCPConnectionTests: XCTestCase {
   }
 }
 
+/// 创建无代理节点和 DNS 配置的协议探测测试 Channel。
 func makeConnectionChannel() throws -> EmbeddedChannel {
   let channel = EmbeddedChannel()
-  let defaultNode = ProxyNode(
-    address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-    cipher: .aes256Gcm,
-    password: "test"
-  )
   let core = try MagentCore(
     defaultDecision: .direct,
-    defaultProxyNode: defaultNode,
-    enableMatchTable: true,
+    proxyNodes: [],
     defaultTimeout: 10_000,
     rules: []
   )
   let shutdownPromise = channel.eventLoop.makePromise(of: Void.self)
   try channel.pipeline.addHandler(
     MagentTCPConnection(
-      channel, core: core, dnsServers: [], shutdownFuture: shutdownPromise.futureResult)
+      channel, core: core, dnsAddress: nil, shutdownFuture: shutdownPromise.futureResult)
   ).wait()
   return channel
 }
@@ -319,10 +314,11 @@ func readOutboundData(from channel: EmbeddedChannel) throws -> Data? {
   return Data(buffer.readableBytesView)
 }
 
+/// 绑定测试代理 listener，并向 accepted Channel 传入路由、DNS 与关闭通知。
 func bindTCPProxy(
   group: EventLoopGroup,
   core: MagentCore,
-  dnsServers: [SocketAddress] = [],
+  dnsAddress: SocketAddress? = nil,
   shutdownFuture: EventLoopFuture<Void>,
   configurePipeline: @escaping @Sendable (Channel) -> EventLoopFuture<Void> = {
     $0.eventLoop.makeSucceededFuture(())
@@ -338,7 +334,7 @@ func bindTCPProxy(
           MagentTCPConnection(
             channel,
             core: core,
-            dnsServers: dnsServers,
+            dnsAddress: dnsAddress,
             shutdownFuture: shutdownFuture
           )
         )

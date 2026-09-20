@@ -42,6 +42,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertFalse(channel.isActive)
   }
 
+  /// SOCKS5 直连建立后只发送一次成功响应。
   func testMagentTCPConnectionEstablishesSOCKS5DirectConnectOnce() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -62,15 +63,9 @@ final class Socks5ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -108,6 +103,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertTrue(targetChannel.isActive)
   }
 
+  /// SOCKS5 隧道两个方向均等待上一批写入完成。
   func testSOCKS5TCPUsesStrictBackpressureInBothDirections() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -148,15 +144,9 @@ final class Socks5ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -218,6 +208,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertEqual(try manualReads.deliveredCount().wait(), 4)
   }
 
+  /// SOCKS5 客户端半关闭前的数据必须先于下游 FIN 转发。
   func testSOCKS5TCPProxyHalfCloseForwardsFinalPayloadBeforeWireFIN() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -247,15 +238,9 @@ final class Socks5ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -300,6 +285,7 @@ final class Socks5ConnectionTests: XCTestCase {
       try wirePayloadPromise.futureResult.wait().suffix(wirePayload.count), wirePayload)
   }
 
+  /// SOCKS5 下游半关闭后保留另一方向的转发。
   func testSOCKS5TCPWireHalfCloseKeepsProxyToWireDirectionOpen() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -328,15 +314,9 @@ final class Socks5ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -384,6 +364,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertEqual(try targetPayloadPromise.futureResult.wait(), proxyPayload)
   }
 
+  /// SOCKS5 建连期间收到半关闭时等待隧道建立后再传播。
   func testSOCKS5TCPDefersProxyHalfCloseUntilTunnelIsEstablished() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -407,15 +388,9 @@ final class Socks5ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -453,6 +428,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertEqual(try responsePromise.futureResult.wait().suffix(wirePayload.count), wirePayload)
   }
 
+  /// 当前 IPv4 UDP relay 必须拒绝 IPv6 control connection 的 association。
   func testSOCKS5UDPAssociateRejectsIPv6ControlBecauseRelayIsIPv4() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -463,15 +439,9 @@ final class Socks5ConnectionTests: XCTestCase {
       shutdownTestChannels(channels, group: group)
     }
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -486,7 +456,7 @@ final class Socks5ConnectionTests: XCTestCase {
             MagentTCPConnection(
               channel,
               core: core,
-              dnsServers: [],
+              dnsAddress: nil,
               shutdownFuture: shutdownPromise.futureResult
             )
           )
@@ -525,6 +495,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertFalse(client.isActive)
   }
 
+  /// 通过节点列表选中的 Shadowsocks Wire 建立 SOCKS5 隧道。
   func testMagentTCPConnectionWritesShadowsocksHandshakeAndEstablishesSOCKS5Connect() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -562,8 +533,7 @@ final class Socks5ConnectionTests: XCTestCase {
     )
     let core = try MagentCore(
       defaultDecision: .proxy(defaultNode.id),
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [defaultNode],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -596,6 +566,7 @@ final class Socks5ConnectionTests: XCTestCase {
     channels.append(try proxyNodeAcceptedPromise.futureResult.wait())
   }
 
+  /// SOCKS5 直连迟到完成时不得重复发送失败响应。
   func testMagentTCPConnectionSendsSingleSOCKS5FailureWhenDirectConnectCompletesLate() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -623,15 +594,9 @@ final class Socks5ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -689,6 +654,7 @@ final class Socks5ConnectionTests: XCTestCase {
 }
 
 extension Socks5ConnectionTests {
+  /// 无 DNS 配置时仍可直连 UDP IP 目标，畸形数据包经 control connection 统一报错。
   func testSOCKS5UDPDirectDataPlaneRoundTripsAndRoutesMalformedPacketToControlErrorChain() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -707,12 +673,7 @@ extension Socks5ConnectionTests {
       writeTestDatagram(envelope, through: context)
     }
     channels.append(targetServer)
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
-    let core = try makeUDPTestCore(decision: .direct, node: defaultNode)
+    let core = try makeUDPTestCore(decision: .direct, nodes: [])
     let association = try establishSOCKS5UDPAssociation(
       group: group,
       core: core,
@@ -743,6 +704,39 @@ extension Socks5ConnectionTests {
     wait(for: [controlClosed], timeout: 2)
   }
 
+  /// 缺少 DNS 地址时拒绝 UDP 直连域名，并通过 control connection 关闭整个 association。
+  func testSOCKS5UDPDirectDomainRejectsMissingDNSAddress() throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let eventLoop = group.next()
+    let shutdownPromise = eventLoop.makePromise(of: Void.self)
+    var channels: [Channel] = []
+    defer {
+      shutdownPromise.succeed(())
+      shutdownTestChannels(channels, group: group)
+    }
+    let core = try makeUDPTestCore(decision: .direct, nodes: [])
+    let association = try establishSOCKS5UDPAssociation(
+      group: group,
+      core: core,
+      dnsAddress: nil,
+      shutdownFuture: shutdownPromise.futureResult,
+      channels: &channels
+    )
+    let udpClient = try bindTestDatagram(group: group) { _, _ in
+      XCTFail("A direct domain without DNS must not produce a UDP response")
+    }
+    channels.append(udpClient)
+    let controlClosed = expectation(description: "missing DNS closes the control connection")
+    association.controlChannel.closeFuture.whenComplete { _ in
+      controlClosed.fulfill()
+    }
+    let target = NetworkAddress.domain("udp.test.invalid", port: 5353)
+    let request = Data([0x00, 0x00, 0x00]) + Socks5Connection.addressBytes(of: target) + Data([1])
+    try writeDatagram(request, from: udpClient, to: association.relayAddress)
+    wait(for: [controlClosed], timeout: 2)
+  }
+
+  /// UDP 直连域名通过单个配置 DNS 解析并完成往返传输。
   func testSOCKS5UDPDirectDomainUsesConfiguredRemoteDNS() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -771,16 +765,11 @@ extension Socks5ConnectionTests {
       writeTestDatagram(envelope, through: context)
     }
     channels.append(targetServer)
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
-    let core = try makeUDPTestCore(decision: .direct, node: defaultNode)
+    let core = try makeUDPTestCore(decision: .direct, nodes: [])
     let association = try establishSOCKS5UDPAssociation(
       group: group,
       core: core,
-      dnsServers: [try XCTUnwrap(dnsServer.localAddress)],
+      dnsAddress: try XCTUnwrap(dnsServer.localAddress),
       shutdownFuture: shutdownPromise.futureResult,
       channels: &channels
     )
@@ -805,6 +794,7 @@ extension Socks5ConnectionTests {
     XCTAssertTrue(association.controlChannel.isActive)
   }
 
+  /// IPv4 SOCKS5 relay 使用 IPv6 下游 Channel 访问 IPv6 目标。
   func testSOCKS5UDPIPv4RelayUsesIPv6ChannelForIPv6Target() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -828,12 +818,7 @@ extension Socks5ConnectionTests {
       throw XCTSkip("IPv6 loopback is unavailable: \(error)")
     }
     channels.append(targetServer)
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
-    let core = try makeUDPTestCore(decision: .direct, node: defaultNode)
+    let core = try makeUDPTestCore(decision: .direct, nodes: [])
     let association = try establishSOCKS5UDPAssociation(
       group: group,
       core: core,
@@ -855,6 +840,7 @@ extension Socks5ConnectionTests {
     XCTAssertTrue(association.controlChannel.isActive)
   }
 
+  /// UDP 代理域名无需本地 DNS，按节点 Wire 加密请求并解密回包。
   func testSOCKS5UDPShadowsocksDataPlaneEncryptsRoutesAndDecryptsResponse() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -890,7 +876,7 @@ extension Socks5ConnectionTests {
     channels.append(shadowsocksServer)
     let nodeAddress = try XCTUnwrap(shadowsocksServer.localAddress)
     let proxyNode = ProxyNode(address: nodeAddress, cipher: cipher, password: password)
-    let core = try makeUDPTestCore(decision: .proxy(proxyNode.id), node: proxyNode)
+    let core = try makeUDPTestCore(decision: .proxy(proxyNode.id), nodes: [proxyNode])
     let association = try establishSOCKS5UDPAssociation(
       group: group,
       core: core,
@@ -921,17 +907,18 @@ extension Socks5ConnectionTests {
 }
 
 extension Socks5ConnectionTests {
+  /// 按生产握手流程创建独占 UDP association，并记录待清理的 Channel。
   fileprivate func establishSOCKS5UDPAssociation(
     group: EventLoopGroup,
     core: MagentCore,
-    dnsServers: [SocketAddress] = [],
+    dnsAddress: SocketAddress? = nil,
     shutdownFuture: EventLoopFuture<Void>,
     channels: inout [Channel]
   ) throws -> (controlChannel: Channel, relayAddress: SocketAddress) {
     let proxyServer = try bindTCPProxy(
       group: group,
       core: core,
-      dnsServers: dnsServers,
+      dnsAddress: dnsAddress,
       shutdownFuture: shutdownFuture
     )
     channels.append(proxyServer)
@@ -961,11 +948,11 @@ extension Socks5ConnectionTests {
     return (client, try SocketAddress(ipAddress: "127.0.0.1", port: port))
   }
 
-  fileprivate func makeUDPTestCore(decision: Decision, node: ProxyNode) throws -> MagentCore {
+  /// 通过指定决策和完整节点列表创建 UDP 路由测试的 Core。
+  fileprivate func makeUDPTestCore(decision: Decision, nodes: [ProxyNode]) throws -> MagentCore {
     return try MagentCore(
       defaultDecision: decision,
-      defaultProxyNode: node,
-      enableMatchTable: false,
+      proxyNodes: nodes,
       defaultTimeout: 10_000,
       rules: []
     )

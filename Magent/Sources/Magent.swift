@@ -5,51 +5,8 @@
 //  Created by MarlinL on 2026/7/14.
 //
 
-import Atomics
 import NIOCore
 import NIOPosix
-
-/// 跨运行周期统计当前 `Magent` 实例仍持有的 accepted TCP connections。
-///
-/// restart 会在旧 connections 异步关闭期间启动新 listener，因此计数器由服务实例共享，
-/// 而不是由单次 runtime 持有。每个成功获取的额度只通过对应 Channel 的 `closeFuture` 归还。
-internal final class AcceptedConnectionCounter: @unchecked Sendable {
-  private let count = ManagedAtomic<Int>(0)
-
-  /// 在不超过 `maximum` 的前提下原子增加当前连接数。
-  internal func tryAcquire(maximum: Int) -> Bool {
-    var current = count.load(ordering: .acquiring)
-    while current < maximum {
-      let result = count.compareExchange(
-        expected: current,
-        desired: current + 1,
-        ordering: .acquiringAndReleasing
-      )
-      if result.exchanged {
-        return true
-      }
-      current = result.original
-    }
-    return false
-  }
-
-  /// 归还一个已经成功获取的连接额度。
-  internal func release() {
-    var current = count.load(ordering: .acquiring)
-    while true {
-      precondition(current > 0, "accepted connection counter underflow")
-      let result = count.compareExchange(
-        expected: current,
-        desired: current - 1,
-        ordering: .acquiringAndReleasing
-      )
-      if result.exchanged {
-        return
-      }
-      current = result.original
-    }
-  }
-}
 
 /// Magent 代理服务的启动配置。
 public struct MagentConfig: Sendable {
@@ -57,36 +14,30 @@ public struct MagentConfig: Sendable {
   /// 本地 TCP listener 的绑定地址。
   public let address: NetworkAddress
 
-  /// 当前 `Magent` 实例允许同时持有的 accepted TCP connection 总数；默认 256。
-  ///
-  /// 超出额度的 child Channel 会在安装代理 handler 前立即关闭。
-  public let maxAcceptedConnections: Int
-
   /// 直连 TCP channel 和远端 DNS 查询的默认超时时间（毫秒）。
   public let defaultTimeout: Int64
 
-  /// SOCKS5 UDP 直连域名目标使用的远端 DNS 服务器；空数组表示不允许解析直连域名。
-  public let dnsServers: [SocketAddress]
+  /// SOCKS5 UDP 直连域名使用的 DNS 地址；nil 表示不支持 UDP 直连域名解析。
+  public let dnsAddress: SocketAddress?
 
+  /// 规则未命中时采用的路由决策。
   public let defaultDecision: Decision
-  public let defaultProxyNode: ProxyNode
-  public let enableMatchTable: Bool
+
+  /// 本次运行参与匹配的规则；空数组表示所有目标使用默认决策。
   public var rules: [ProxyRule]
+
+  /// 所有可用代理节点，包含默认决策和规则引用的节点。
   public var proxyNodes: [ProxyNode]
 
+  /// 创建监听、路由和 DNS 配置；服务不设置已接入连接数上限。
   public init(
-    address: NetworkAddress, defaultDecision: Decision, defaultProxyNode: ProxyNode,
-    enableMatchTable: Bool, maxAcceptedConnections: Int = 256,
-    defaultTimeout: Int64 = 10_000, rules: [ProxyRule] = [],
-    proxyNodes: [ProxyNode] = [], dnsServers: [SocketAddress] = []
+    address: NetworkAddress, defaultDecision: Decision = .direct, rules: [ProxyRule] = [],
+    proxyNodes: [ProxyNode] = [], defaultTimeout: Int64 = 10_000, dnsAddress: SocketAddress? = nil
   ) {
     self.address = address
-    self.maxAcceptedConnections = maxAcceptedConnections
     self.defaultTimeout = defaultTimeout
-    self.dnsServers = dnsServers
+    self.dnsAddress = dnsAddress
     self.defaultDecision = defaultDecision
-    self.defaultProxyNode = defaultProxyNode
-    self.enableMatchTable = enableMatchTable
     self.rules = rules
     self.proxyNodes = proxyNodes
   }
@@ -106,7 +57,6 @@ public actor Magent {
 
   private var state = State.stop
   private let group: MultiThreadedEventLoopGroup
-  private let acceptedConnections = AcceptedConnectionCounter()
 
   /// 使用指定配置创建尚未启动的本地代理服务，并初始化该服务实例独有的 Core。
   public init(threadNumber: Int = System.coreCount) {
@@ -180,12 +130,11 @@ public actor Magent {
     }
   }
 
+  /// 创建 listener，为每条接入连接安装协议 handler，并在安装失败时关闭该连接。
   private func createTCPServerChannel(
     _ config: MagentConfig, core: MagentCore,
     shutdownFuture: EventLoopFuture<Void>
   ) throws -> Channel {
-    let acceptedConnections = acceptedConnections
-    let maxAcceptedConnections = config.maxAcceptedConnections
     return try ServerBootstrap(group: group)
       .serverChannelOption(ChannelOptions.backlog, value: 256)
       .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
@@ -193,17 +142,11 @@ public actor Magent {
       .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
       .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
       .childChannelInitializer { channel in
-        guard acceptedConnections.tryAcquire(maximum: maxAcceptedConnections) else {
-          return channel.close()
-        }
-        channel.closeFuture.whenComplete { _ in
-          acceptedConnections.release()
-        }
         let initialization = channel.pipeline.addHandler(
           MagentTCPConnection(
             channel,
             core: core,
-            dnsServers: config.dnsServers,
+            dnsAddress: config.dnsAddress,
             shutdownFuture: shutdownFuture
           )
         )
@@ -216,6 +159,7 @@ public actor Magent {
       .wait()
   }
 
+  /// 在创建运行周期前校验监听地址、超时和 DNS 服务器配置。
   private func validate(_ config: MagentConfig) throws {
     guard !config.address.host.isEmpty, (1...65_535).contains(config.address.port) else {
       throw MagentError.invalidAddress("invalid Magent listen address")
@@ -223,29 +167,24 @@ public actor Magent {
     guard config.defaultTimeout > 0 else {
       throw MagentError.invalidOptions("default timeout must be greater than zero")
     }
-    guard config.maxAcceptedConnections > 0 else {
-      throw MagentError.invalidOptions("maximum accepted connections must be greater than zero")
-    }
-    for dnsServer in config.dnsServers {
-      guard dnsServer.port.map({ (1...65_535).contains($0) }) == true else {
+    if let dnsAddress = config.dnsAddress {
+      guard dnsAddress.port.map({ (1...65_535).contains($0) }) == true else {
         throw MagentError.invalidAddress("invalid DNS server address")
       }
-      if case .unixDomainSocket = dnsServer {
+      if case .unixDomainSocket = dnsAddress {
         throw MagentError.invalidAddress("DNS server must be an IPv4 or IPv6 address")
       }
     }
   }
 
+  /// 根据本次运行的规则与完整节点列表创建独立的 Core。
   private func makeCore(_ config: MagentConfig) throws -> MagentCore {
-    let core = try MagentCore(
+    try MagentCore(
       defaultDecision: config.defaultDecision,
-      defaultProxyNode: config.defaultProxyNode,
-      enableMatchTable: config.enableMatchTable,
+      proxyNodes: config.proxyNodes,
       defaultTimeout: config.defaultTimeout,
       rules: config.rules
     )
-    try core.putAllProxyNodes(config.proxyNodes)
-    return core
   }
 
   private func shutdown(keepEventLoopGroup: Bool, tcpChannel: Channel?) throws {

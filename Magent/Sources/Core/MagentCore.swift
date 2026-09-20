@@ -8,7 +8,6 @@ import NIOPosix
 internal final class MagentCore: @unchecked Sendable {
 
   private let defaultDecision: Decision
-  private let enableMatchTable: Bool
   private let routeCache: MagentCache<Decision>
   private let router: MagentRouter
   internal let defaultTimeout: Int64
@@ -18,19 +17,19 @@ internal final class MagentCore: @unchecked Sendable {
   private var addressNodes: [SocketAddress: UUID]
   private var udpWires: [UUID: Wire]
 
+  /// 装载当前运行周期的完整节点和规则；没有规则时不缓存默认决策。
   internal init(
-    defaultDecision: Decision, defaultProxyNode: ProxyNode, enableMatchTable: Bool,
+    defaultDecision: Decision, proxyNodes: [ProxyNode],
     defaultTimeout: Int64, rules: [ProxyRule]
   ) throws {
     self.defaultDecision = defaultDecision
-    self.enableMatchTable = enableMatchTable
-    self.routeCache = MagentCache(capacity: enableMatchTable ? 4096 : 0)
+    self.routeCache = MagentCache(capacity: rules.isEmpty ? 0 : 4096)
     self.router = try MagentRouter(rules)
     self.defaultTimeout = defaultTimeout
     self.nodes = [:]
     self.addressNodes = [:]
     self.udpWires = [:]
-    try putProxyNode(defaultProxyNode)
+    try putAllProxyNodes(proxyNodes)
   }
 
   /// 根据代理节点类型创建对应的 UDP Wire；创建失败时原样向上抛出异常。
@@ -75,7 +74,7 @@ internal final class MagentCore: @unchecked Sendable {
     udpWires[node.id] = udpWire
   }
 
-  /// 返回目标地址的路由决策。
+  /// 返回规则匹配结果，规则为空或未命中时使用默认决策。
   private func routeDecision(_ address: NetworkAddress) -> Decision {
     let key = Self.routeCacheKey(address)
     if let decision = routeCache.get(key) {
@@ -83,9 +82,6 @@ internal final class MagentCore: @unchecked Sendable {
     }
 
     return routeCache.getOrLoad(key) { _ in
-      guard enableMatchTable else {
-        return defaultDecision
-      }
       return router.match(address) ?? defaultDecision
     }
   }
@@ -94,7 +90,7 @@ internal final class MagentCore: @unchecked Sendable {
   ///
   /// 路由决策按地址类型和 host/IP 缓存。
   /// 当前规则不匹配端口，因此 cache key 不包含端口。
-  /// 未启用匹配表或没有规则命中时，使用初始化时传入的默认决策。
+  /// 规则为空或没有规则命中时，使用初始化时传入的默认决策。
   internal func routeTCPWire(_ address: NetworkAddress) throws -> Wire? {
     let decision = routeDecision(address)
     switch decision {

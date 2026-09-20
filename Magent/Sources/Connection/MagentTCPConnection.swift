@@ -134,18 +134,19 @@ internal final class MagentTCPConnection: ChannelInboundHandler, @unchecked Send
 
   private let serverChannel: Channel
   private let core: MagentCore
-  private let dnsServers: [SocketAddress]
+  private let dnsAddress: SocketAddress?
   private var detectBuffer: ByteBuffer
   private var state: State = .detecting
   private var proxyConnection: ProxyConnection?
 
+  /// 持有 accepted Channel 的协议探测状态，并订阅所属运行周期的关闭通知。
   internal init(
-    _ serverChannel: Channel, core: MagentCore, dnsServers: [SocketAddress],
+    _ serverChannel: Channel, core: MagentCore, dnsAddress: SocketAddress?,
     shutdownFuture: EventLoopFuture<Void>
   ) {
     self.serverChannel = serverChannel
     self.core = core
-    self.dnsServers = dnsServers
+    self.dnsAddress = dnsAddress
     self.detectBuffer = serverChannel.allocator.buffer(capacity: 0)
     shutdownFuture.whenComplete { [weak serverChannel] _ in
       serverChannel?.close(promise: nil)
@@ -222,6 +223,7 @@ internal final class MagentTCPConnection: ChannelInboundHandler, @unchecked Send
     ProxyProbe.detect(Data(detectBuffer.readableBytesView))
   }
 
+  /// 根据探测结果安装唯一的协议连接，并把已接收字节交给该连接处理。
   private func installProxyConnection(_ proxy: ProxyProbe, context: ChannelHandlerContext) {
     switch proxy {
     case .socks4:
@@ -234,7 +236,7 @@ internal final class MagentTCPConnection: ChannelInboundHandler, @unchecked Send
       connection.upstream(context: context, data: NIOAny(initialData))
     case .socks5:
       let connection = Socks5Connection(
-        proxyChannel: serverChannel, core: core, dnsServers: dnsServers)
+        proxyChannel: serverChannel, core: core, dnsAddress: dnsAddress)
       proxyConnection = connection
       state = .active
 

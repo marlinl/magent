@@ -8,57 +8,8 @@ import XCTest
 
 /// `Magent` 启动、重启和关闭生命周期测试。
 final class MagentTests: XCTestCase {
-  /// 原子额度在并发竞争下不能超过上限，归还后必须可以完整复用。
-  func testAcceptedConnectionCounterEnforcesLimitAndReusesCapacity() async {
-    let counter = AcceptedConnectionCounter()
-    let maximum = 8
-    let acquired = await withTaskGroup(of: Bool.self, returning: Int.self) { group in
-      for _ in 0..<128 {
-        group.addTask {
-          counter.tryAcquire(maximum: maximum)
-        }
-      }
-
-      var count = 0
-      for await result in group where result {
-        count += 1
-      }
-      return count
-    }
-
-    XCTAssertEqual(acquired, maximum)
-    XCTAssertFalse(counter.tryAcquire(maximum: maximum))
-
-    for _ in 0..<acquired {
-      counter.release()
-    }
-    for _ in 0..<maximum {
-      XCTAssertTrue(counter.tryAcquire(maximum: maximum))
-    }
-    XCTAssertFalse(counter.tryAcquire(maximum: maximum))
-    for _ in 0..<maximum {
-      counter.release()
-    }
-  }
-
-  /// 未显式配置时使用 256 条 accepted connections。
-  func testMagentConfigDefaultsAcceptedConnectionLimit() throws {
-    let config = MagentConfig(
-      address: .domain("127.0.0.1", port: 1080),
-      defaultDecision: .direct,
-      defaultProxyNode: ProxyNode(
-        address: try SocketAddress(ipAddress: "192.0.2.31", port: 8388),
-        cipher: .aes256Gcm,
-        password: "test"
-      ),
-      enableMatchTable: false
-    )
-
-    XCTAssertEqual(config.maxAcceptedConnections, 256)
-  }
-
-  /// accepted connection 达到上限后立即关闭新 Channel；已有 Channel 结束和 restart 后额度均可复用。
-  func testMagentLimitsAcceptedConnectionsAcrossRestart() async throws {
+  /// 超过原 256 条上限的连接仍可握手，restart 和 close 必须关闭所属运行周期的连接。
+  func testMagentAcceptsMoreThan256ConnectionsAcrossRestart() async throws {
     let supportGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let portProbe = try await ServerBootstrap(group: supportGroup)
       .childChannelInitializer { channel in channel.pipeline.addHandler(TestInboundHandler()) }
@@ -67,85 +18,33 @@ final class MagentTests: XCTestCase {
     let port = try XCTUnwrap(portProbe.localAddress?.port)
     try await portProbe.close().get()
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.31", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
+    let config = MagentConfig(
+      address: .domain("127.0.0.1", port: port)
     )
-    let config: (Int) -> MagentConfig = { maximum in
-      MagentConfig(
-        address: .domain("127.0.0.1", port: port),
-        defaultDecision: .direct,
-        defaultProxyNode: defaultNode,
-        enableMatchTable: false,
-        maxAcceptedConnections: maximum
-      )
-    }
-
     let magent = Magent(threadNumber: 2)
     var clients: [Channel] = []
     var testError: Error?
 
     do {
-      do {
-        try await magent.start(config(0))
-        XCTFail("start should reject a non-positive accepted connection limit")
-      } catch {
-        XCTAssertEqual(
-          error as? MagentError,
-          .invalidOptions("maximum accepted connections must be greater than zero")
-        )
+      try await magent.start(config)
+
+      for _ in 0..<257 {
+        let (client, greeting) = try await connectSOCKS5Client(group: supportGroup, port: port)
+        clients.append(client)
+        let greetingData = try await greeting.get()
+        XCTAssertEqual(greetingData, Data([0x05, 0x00]))
       }
+      XCTAssertTrue(clients.allSatisfy { $0.isActive })
 
-      try await magent.start(config(1))
-
-      let (firstClient, firstGreeting) = try await connectSOCKS5Client(
-        group: supportGroup,
-        port: port
-      )
-      clients.append(firstClient)
-      let firstGreetingData = try await firstGreeting.get()
-      XCTAssertEqual(firstGreetingData, Data([0x05, 0x00]))
-
-      do {
-        let rejectedClient = try await ClientBootstrap(group: supportGroup)
-          .connect(host: "127.0.0.1", port: port)
-          .get()
-        clients.append(rejectedClient)
-        let rejectedClosed = expectation(description: "connection above the limit is closed")
-        rejectedClient.closeFuture.whenComplete { _ in
-          rejectedClosed.fulfill()
+      let oldRuntimeClosed = expectation(description: "restart closes all old runtime connections")
+      oldRuntimeClosed.expectedFulfillmentCount = clients.count
+      for client in clients {
+        client.closeFuture.whenComplete { _ in
+          oldRuntimeClosed.fulfill()
         }
-        try? await writeData(Data([0x05, 0x01, 0x00]), to: rejectedClient)
-        await fulfillment(of: [rejectedClosed], timeout: 2)
-      } catch {
-        // listener 可以在 connect Future 完成前关闭超额 Channel；这同样是正确的拒绝结果。
       }
-
-      let firstClosed = expectation(description: "first accepted connection is closed")
-      firstClient.closeFuture.whenComplete { _ in
-        firstClosed.fulfill()
-      }
-      try await writeData(
-        Data([0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0, 80]),
-        to: firstClient
-      )
-      await fulfillment(of: [firstClosed], timeout: 2)
-
-      let (reusedClient, reusedGreeting) = try await connectSOCKS5Client(
-        group: supportGroup,
-        port: port
-      )
-      clients.append(reusedClient)
-      let reusedGreetingData = try await reusedGreeting.get()
-      XCTAssertEqual(reusedGreetingData, Data([0x05, 0x00]))
-
-      let oldRuntimeClosed = expectation(description: "restart closes the old runtime connection")
-      reusedClient.closeFuture.whenComplete { _ in
-        oldRuntimeClosed.fulfill()
-      }
-      try await magent.restart(config(1))
-      await fulfillment(of: [oldRuntimeClosed], timeout: 2)
+      try await magent.restart(config)
+      await fulfillment(of: [oldRuntimeClosed], timeout: 5)
 
       let (restartedClient, restartedGreeting) = try await connectSOCKS5Client(
         group: supportGroup,
@@ -155,7 +54,12 @@ final class MagentTests: XCTestCase {
       let restartedGreetingData = try await restartedGreeting.get()
       XCTAssertEqual(restartedGreetingData, Data([0x05, 0x00]))
 
+      let currentRuntimeClosed = expectation(description: "close ends the current runtime connection")
+      restartedClient.closeFuture.whenComplete { _ in
+        currentRuntimeClosed.fulfill()
+      }
       try await magent.close()
+      await fulfillment(of: [currentRuntimeClosed], timeout: 5)
     } catch {
       try? await magent.close()
       testError = error
@@ -174,17 +78,9 @@ final class MagentTests: XCTestCase {
   func testMagentCanStartAfterRestartTCPBindFailureAndIgnoresUDPPortOccupancy() async throws {
     let supportGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     var supportChannels: [Channel] = []
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.31", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let config: (Int) -> MagentConfig = { port in
       MagentConfig(
-        address: .domain("127.0.0.1", port: port),
-        defaultDecision: .direct,
-        defaultProxyNode: defaultNode,
-        enableMatchTable: false
+        address: .domain("127.0.0.1", port: port)
       )
     }
     let magent = Magent(threadNumber: 1)

@@ -19,10 +19,10 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
     typealias InboundIn = AddressedEnvelope<ByteBuffer>
 
     private weak var connection: Socks5Connection?
-    private let dnsServers: [SocketAddress]
+    private let dnsAddress: SocketAddress?
     private var wireV4Channel: Channel?
     private var wireV6Channel: Channel?
-    private var dnsClients: [DNSClient] = []
+    private var dnsClient: DNSClient?
     private var sourceAddress: SocketAddress?
     /// 直连域名 B 在当前 control connection 内解析出的最终远端地址。
     private var resolvedAddressMap: [NetworkAddress: SocketAddress] = [:]
@@ -31,42 +31,35 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
     /// value 为 `nil` 表示直连 B，非空表示向代理节点 C 收发时使用的 Wire。
     private var wireMap: [SocketAddress: Wire?] = [:]
 
-    init(_ connection: Socks5Connection, dnsServers: [SocketAddress]) {
+    /// 让 UDP association 及其 DNS client 随所属 TCP control connection 关闭。
+    init(_ connection: Socks5Connection, dnsAddress: SocketAddress?) {
       self.connection = connection
-      self.dnsServers = dnsServers
+      self.dnsAddress = dnsAddress
       connection.proxyChannel.closeFuture.whenComplete { [weak self] _ in
         self?.closeUDPResources()
       }
     }
 
-    /// 安装 association 的两个数据 Channel，并在同一 EventLoop 上创建远端 DNS clients。
+    /// 安装 association 的数据 Channel，并按配置在同一 EventLoop 上创建一个 DNS client。
     fileprivate func installChannels(v4Channel: Channel, v6Channel: Channel) -> EventLoopFuture<
       Void
     > {
       wireV4Channel = v4Channel
       wireV6Channel = v6Channel
-      let clients = dnsServers.map {
-        DNSClient.connect(on: v4Channel.eventLoop, config: [$0])
+      guard let dnsAddress else {
+        return v4Channel.eventLoop.makeSucceededFuture(())
       }
-      return EventLoopFuture.whenAllComplete(clients, on: v4Channel.eventLoop).flatMapThrowing {
-        results in
-        var connectedClients: [DNSClient] = []
-        var connectionError: Error?
-        for result in results {
-          switch result {
-          case .success(let client):
-            connectedClients.append(client)
-          case .failure(let error):
-            connectionError = connectionError ?? error
-          }
+      return DNSClient.connect(on: v4Channel.eventLoop, config: [dnsAddress]).flatMapThrowing {
+        client in
+        // control connection 可能在 DNS Channel 创建期间关闭，迟到的 client 必须立即回收。
+        guard let connection = self.connection,
+          connection.state != .closed,
+          connection.proxyChannel.isActive
+        else {
+          _ = client.close()
+          throw MagentError.connectionClosed
         }
-        if let connectionError {
-          for client in connectedClients {
-            _ = client.close()
-          }
-          throw connectionError
-        }
-        self.dnsClients = connectedClients
+        self.dnsClient = client
       }
     }
 
@@ -225,7 +218,7 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
       return wireV4Channel.writeAndFlush(responseEnvelope)
     }
 
-    /// IP 目标直接构造 SocketAddress；域名目标只通过配置的远端 DNS 异步解析。
+    /// IP 目标直接构造 SocketAddress；域名通过配置的单个 DNS 解析，查询错误原样向上传播。
     private func resolveTargetAddress(_ targetAddress: NetworkAddress) throws -> EventLoopFuture<
       SocketAddress
     > {
@@ -234,72 +227,53 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
       }
       switch targetAddress {
       case .ipv4, .ipv6:
-        do {
-          return connection.proxyChannel.eventLoop.makeSucceededFuture(
-            try targetAddress.socketAddress())
-        } catch {
-          return connection.proxyChannel.eventLoop.makeFailedFuture(error)
-        }
+        return connection.proxyChannel.eventLoop.makeSucceededFuture(
+          try targetAddress.socketAddress())
       case .domain(let host, let port):
         if let cachedAddress = resolvedAddressMap[targetAddress] {
           return connection.proxyChannel.eventLoop.makeSucceededFuture(cachedAddress)
         }
-        guard !dnsClients.isEmpty else {
+        guard let dnsClient else {
           return connection.proxyChannel.eventLoop.makeFailedFuture(
-            MagentError.invalidOptions("DNS servers are required for direct UDP domain targets")
+            MagentError.invalidOptions("A DNS address is required for direct UDP domain targets")
           )
         }
 
-        @Sendable
-        func query(_ index: Int) -> EventLoopFuture<SocketAddress> {
-          guard index < dnsClients.count else {
-            return connection.proxyChannel.eventLoop.makeFailedFuture(
-              MagentError.invalidAddress("DNS returned no address for \(host)")
-            )
-          }
-          let client = dnsClients[index]
-          let timeout = TimeAmount.milliseconds(connection.core.defaultTimeout)
-          let ipv4Query = client.sendQuery(forHost: host, type: .a, timeout: timeout).map {
-            message in
-            message.answers.compactMap { answer -> SocketAddress? in
-              guard case .a(let record) = answer else {
-                return nil
-              }
-              return try? SocketAddress(ipAddress: record.resource.stringAddress, port: port)
+        let timeout = TimeAmount.milliseconds(connection.core.defaultTimeout)
+        let ipv4Query = dnsClient.sendQuery(forHost: host, type: .a, timeout: timeout).map {
+          message in
+          message.answers.compactMap { answer -> SocketAddress? in
+            guard case .a(let record) = answer else {
+              return nil
             }
+            return try? SocketAddress(ipAddress: record.resource.stringAddress, port: port)
           }
-          let ipv6Query = client.sendQuery(forHost: host, type: .aaaa, timeout: timeout).map {
-            message in
-            message.answers.compactMap { answer -> SocketAddress? in
-              guard case .aaaa(let record) = answer else {
-                return nil
-              }
-              return try? SocketAddress(ipAddress: record.resource.stringAddress, port: port)
-            }
-          }
-          return
-            ipv4Query
-            .and(ipv6Query)
-            .flatMapThrowing { ipv4Addresses, ipv6Addresses in
-              guard let address = ipv4Addresses.first ?? ipv6Addresses.first else {
-                throw MagentError.invalidAddress("DNS returned no address for \(host)")
-              }
-              self.resolvedAddressMap[targetAddress] = address
-              return address
-            }
-            .flatMapError { _ in query(index + 1) }
         }
-        return query(0)
+        let ipv6Query = dnsClient.sendQuery(forHost: host, type: .aaaa, timeout: timeout).map {
+          message in
+          message.answers.compactMap { answer -> SocketAddress? in
+            guard case .aaaa(let record) = answer else {
+              return nil
+            }
+            return try? SocketAddress(ipAddress: record.resource.stringAddress, port: port)
+          }
+        }
+        return ipv4Query.and(ipv6Query).flatMapThrowing { ipv4Addresses, ipv6Addresses in
+          guard let address = ipv4Addresses.first ?? ipv6Addresses.first else {
+            throw MagentError.invalidAddress("DNS returned no address for \(host)")
+          }
+          self.resolvedAddressMap[targetAddress] = address
+          return address
+        }
       }
     }
 
-    /// 关闭当前 UDP association 拥有的两个数据 Channel 和所有 DNS client Channel。
+    /// 关闭当前 UDP association 拥有的数据 Channel 和可选的 DNS client Channel。
     private func closeUDPResources() {
       wireV4Channel?.close(promise: nil)
       wireV6Channel?.close(promise: nil)
-      for dnsClient in dnsClients {
-        _ = dnsClient.close()
-      }
+      _ = dnsClient?.close()
+      dnsClient = nil
     }
   }
 
@@ -313,7 +287,7 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
 
   private let proxyChannel: Channel
   private let core: MagentCore
-  private let dnsServers: [SocketAddress]
+  private let dnsAddress: SocketAddress?
   private var wireChannel: Channel?
   private var state: State = .greeting
   private var wire: Wire?
@@ -323,10 +297,11 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
   private var isProxyInputClosed = false
   private let hasRespondedHandshake = ManagedAtomic(false)
 
-  internal init(proxyChannel: Channel, core: MagentCore, dnsServers: [SocketAddress]) {
+  /// 为 accepted Channel 创建 SOCKS5 握手状态，并保存 UDP 直连域名的可选 DNS 地址。
+  internal init(proxyChannel: Channel, core: MagentCore, dnsAddress: SocketAddress?) {
     self.proxyChannel = proxyChannel
     self.core = core
-    self.dnsServers = dnsServers
+    self.dnsAddress = dnsAddress
     self.requestBuffer = proxyChannel.allocator.buffer(capacity: 0)
   }
 }
@@ -632,6 +607,7 @@ extension Socks5Connection {
     }
   }
 
+  /// 为 control connection 创建 UDP relay，资源就绪后才发送成功响应并启动读取。
   private func installUDPAssociate() throws {
     guard let proxyAddress = proxyChannel.localAddress.flatMap(NetworkAddress.init) else {
       throw MagentError.invalidAddress("SOCKS5 TCP Channel has no local IP address")
@@ -641,7 +617,7 @@ extension Socks5Connection {
     }
     let v4BindAddress = try SocketAddress(ipAddress: "0.0.0.0", port: 0)
     let v6BindAddress = try SocketAddress(ipAddress: "::", port: 0)
-    let handler = Socks5UDPConnection(self, dnsServers: dnsServers)
+    let handler = Socks5UDPConnection(self, dnsAddress: dnsAddress)
     _ = core.createUDPClientChannel(
       group: proxyChannel.eventLoop,
       address: v4BindAddress,

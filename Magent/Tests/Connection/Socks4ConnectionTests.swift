@@ -22,6 +22,7 @@ final class Socks4ConnectionTests: XCTestCase {
     XCTAssertFalse(channel.isActive)
   }
 
+  /// 直连成功后只发送一次 SOCKS4 成功响应。
   func testMagentTCPConnectionGrantsSOCKS4DirectConnectOnce() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -42,15 +43,9 @@ final class Socks4ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -78,6 +73,7 @@ final class Socks4ConnectionTests: XCTestCase {
     XCTAssertTrue(targetChannel.isActive)
   }
 
+  /// 通过 SOCKS4a 域名请求建立直连并转发数据。
   func testMagentTCPConnectionConnectsSOCKS4aDomain() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -102,15 +98,9 @@ final class Socks4ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -140,6 +130,7 @@ final class Socks4ConnectionTests: XCTestCase {
     XCTAssertEqual(try targetPayloadPromise.futureResult.wait(), payload)
   }
 
+  /// SOCKS4 隧道两个方向均按手动读取许可转发。
   func testMagentTCPConnectionPullsSOCKS4TunnelInBothDirections() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -165,15 +156,9 @@ final class Socks4ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -210,6 +195,7 @@ final class Socks4ConnectionTests: XCTestCase {
     XCTAssertEqual(try tunnelPayloadPromise.futureResult.wait(), testSocks4Granted + wirePayload)
   }
 
+  /// 向客户端写入完成后才读取下一批 SOCKS4 下游数据。
   func testSOCKS4WaitsForProxyWriteFutureBeforeReadingNextWirePayload() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -239,15 +225,9 @@ final class Socks4ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -293,6 +273,7 @@ final class Socks4ConnectionTests: XCTestCase {
     XCTAssertEqual(try delayedWrites.writeCount().wait(), 3)
   }
 
+  /// 向下游写入完成后才读取下一批 SOCKS4 客户端数据。
   func testSOCKS4WaitsForWireWriteFutureBeforeReadingNextProxyPayload() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -324,15 +305,9 @@ final class Socks4ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -370,6 +345,7 @@ final class Socks4ConnectionTests: XCTestCase {
     XCTAssertEqual(try manualReads.deliveredCount().wait(), 3)
   }
 
+  /// SOCKS4 客户端半关闭前的最后一批数据必须先于下游 FIN 转发。
   func testSOCKS4ProxyHalfCloseForwardsFinalPayloadBeforeWireFIN() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -399,15 +375,9 @@ final class Socks4ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -450,6 +420,7 @@ final class Socks4ConnectionTests: XCTestCase {
     XCTAssertEqual(try responsePromise.futureResult.wait(), testSocks4Granted + wireResponse)
   }
 
+  /// SOCKS4 建连期间收到半关闭时等待隧道建立后再传播。
   func testSOCKS4DefersProxyHalfCloseUntilTunnelIsEstablished() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -473,15 +444,9 @@ final class Socks4ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -518,6 +483,7 @@ final class Socks4ConnectionTests: XCTestCase {
     XCTAssertEqual(try responsePromise.futureResult.wait(), testSocks4Granted + wireResponse)
   }
 
+  /// SOCKS4 下游半关闭后保留客户端向下游的写入方向。
   func testSOCKS4WireHalfCloseKeepsProxyToWireDirectionOpen() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -544,15 +510,9 @@ final class Socks4ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -590,6 +550,7 @@ final class Socks4ConnectionTests: XCTestCase {
     XCTAssertEqual(try targetPayloadPromise.futureResult.wait(), proxyPayload)
   }
 
+  /// SOCKS4 未完整握手便半关闭时回收连接。
   func testSOCKS4ClosesIncompleteRequestWhenProxyHalfCloses() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -600,15 +561,9 @@ final class Socks4ConnectionTests: XCTestCase {
       shutdownTestChannels(channels, group: group)
     }
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -634,6 +589,7 @@ final class Socks4ConnectionTests: XCTestCase {
     wait(for: [clientClosed], timeout: 2)
   }
 
+  /// 通过节点列表选中的 Shadowsocks Wire 建连后完成 SOCKS4 握手。
   func testMagentTCPConnectionWritesShadowsocksHandshakeAndGrantsSOCKS4Connect() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -670,8 +626,7 @@ final class Socks4ConnectionTests: XCTestCase {
     )
     let core = try MagentCore(
       defaultDecision: .proxy(defaultNode.id),
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [defaultNode],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -697,6 +652,7 @@ final class Socks4ConnectionTests: XCTestCase {
     channels.append(try proxyNodeAcceptedPromise.futureResult.wait())
   }
 
+  /// SOCKS4 直连迟到完成时不得重复发送失败响应。
   func testMagentTCPConnectionSendsSingleSOCKS4RejectedWhenDirectConnectCompletesLate() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -721,15 +677,9 @@ final class Socks4ConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )

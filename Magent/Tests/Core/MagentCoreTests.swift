@@ -24,6 +24,33 @@ final class MagentCoreTests: XCTestCase {
     XCTAssertNil(try core.routeUDPWire(target))
   }
 
+  /// 空规则和未命中规则均采用默认代理决策，命中直连规则时覆盖默认决策。
+  func testDefaultProxyDecisionHandlesEmptyAndUnmatchedRules() throws {
+    let node = makeRoutingNode(host: "192.0.2.20")
+    let directRule = try ProxyRule(
+      matchType: .exactDomain,
+      matchValue: "direct.example",
+      decision: .direct,
+      order: 0
+    )
+    let unmatched = NetworkAddress.domain("unmatched.example", port: 443)
+    for rules in [[], [directRule]] {
+      let core = try MagentCore(
+        defaultDecision: .proxy(node.id),
+        proxyNodes: [node],
+        defaultTimeout: 10_000,
+        rules: rules
+      )
+      XCTAssertEqual(try core.routeTCPWire(unmatched)?.getTargetAddress(), node.address)
+      XCTAssertEqual(try core.routeUDPWire(unmatched)?.getTargetAddress(), node.address)
+      if !rules.isEmpty {
+        let direct = NetworkAddress.domain("direct.example", port: 443)
+        XCTAssertNil(try core.routeTCPWire(direct))
+        XCTAssertNil(try core.routeUDPWire(direct))
+      }
+    }
+  }
+
   func testTCPProxyRouteUsesRegisteredNodeAddress() throws {
     let node = makeProxyNode(id: UUID(), host: "192.0.2.10")
     let target = NetworkAddress.domain("target.example", port: 443)
@@ -256,6 +283,7 @@ final class MagentCoreTests: XCTestCase {
     )
   }
 
+  /// 不支持的规则类型必须在初始化路由表时失败。
   func testUnsupportedRuleFailsCoreInitialization() throws {
     let unsupported = try ProxyRule(
       matchType: .urlRegex, matchValue: ".*", decision: .direct, order: 0)
@@ -263,8 +291,7 @@ final class MagentCoreTests: XCTestCase {
     XCTAssertThrowsError(
       try MagentCore(
         defaultDecision: .direct,
-        defaultProxyNode: makeRoutingNode(host: "192.0.2.254"),
-        enableMatchTable: true,
+        proxyNodes: [],
         defaultTimeout: 10_000,
         rules: [unsupported]
       )
@@ -291,15 +318,9 @@ final class MagentCoreTests: XCTestCase {
     let port = try XCTUnwrap(server.localAddress?.port)
     let loop = group.next()
     let promise = loop.makePromise(of: Channel.self)
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: true,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -320,18 +341,13 @@ final class MagentCoreTests: XCTestCase {
     try client.close().wait()
   }
 
+  /// 无效建连超时必须在创建下游 Channel 前被拒绝。
   func testTCPClientChannelRejectsNonPositiveTimeout() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     defer { XCTAssertNoThrow(try group.syncShutdownGracefully()) }
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: true,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -372,11 +388,11 @@ final class MagentCoreTests: XCTestCase {
   }
 }
 
+/// 创建无预置节点的直连 Core，供路由和节点注册测试使用。
 private func makeCore(rules: [ProxyRule] = []) throws -> MagentCore {
   try MagentCore(
     defaultDecision: .direct,
-    defaultProxyNode: makeProxyNode(id: UUID(), host: "192.0.2.254"),
-    enableMatchTable: true,
+    proxyNodes: [],
     defaultTimeout: 10_000,
     rules: rules
   )
@@ -391,16 +407,14 @@ private func makeProxyNode(id: UUID, host: String) -> ProxyNode {
   )
 }
 
+/// 使用真实节点列表与规则创建路由测试的 Core。
 private func makeRoutingCore(rules: [ProxyRule], nodes: [ProxyNode]) throws -> MagentCore {
-  let core = try MagentCore(
+  try MagentCore(
     defaultDecision: .direct,
-    defaultProxyNode: makeRoutingNode(host: "192.0.2.254"),
-    enableMatchTable: true,
+    proxyNodes: nodes,
     defaultTimeout: 10_000,
     rules: rules
   )
-  try core.putAllProxyNodes(nodes)
-  return core
 }
 
 private func makeRoutingNode(host: String) -> ProxyNode {

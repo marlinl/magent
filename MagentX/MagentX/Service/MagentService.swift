@@ -48,7 +48,7 @@ actor MagentService {
   ///   - modelContainer: 存储 Magent 节点、规则、策略及关联记录的模型容器。
   ///   - appSettings: 提供当前代理模式的应用设置。
   ///   - generalSettings: 提供本地代理监听地址和端口的常规设置。
-  /// - Returns: 包含启用规则和可用代理节点的 Magent 运行配置。
+  /// - Returns: 包含可用节点的运行配置；仅策略模式带匹配规则，无节点时采用直连。
   func getConfig(
     modelContainer: ModelContainer,
     appSettings: AppSettings,
@@ -76,38 +76,24 @@ actor MagentService {
     let policyProxyNode = enabledPolicies.lazy.compactMap {
       proxyNodesByID[$0.nodeID]
     }.first
-    let defaultProxyNode: ProxyNode
-    if let policyProxyNode {
-      defaultProxyNode = policyProxyNode
-    } else {
-      // MagentConfig 的 defaultProxyNode 当前不可为空；无策略时仅用作必填占位，不加入节点列表。
-      defaultProxyNode = ProxyNode(
-        address: try SocketAddress(ipAddress: "127.0.0.1", port: 9),
-        cipher: .chacha20IetfPoly1305,
-        password: "unused-direct-route"
-      )
-    }
 
-    // 3. 根据已启用策略的 ID 查询关联表，并构建全部代理规则。
-    let rules = queryRuleList(
-      enabledPolicies.map(\.id),
-      nodeIDByPolicyID: nodeIDByPolicyID,
-      modelContext: modelContext
-    )
-
-    // 4. 使用查询方法返回的节点和策略规则组装 MagentConfig。
+    // 3. 仅策略模式装载匹配规则；全局和直连模式只使用默认决策。
     let defaultDecision: Decision
-    let enableMatchTable: Bool
+    let rules: [ProxyRule]
     switch appSettings.proxyMode {
     case .policy:
       defaultDecision = .direct
-      enableMatchTable = true
+      rules = queryRuleList(
+        enabledPolicies.map(\.id),
+        nodeIDByPolicyID: nodeIDByPolicyID,
+        modelContext: modelContext
+      )
     case .global:
-      defaultDecision = policyProxyNode == nil ? .direct : .proxy(defaultProxyNode.id)
-      enableMatchTable = false
+      defaultDecision = policyProxyNode.map { .proxy($0.id) } ?? .direct
+      rules = []
     case .direct:
       defaultDecision = .direct
-      enableMatchTable = false
+      rules = []
     }
 
     return MagentConfig(
@@ -116,10 +102,8 @@ actor MagentService {
         port: generalSettings.proxyListenPort
       ),
       defaultDecision: defaultDecision,
-      defaultProxyNode: defaultProxyNode,
-      enableMatchTable: enableMatchTable,
       rules: rules,
-      proxyNodes: proxyNodes.filter { $0.id != defaultProxyNode.id }
+      proxyNodes: proxyNodes
     )
   }
 

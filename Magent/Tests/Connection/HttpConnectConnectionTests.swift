@@ -8,6 +8,7 @@ import XCTest
 
 /// `HttpConnectConnection` 解析、隧道、背压和 half-close 测试。
 final class HttpConnectConnectionTests: XCTestCase {
+  /// HTTP CONNECT 直连建立后只发送一次成功响应。
   func testMagentTCPConnectionEstablishesHTTPConnectDirectOnce() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -28,15 +29,9 @@ final class HttpConnectConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -64,6 +59,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     XCTAssertTrue(targetChannel.isActive)
   }
 
+  /// HTTP CONNECT 两个转发方向均等待上一批写入完成。
   func testHTTPConnectUsesStrictBackpressureInBothDirections() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -104,15 +100,9 @@ final class HttpConnectConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -168,6 +158,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     XCTAssertEqual(try manualReads.deliveredCount().wait(), 3)
   }
 
+  /// HTTP CONNECT 客户端半关闭前的数据必须先于下游 FIN 转发。
   func testHTTPConnectProxyHalfCloseForwardsFinalPayloadBeforeWireFIN() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -196,15 +187,9 @@ final class HttpConnectConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -248,6 +233,7 @@ final class HttpConnectConnectionTests: XCTestCase {
       try wirePayloadPromise.futureResult.wait().suffix(wirePayload.count), wirePayload)
   }
 
+  /// HTTP CONNECT 下游半关闭后保留另一方向的转发。
   func testHTTPConnectWireHalfCloseKeepsProxyToWireDirectionOpen() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -275,15 +261,9 @@ final class HttpConnectConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -330,6 +310,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     XCTAssertEqual(try targetPayloadPromise.futureResult.wait(), proxyPayload)
   }
 
+  /// HTTP CONNECT 建连期间收到半关闭时等待隧道建立后再传播。
   func testHTTPConnectDefersProxyHalfCloseUntilTunnelIsEstablished() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -353,15 +334,9 @@ final class HttpConnectConnectionTests: XCTestCase {
       .wait()
     channels.append(targetServer)
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -397,6 +372,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     XCTAssertEqual(try responsePromise.futureResult.wait().suffix(wirePayload.count), wirePayload)
   }
 
+  /// HTTP CONNECT 请求不完整便半关闭时回收连接。
   func testHTTPConnectClosesIncompleteRequestWhenProxyHalfCloses() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -407,15 +383,9 @@ final class HttpConnectConnectionTests: XCTestCase {
       shutdownTestChannels(channels, group: group)
     }
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -448,6 +418,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     }
   }
 
+  /// 通过节点列表选中的 Shadowsocks Wire 建立 HTTP CONNECT 隧道。
   func testMagentTCPConnectionWritesShadowsocksHandshakeAndEstablishesHTTPConnect() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -485,8 +456,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     )
     let core = try MagentCore(
       defaultDecision: .proxy(defaultNode.id),
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [defaultNode],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -512,6 +482,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     channels.append(try proxyNodeAcceptedPromise.futureResult.wait())
   }
 
+  /// HTTP CONNECT 直连失败时向客户端返回网关错误。
   func testMagentTCPConnectionReturnsBadGatewayWhenDirectConnectFails() throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let eventLoop = group.next()
@@ -528,15 +499,9 @@ final class HttpConnectConnectionTests: XCTestCase {
     let unavailablePort = try XCTUnwrap(unavailableServer.localAddress?.port)
     try unavailableServer.close().wait()
 
-    let defaultNode = ProxyNode(
-      address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
-      cipher: .aes256Gcm,
-      password: "test"
-    )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: defaultNode,
-      enableMatchTable: false,
+      proxyNodes: [],
       defaultTimeout: 10_000,
       rules: []
     )
@@ -624,6 +589,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     XCTAssertNoThrow(try request.checkConnect())
   }
 
+  /// HTTP CONNECT 数值地址保留 IP 类型并参与 CIDR 规则匹配。
   func testHTTPConnectNumericAddressesPreserveIPTypeAndMatchCIDR() throws {
     let proxyNode = ProxyNode(
       address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
@@ -632,8 +598,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     )
     let core = try MagentCore(
       defaultDecision: .direct,
-      defaultProxyNode: proxyNode,
-      enableMatchTable: true,
+      proxyNodes: [proxyNode],
       defaultTimeout: 10_000,
       rules: [
         try ProxyRule(

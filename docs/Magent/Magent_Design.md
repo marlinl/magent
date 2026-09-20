@@ -118,13 +118,10 @@ let rules = [
 let config = MagentConfig(
     address: .domain("0.0.0.0", port: 1080),
     defaultDecision: .direct,
-    defaultProxyNode: node,
-    enableMatchTable: true,
-    maxAcceptedConnections: 256,
-    defaultTimeout: 10_000,
     rules: rules,
     proxyNodes: [node],
-    dnsServers: [try SocketAddress(ipAddress: "1.1.1.1", port: 53)]
+    defaultTimeout: 10_000,
+    dnsAddress: try SocketAddress(ipAddress: "1.1.1.1", port: 53)
 )
 
 let magent = Magent(threadNumber: 2)
@@ -145,14 +142,11 @@ Magent 自己的 NIO EventLoop 内调用这些同步生命周期边界。
 | 字段 | 语义 |
 | --- | --- |
 | `address` | TCP listener 的 bind 地址和端口 |
-| `maxAcceptedConnections` | 当前 `Magent` 实例允许同时持有的 accepted TCP connection 总数；默认 256，必须大于 0 |
 | `defaultTimeout` | direct TCP connect 和 SOCKS5 UDP 直连 DNS 查询的超时毫秒数 |
-| `dnsServers` | SOCKS5 UDP 直连域名目标使用的远端 DNS server；空数组表示拒绝该能力 |
-| `defaultDecision` | 未命中规则或关闭匹配表时的决策 |
-| `defaultProxyNode` | Core 初始化时必定注册的默认节点 |
-| `enableMatchTable` | 是否执行规则表；关闭后直接使用默认决策 |
-| `rules` | 当前运行周期的完整规则数组 |
-| `proxyNodes` | 默认节点之外追加注册的节点 |
+| `dnsAddress` | SOCKS5 UDP 直连域名使用的单个 DNS 地址；默认 nil，表示拒绝 UDP 直连域名目标 |
+| `defaultDecision` | 规则为空或未命中时的决策，默认直连 |
+| `rules` | 当前运行周期实际参与匹配的规则；全局和直连模式传空数组 |
+| `proxyNodes` | 完整代理节点列表，包括默认决策与规则引用的节点；纯直连时可为空 |
 
 `rules` 和 `proxyNodes` 是配置值，不是运行中热更新接口。`start/restart` 创建新的 `MagentCore`，
 运行期间修改原 `MagentConfig` 不会改变已经启动的 Core。
@@ -258,7 +252,7 @@ func decodeInbound(_ bytes: Data) throws -> InboundData
 | `Magent` | group、TCP listener、运行周期 shutdown promise、跨 restart 共享的 accepted connection 计数器 |
 | `MagentTCPConnection` | accepted `proxyChannel`、协议探测缓冲、具体 `ProxyConnection` |
 | 具体 TCP connection | `wireChannel`、协议状态、首请求缓冲、TCP Wire |
-| `Socks5Connection` | 当前 control connection 的 UDP relay、IPv4/IPv6 outbound Channel 和 DNS clients |
+| `Socks5Connection` | 当前 control connection 的 UDP relay、IPv4/IPv6 outbound Channel 和可选的 DNS client |
 | UDP inbound handler | 首个 client source、实际远端 endpoint 到所选 Wire 的映射 |
 | `MagentCore` | 路由表、route cache、节点映射、UDP Wires |
 
@@ -371,7 +365,7 @@ TCP control connection
   -> 写回已固定的 client source IP:port
 ```
 
-control connection 关闭会关闭这组 UDP Channel 和 DNS clients。UDP Channel 无 TCP connect
+control connection 关闭会关闭这组 UDP Channel 和可选的 DNS client。UDP Channel 无 TCP connect
 阶段，同一个 association Channel 可以向多个 target 发送 datagram，因此不应用 TCP
 `connectTimeout`。`ProxyNode.timeout` 只控制 proxy TCP connect；`defaultTimeout` 还控制 direct
 UDP 域名的远端 DNS query。
@@ -396,7 +390,7 @@ wireChannel inactive/error
 
 UDP：
 
-- control connection close -> 当前 association 的 UDP Channel 和 DNS clients close。
+- control connection close -> 当前 association 的 UDP Channel 和可选的 DNS client close。
 - runtime shutdown future -> accepted control connection close -> UDP resources close。
 
 # 4. Corners
@@ -429,8 +423,6 @@ UDP：
 - HTTP CONNECT/forward 超时返回 504。
 - accepted/wire Channel 使用 `autoRead = false`，每批写入完成后才读取下一批，限制单连接
   in-flight payload。
-- `maxAcceptedConnections` 给服务实例的活跃 accepted TCP connection 建立硬上限，默认 256；
-  超限 child Channel 立即关闭。
 - TCP input half-close 会传播为另一侧 output close，并保留反方向读取。
 
 尚未实现：
@@ -499,16 +491,15 @@ MagentX 持久化模型与 package 公共类型的映射见 `Magent_Model_SQL_De
 
 核心路由、Shadowsocks Wire、TCP/UDP 基本链路、严格单批流控、half-close 和常规关闭路径已经
 具备。Shadowsocks UDP 回包按实际 endpoint 关联 Wire，HTTP request 使用 NIOHTTP1 decoder，
-并已拒绝 `Expect`、HTTPS absolute-form 和超限请求。服务级 accepted connection 上限同时约束
-每条 accepted control connection 派生的 UDP association；但当前仍没有 read/write/idle
+并已拒绝 `Expect`、HTTPS absolute-form 和超限请求。Magent 不设置已接入连接数上限，
+每条 accepted control connection 仍拥有并回收其 UDP association。当前仍没有 read/write/idle
 timeout、配置引用 fail-fast、完整 HTTP `Via` 与 SOCKS5 错误映射；CI 和 public `Magent`
 端到端门禁也未完成。
 
 在以下限制全部成立时，可以作为 **🟡 受控灰度版本**：
 
 - 只绑定 loopback 或可信内网，不直接暴露给不受信任客户端。
-- 根据进程文件描述符预算设置 `maxAcceptedConnections`（默认 256），在上层限制单连接生命周期，
-  并监控内存与文件描述符。
+- 根据进程文件描述符和内存预算评估并发负载，在上层限制单连接生命周期，并监控资源占用。
 - 不宣称完整 HTTP intermediary 或完整 RFC 1928；HTTPS 客户端使用 HTTP CONNECT。
 
 ## 5.2 已修复项目
@@ -520,7 +511,7 @@ timeout、配置引用 fail-fast、完整 HTTP `Via` 与 SOCKS5 错误映射；C
 | FIX-3 | ✅ 已解决 | Core singleton 导致实例和配置相互污染。 | `MagentCore` 由单个运行周期创建并注入 handler；节点和规则在 Core 创建阶段完成写入。 |
 | FIX-4 | ✅ 已解决 | proxy 路由缺失节点时可能降级为 UDP 明文直连。 | TCP/UDP `.proxy` 缺少节点均抛出 `proxyNodeNotFound`，只有明确 `.direct` 才返回 `nil`。 |
 | FIX-5 | ✅ 已解决 | 同一代理 endpoint 可能对应多个 UDP Wire。 | `putProxyNode` 拒绝不同 UUID 复用相同 `SocketAddress`；每条 association 还按实际远端 endpoint 保存出站时选择的 Wire。 |
-| FIX-6 | ✅ 已解决 | UDP association 与 control connection 生命周期曾分离，可能遗留 backend Channel。 | 共享 cache/pending-bind 模型已删除；每条 control connection 独占固定 UDP Channel 和 DNS clients，control close 直接回收。 |
+| FIX-6 | ✅ 已解决 | UDP association 与 control connection 生命周期曾分离，可能遗留 backend Channel。 | 共享 cache/pending-bind 模型已删除；每条 control connection 独占固定 UDP Channel 和可选的 DNS client，control close 直接回收。 |
 | FIX-7 | ✅ 已解决 | accepted TCP、wire TCP 和 UDP backend 的常规关闭链路不统一。 | 运行周期 shutdown future 关闭 accepted/backend Channel；具体 TCP connection 使用 `.closed` 守卫避免循环关闭。 |
 | FIX-8 | ✅ 已解决 | `ProxyNode.timeout` 没有用于代理 TCP connect。 | `Wire.getTimeout()` 动态返回节点毫秒值，四个 proxy TCP 分支均传入 `createTCPClientChannel`。 |
 | FIX-9 | ✅ 已解决 | HTTP forward 无法从协议探测入口到达。 | `.httpForward` 已安装 `HttpForwardConnection`，absolute-form 改写、header 清理、body 分片和拒绝 framing 已有回归测试。 |
@@ -530,7 +521,7 @@ timeout、配置引用 fail-fast、完整 HTTP `Via` 与 SOCKS5 错误映射；C
 | FIX-13 | ✅ 已解决 | RFC Gap 独立文档与主 Review 并存，审计基线和大量代码路径已经过期。 | 仍成立的 HTTP、SOCKS 和 TCP 生命周期问题及能力声明边界已合并到本节；已修复结论不重复保留，原独立文档已删除。 |
 | FIX-14 | ✅ 已解决 | 原 `NEW-P0-1`：代码使用 `Magent.start/restart/close` 并由服务拥有 listener/group，但 README 和 `AGENTS.md` 仍要求已删除的 `MagentClient.attach(channel:)` 与 App-owned listener/group。 | README 和 `AGENTS.md` 已统一为当前服务模型：App 提供 `MagentConfig`，`Magent` 拥有 EventLoopGroup、TCP listener 和 Channel 生命周期；`close()` 视为实例终止操作。 |
 | FIX-15 | ✅ 已解决 | 原 `NEW-P0-2`：`restart` 关闭旧服务后，新 TCP bind 失败会留下指向已关闭旧 Channel 的 `.running` 状态。 | `shutdown` 通过 `defer` 将所有退出路径收敛到 `.stop`；restart 失败路径完成新 shutdown promise 并关闭新 TCP listener。生命周期回归覆盖 TCP bind 失败及失败后使用同一 `Magent` 和 EventLoopGroup 再次 `start`。 |
-| FIX-16 | ✅ 已解决 | 原 `NEW-P0-4`：accepted TCP connection 及其 SOCKS5 UDP association 没有服务级总量上限。 | `maxAcceptedConnections` 默认 256 且必须大于 0；service-owned atomic counter 跨 EventLoop/restart 统一准入，超限 child Channel 立即关闭，额度只在对应 `closeFuture` 完成时归还。并发竞争、额度复用和 restart 回归已覆盖。 |
+| FIX-16 | 已调整设计 | 原 `NEW-P0-4` 曾通过服务级连接总量限制处理。 | 当前设计取消连接计数器与连接上限配置；回归测试覆盖超过原 256 条上限的接入，以及 restart/close 关闭连接。实际容量由系统资源和处理负载决定。 |
 
 ## 5.3 当前未解决问题
 
@@ -557,7 +548,7 @@ RFC 1928”或“支持所有 HTTP/SOCKS 能力”。
 | HTTP Forward | HTTP/1.x 受限单请求；NIOHTTP1 request 解析；absolute-form/origin-form；唯一 `Content-Length` body；Host 重建和 proxy/hop-by-hop header 清理；强制 `Connection: close`；拒绝 `Expect`、Upgrade 和 HTTPS absolute-form | 完整 RFC 9110/9112 intermediary、`Via`、chunked、`Expect: 100-continue`、大 body streaming、keep-alive、pipelining、Upgrade/WebSocket、HTTPS absolute-form、HTTP/2/3 |
 | SOCKS4/SOCKS4a | no-auth CONNECT；IPv4/domain；固定 granted/rejected reply | BIND、ident authentication、原生 IPv6、完整 SOCKS4 command 集 |
 | SOCKS5 TCP | no-auth CONNECT；IPv4/domain/IPv6；不支持 command 返回失败；支持单批流控和 half-close | GSSAPI、username/password、BIND、完整 REP code 映射、完整 RFC 1928 compliant implementation |
-| SOCKS5 UDP | 每条 control connection 独占 relay；control close 联动回收；IPv4/domain/IPv6 target；direct domain 使用配置 DNS；`FRAG=0`；首个 client `IP:port` 固定 association；按真实 proxy endpoint 关联 Wire；服务级 association 数量受 `maxAcceptedConnections` 间接约束 | fragment reassembly、非零 FRAG 的 RFC 静默丢弃、request client hint 与 control peer 校验、IPv6 control/relay |
+| SOCKS5 UDP | 每条 control connection 独占 relay；control close 联动回收；IPv4/domain/IPv6 target；direct domain 使用配置 DNS；`FRAG=0`；首个 client `IP:port` 固定 association；按真实 proxy endpoint 关联 Wire | fragment reassembly、非零 FRAG 的 RFC 静默丢弃、request client hint 与 control peer 校验、IPv6 control/relay |
 
 主要规范基线：
 

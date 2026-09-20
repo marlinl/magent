@@ -1,165 +1,243 @@
 # Magent
 
-Magent 是基于 SwiftNIO 的本地代理服务类库。应用通过一个 `MagentConfig` 启动服务，
-Magent 自己创建并管理 TCP listener、accepted TCP connections、出站 channels 和
-`MultiThreadedEventLoopGroup`。
+English | [中文](README_zh.md)
 
-当前支持：
+Magent is a SwiftNIO-based proxy service library for embedding HTTP and SOCKS
+proxying in applications. Configure a `Magent` instance, start its local listener,
+and let the library handle protocol detection, routing, connections, and forwarding.
 
-- HTTP/1.0、HTTP/1.1 CONNECT。
-- 受限的单请求 HTTP/1.x forward。
-- SOCKS4、SOCKS4a CONNECT。
-- SOCKS5 no-auth CONNECT。
-- SOCKS5 control connection 独占的 UDP relay 数据面。
-- direct 和 Shadowsocks AEAD TCP/UDP 出站。
-- exact domain、domain suffix、domain keyword、IPv4/IPv6 CIDR 路由规则。
+The application owns its UI, persistence, platform permissions, and system proxy
+or Network Extension integration. Magent owns its networking resources.
 
-完整的产品边界、RFC 能力声明和上线状态见
-[`docs/Magent/Magent_Design.md`](../docs/Magent/Magent_Design.md)。
+## Features
 
-## 安装
+- HTTP CONNECT and a restricted HTTP forward proxy.
+- SOCKS4, SOCKS4a, and SOCKS5 CONNECT; SOCKS5 UDP ASSOCIATE.
+- Direct connections and Shadowsocks AEAD TCP/UDP forwarding.
+- Routing by exact domain, domain suffix, domain keyword, or IPv4/IPv6 CIDR.
+- Independent encryption state for each Shadowsocks TCP stream.
+- Configuration replacement through `restart(_:)`.
 
-包清单要求 Swift 6.4 工具链。
+Supported ciphers are `aes-128-gcm`, `aes-256-gcm`,
+`chacha20-ietf-poly1305`, and `xchacha20-ietf-poly1305`.
 
-```swift
-.package(url: "https://github.com/marlinl/magent.git", branch: "master")
+## Requirements
+
+- Swift 6.4 or later, as required by [Package.swift](Package.swift).
+- The package declares macOS 14 and iOS 17 as its minimum Apple platform versions.
+- Permission to open the listener and outbound sockets in the host application.
+
+## Installation
+
+The Swift package lives in the repository's `Magent/` subdirectory. Clone the
+repository, then add that directory as a local package in Xcode:
+
+```bash
+git clone https://github.com/marlinl/magent.git
 ```
 
+For another Swift package, add the following entries to its `dependencies` array.
+The local path is relative to the consuming package; adjust it to your checkout.
+SwiftNIO is listed explicitly because the node and DNS examples use `NIOCore.SocketAddress`.
+
 ```swift
-.product(name: "Magent", package: "magent")
+.package(path: "../magent/Magent"),
+.package(url: "https://github.com/apple/swift-nio.git", from: "2.102.0"),
 ```
 
-## 启动
+Add these products to the consuming target's `dependencies` array:
+
+```swift
+.product(name: "Magent", package: "Magent"),
+.product(name: "NIOCore", package: "swift-nio"),
+```
+
+## Quick start
+
+Run the following from an asynchronous application context. This starts a proxy
+on `127.0.0.1:1080` and connects directly to requested destinations. No proxy node
+is required.
 
 ```swift
 import Magent
+
+let listenAddress = NetworkAddress.domain("127.0.0.1", port: 1080)
+let service = Magent(threadNumber: 2)
+let directConfig = MagentConfig(address: listenAddress)
+
+try await service.start(directConfig)
+```
+
+Keep the application running and retain the service for later reconfiguration or
+shutdown. Clients may use HTTP CONNECT, HTTP forward, or SOCKS on the same TCP
+listener; Magent detects the protocol automatically.
+
+## Routing and proxy nodes
+
+All proxy nodes belong in `proxyNodes`. A `.proxy(node.id)` decision selects one
+of them by UUID. The following example creates both a global proxy configuration
+and a configuration that proxies only domains matching a rule.
+
+The server IP, DNS IP, and password below are placeholders. Replace them with
+your own settings before using the proxy configurations.
+
+```swift
 import NIOCore
 
-let proxyAddress = try SocketAddress.makeAddressResolvingHost("proxy.example.com", port: 8388)
 let node = ProxyNode(
-    address: proxyAddress,
+    address: try SocketAddress(ipAddress: "192.0.2.10", port: 8388),
     cipher: .chacha20IetfPoly1305,
-    password: "sample-password",
+    password: "replace-with-your-password",
     timeout: 10
 )
 
-let rules = [
-    try ProxyRule(
-        matchType: .domainSuffix,
-        matchValue: "example.com",
-        decision: .proxy(node.id),
-        order: 0
-    ),
-]
-
-let config = MagentConfig(
-    address: .domain("127.0.0.1", port: 1080),
-    defaultDecision: .direct,
-    defaultProxyNode: node,
-    enableMatchTable: true,
-    maxAcceptedConnections: 256,
-    rules: rules,
-    dnsServers: [try SocketAddress(ipAddress: "1.1.1.1", port: 53)]
+let globalConfig = MagentConfig(
+    address: listenAddress,
+    defaultDecision: .proxy(node.id),
+    proxyNodes: [node]
 )
 
-let magent = Magent(threadNumber: 2)
-try await magent.start(config)
+let rule = try ProxyRule(
+    matchType: .domainSuffix,
+    matchValue: "example.com",
+    decision: .proxy(node.id),
+    order: 0
+)
+
+let ruleConfig = MagentConfig(
+    address: listenAddress,
+    rules: [rule],
+    proxyNodes: [node],
+    dnsAddress: try SocketAddress(ipAddress: "192.0.2.53", port: 53)
+)
 ```
 
-`start(_:)` 绑定配置地址的 TCP listener。HTTP/SOCKS 协议探测、local reply、规则匹配、
-目标建连和双向转发全部由 Magent 内部完成；SOCKS5 UDP ASSOCIATE 成功后按 control
-connection 创建随机端口的 UDP relay。
+| Mode | Rules | Default decision |
+| --- | --- | --- |
+| Direct | Empty | `.direct` |
+| Global proxy | Empty | `.proxy(node.id)` |
+| Rule-based | Rules for the current run | Used when no rule matches |
 
-生命周期方法是 actor 隔离的同步边界，从 actor 外调用需要 `await`。不要从 Magent 自己的
-NIO EventLoop 中调用 `start`、`restart` 或 `close`。
+Rules with smaller `order` values take precedence. If no rule matches, or the
+rule list is empty, routing uses `defaultDecision`. A decision referencing a
+missing node fails when that route is used; it does not fall back to a direct
+connection. The `urlRegex` enum case is currently unsupported by the router.
 
-## 配置切换与关闭
+## Configuration
+
+`MagentConfig` describes one complete start or restart. Only `address` is required.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `address` | Required | Local TCP listener address; port must be in `1...65535`. |
+| `defaultDecision` | `.direct` | Decision used when rules are empty or no rule matches. |
+| `rules` | `[]` | Rules to match during this run. |
+| `proxyNodes` | `[]` | All available nodes, including any selected by the default decision. |
+| `defaultTimeout` | `10_000` | Direct TCP connection and UDP DNS query timeout, in milliseconds. |
+| `dnsAddress` | `nil` | One DNS server address for direct SOCKS5 UDP domain destinations. |
+
+`ProxyNode.timeout` controls proxied TCP connection attempts. It is expressed in
+**seconds** and defaults to `30`, unlike `MagentConfig.defaultTimeout`.
+
+`dnsAddress` only affects direct SOCKS5 UDP domain resolution. With `nil`, UDP
+IP destinations and proxied domain destinations still work, but direct UDP
+domain destinations are rejected. It does not override TCP hostname resolution,
+and there is no fallback to a second configured DNS server.
+
+Magent has no application-level connection count limit. EventLoop thread count
+and listener backlog are not limits on established connections; practical
+capacity depends on file descriptors, memory, and processing load.
+
+## Reconfiguration and shutdown
+
+Use the running service from the quick-start example:
 
 ```swift
-try await magent.restart(newConfig)
+try await service.restart(ruleConfig)
 
-// 最终停止。
-try await magent.close()
+// When the application is finished using the service:
+try await service.close()
 ```
 
-`restart(_:)` 使用同一个 EventLoopGroup 创建新的 Core 和 TCP listener，并结束旧运行周期。
-accepted connection 额度由 `Magent` 实例持有；restart 期间尚未完成关闭的旧 connection 仍占用额度，
-直到对应 Channel 的 `closeFuture` 完成。
-`close()` 关闭当前 listener、accepted/backend channels，随后关闭 Magent 自己的
-EventLoopGroup。
+`restart(_:)` creates a new runtime and replaces the listener while reusing the
+service-owned EventLoopGroup. It closes the old runtime's connections; it is
+not a seamless handover of existing tunnels. Editing a configuration value after
+startup does not change an already running service.
 
-`close()` 是当前 `Magent` 实例的终止操作。关闭后需要再次运行时，应创建新的 `Magent`
-实例；运行中切换配置使用 `restart(_:)`。
+Treat `close()` as terminal for that instance. Create a new `Magent` instance if
+you need to start again after closing it. Call `start`, `restart`, and `close`
+from outside NIO EventLoops: these actor-isolated lifecycle methods internally
+wait for NIO futures. Calls from outside the actor use `await`.
 
-## 路由与节点
+## Protocol scope
 
-`MagentConfig` 是一次 start/restart 的完整配置：
+- **HTTP:** HTTP/1.0 and HTTP/1.1 CONNECT are supported. HTTP forward handles one
+  request per connection and rejects chunked framing, pipelining, and subsequent
+  keep-alive requests. Use CONNECT for HTTPS; `https://` absolute-form forward
+  requests are not supported.
+- **SOCKS4/SOCKS4a:** CONNECT is supported. BIND, ident authentication, and native
+  SOCKS4 IPv6 addresses are not supported.
+- **SOCKS5:** No-auth CONNECT and UDP ASSOCIATE are supported. BIND, GSSAPI, and
+  username/password authentication are not supported.
+- **Handshake ordering:** SOCKS4, SOCKS5, and HTTP CONNECT reject payload bytes
+  sent after a complete handshake request but before the local success reply.
+- **UDP:** Each SOCKS5 control connection owns an ephemeral relay port. The
+  current relay requires an IPv4 control connection, while outbound targets may
+  use IPv4, IPv6, or domains. Closing the control connection closes its UDP and
+  DNS resources. Only `FRAG=0` is supported; fragmented datagrams are rejected.
+- **Other HTTP versions:** HTTP/2, HTTP/3, and Extended CONNECT are not supported.
 
-- `address`：TCP listener 的 bind 地址。
-- `defaultDecision`：未命中规则或关闭匹配表时的决策。
-- `defaultProxyNode`：Core 初始化时注册的默认代理节点。
-- `enableMatchTable`：是否执行规则匹配。
-- `maxAcceptedConnections`：当前 `Magent` 实例允许同时持有的 accepted TCP connection 总数，
-  默认 256；超限的新 connection 会立即关闭。
-- `rules`：按 `order` 匹配的规则。
-- `proxyNodes`：默认节点之外的代理节点。
-- `dnsServers`：SOCKS5 UDP 直连域名使用的远端 DNS 地址；为空时拒绝直连域名目标。
+These are the implemented protocol boundaries, not a claim of full HTTP or
+SOCKS RFC compliance. See the [design document](../docs/Magent/Magent_Design.md)
+for detailed behavior and known limitations.
 
-`.direct` 连接原始目标；`.proxy(nodeID)` 使用对应节点的 Wire。找不到代理节点时请求失败，
-不会降级为明文直连。代理 TCP connect timeout 从 `ProxyNode.timeout` 动态取得。
+## Deployment responsibilities
 
-## SOCKS5 UDP
+The application selects a loopback, LAN, or wildcard listen address. The local
+proxy frontends currently provide no client authentication, so applications
+exposing the listener must arrange their own access controls.
 
-每条 SOCKS5 UDP ASSOCIATE control connection 创建一个绑定系统随机端口的 UDP relay。
-SOCKS5 success reply 使用 control connection 的本地 IP 和该随机端口；首个 UDP datagram
-确定客户端 source `IP:port`。关闭 control connection 会关闭对应 UDP relay。每条 association
-只能属于一条 accepted control connection，因此 `maxAcceptedConnections` 同时给 association
-及其 UDP/DNS Channel 数量建立服务级上界。
+Magent does not configure the operating system's proxy settings, request
+platform permissions, or persist node credentials. Those responsibilities stay
+with the host application. Keep real server addresses, passwords, and local user
+settings out of source control.
 
-relay 固定使用 IPv4，IPv4 relay/outbound 与 IPv6 outbound 各自使用一个 Channel；具体出站
-Channel 只由最终远端 `SocketAddress` 的地址族决定。直连域名通过 `dnsServers` 异步解析，
-代理域名保持域名形式交给 Wire。当前只支持 `FRAG=0`；非零 fragmentation 会结束当前
-association。
+## Development
 
-## 当前协议边界
-
-- HTTP forward 只支持一条请求，拒绝 chunked、pipelining 和后续 keep-alive 请求。
-- HTTP forward 不支持 `https://` absolute-form；HTTPS 客户端应使用 CONNECT。
-- SOCKS4、SOCKS5 和 HTTP CONNECT 不接受 success reply 前提前发送的 tunnel payload。
-- SOCKS4 不支持 BIND、ident authentication 和原生 IPv6。
-- SOCKS5 只支持 no-auth，不支持 BIND、GSSAPI 和 username/password。
-- HTTP/2、HTTP/3 和 Extended CONNECT 当前不支持。
-
-## 监听与安全
-
-Magent 允许配置 loopback、局域网地址、具体公网接口或 `0.0.0.0`。HTTP、SOCKS4 和
-SOCKS5 前端当前没有本地用户认证。开放监听是受支持的产品能力，但部署方必须自行承担
-防火墙、安全组、来源限制和凭据保护。
-
-不要把真实 Shadowsocks 密码、节点地址或用户代理设置提交到仓库。
-
-## 所有权
-
-- App 负责平台权限、UI、配置持久化、系统代理或 Network Extension 集成。
-- `Magent` 拥有并关闭 EventLoopGroup 和 TCP listener。
-- `MagentTCPConnection` 拥有 accepted TCP channel 的代理生命周期。
-- 每条 TCP stream 使用独立的 Shadowsocks TCP Wire、salt、nonce 和 frame buffer。
-- `Socks5Connection` 拥有对应 control connection 的 UDP relay，control connection 关闭时回收。
-
-## 构建与测试
-
-从 `Magent/` 目录执行：
+Run package commands from the repository's `Magent/` directory:
 
 ```bash
-xcrun swift-format format --in-place --parallel --recursive Package.swift Sources Tests
-xcrun swift-format lint --strict --parallel --recursive Package.swift Sources Tests
 swift build
 swift build -Xswiftc -strict-concurrency=complete
 swift build -c release
 swift test --filter ConnectionTests
+swift test --filter AeadCipherTests
 swift test
 git diff --check
 ```
 
-项目使用当前 Xcode 工具链内置的 Swift 官方 `swift-format` 默认规则，不再把 lint 作为
-SwiftPM build-tool plugin 挂到每次编译流程中。
+Tests cover routing, packet parsing, encryption, connection lifecycle, and local
+TCP/UDP forwarding. Socket tests require local networking permissions; tests
+requiring IPv6 loopback report a skip if it is unavailable.
+
+Formatting uses the official `swift-format` bundled with the selected Xcode
+toolchain. Formatting is run explicitly, not as a SwiftPM build-tool plugin:
+
+```bash
+xcrun swift-format format --in-place --parallel --recursive Package.swift Sources Tests
+xcrun swift-format lint --strict --parallel --recursive Package.swift Sources Tests
+```
+
+| Directory | Contents |
+| --- | --- |
+| `Sources/Connection` | Protocol detection, frontend handshakes, and forwarding. |
+| `Sources/Core` | Routing, node selection, channel creation, and caches. |
+| `Sources/Model` | Addresses, nodes, rules, and protocol types. |
+| `Sources/Wire/Shadowsocks` | Shadowsocks framing, addresses, and AEAD encryption. |
+| `Tests` | XCTest unit tests and local networking tests. |
+
+## License and contributions
+
+Except where a file or third-party component states otherwise, Magent is licensed
+under [GPL-3.0-only](../LICENSE). Contributions are governed by the
+[Magent Contributor License Agreement](../CLA.md).
