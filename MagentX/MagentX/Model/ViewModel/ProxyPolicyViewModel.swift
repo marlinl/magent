@@ -54,6 +54,7 @@ struct ProxyPolicyViewModel: Identifiable {
     let policy = MagentProxyPolicy(
       id: lastPolicyID.map { $0 + 1 } ?? 0,
       name: "",
+      enable: true,
       nodeID: node.id,
       createdAt: now,
       updatedAt: now

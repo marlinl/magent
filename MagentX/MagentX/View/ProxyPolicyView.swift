@@ -3,43 +3,140 @@
 //  MagentX
 //
 //  Author: MarlinL
-//  Responsibility: Manages proxy policies and optional rule-policy associations.
+//  Responsibility: Manages proxy policies in a native list-detail interface.
 //
 
-import AppKit
 import SwiftData
 import SwiftUI
 
-/// 代理策略页面，在规则表格和策略卡片中管理规则归属和代理策略。
+/// 代理策略页面，在原生策略表格和详情区域中提供直接的 SwiftData CRUD 交互。
 @MainActor
 struct ProxyPolicyView: View {
   @Environment(\.modelContext) private var modelContext
   @Binding var toolbarButtons: [ContentToolbarButton]
   @State private var searchText = ""
   @FocusState private var isSearchFocused: Bool
-  @State private var selectedRuleID: Int?
+  @State private var selectedPolicy: MagentProxyPolicy?
   @State private var proxyPolicyViewModel: ProxyPolicyViewModel?
-  @State private var formError: String?
+  @State private var actionError: String?
 
   private static let maximumCachedModelCount = 1_000
 
   var body: some View {
     let normalizedSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let sortDescriptors = [SortDescriptor(\MagentProxyPolicy.id, order: .forward)]
+    let descriptor: FetchDescriptor<MagentProxyPolicy> = {
+      if normalizedSearchText.isEmpty {
+        return FetchDescriptor<MagentProxyPolicy>(sortBy: sortDescriptors)
+      }
 
+      let query = normalizedSearchText
+      return FetchDescriptor<MagentProxyPolicy>(
+        predicate: #Predicate<MagentProxyPolicy> { policy in
+          policy.name.contains(query)
+        },
+        sortBy: sortDescriptors
+      )
+    }()
     let content = GeometryReader { geometry in
       HSplitView {
-        ProxyPolicyRulePageView(
-          searchText: normalizedSearchText,
-          maximumCachedModelCount: Self.maximumCachedModelCount,
-          selectedRuleID: $selectedRuleID
-        )
-        .frame(width: geometry.size.width * 0.6)
+        ScrollTableView(
+          selection: Binding(
+            get: { selectedPolicy?.id },
+            set: { policyID in
+              guard policyID != selectedPolicy?.id else { return }
+              guard let policyID else {
+                selectedPolicy = nil
+                return
+              }
+
+              do {
+                var descriptor = FetchDescriptor<MagentProxyPolicy>(
+                  predicate: #Predicate { $0.id == policyID }
+                )
+                descriptor.fetchLimit = 1
+                guard let policy = try modelContext.fetch(descriptor).first else {
+                  throw MagentXError.invalidParameter(
+                    String(
+                      format: String(localized: "Proxy policy does not exist: %d"),
+                      policyID
+                    )
+                  )
+                }
+                selectedPolicy = policy
+                actionError = nil
+              } catch {
+                actionError = error.localizedDescription
+              }
+            }
+          ),
+          descriptor: descriptor,
+          queryID: normalizedSearchText,
+          maximumCachedModelCount: Self.maximumCachedModelCount
+        ) {
+          TableColumn("名称") { policy in
+            Text(policy.name)
+              .lineLimit(1)
+          }
+          .width(min: 90, ideal: 160)
+
+          TableColumn("规则总数") { policy in
+            ProxyPolicyRuleCountView(policyID: policy.id, actionError: $actionError)
+          }
+          .width(min: 64, ideal: 72, max: 88)
+        }
+        .accessibilityIdentifier("proxy-policies-table")
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(width: geometry.size.width * 0.3)
         .frame(maxHeight: .infinity)
 
-        ProxyPolicyGridView(
-          maximumCachedModelCount: Self.maximumCachedModelCount
-        )
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        Group {
+          if let proxyPolicyViewModel, proxyPolicyViewModel.isNew {
+            ProxyPolicyFormView(
+              proxyPolicyViewModel: proxyPolicyViewModel,
+              onSaved: { policyID in
+                do {
+                  var descriptor = FetchDescriptor<MagentProxyPolicy>(
+                    predicate: #Predicate<MagentProxyPolicy> { policy in
+                      policy.id == policyID
+                    }
+                  )
+                  descriptor.fetchLimit = 1
+                  guard let savedPolicy = try modelContext.fetch(descriptor).first else {
+                    throw MagentXError.invalidParameter(
+                      String(
+                        format: String(localized: "Proxy policy does not exist: %d"),
+                        policyID
+                      )
+                    )
+                  }
+                  selectedPolicy = savedPolicy
+                  self.proxyPolicyViewModel = nil
+                  actionError = nil
+                } catch {
+                  actionError = error.localizedDescription
+                }
+              },
+              onCancelled: {
+                proxyPolicyViewModel.rollback()
+                self.proxyPolicyViewModel = nil
+                actionError = nil
+              }
+            )
+          } else if let selectedPolicy {
+            ProxyPolicyDetailView(policy: selectedPolicy, actionError: $actionError) {
+              delete(selectedPolicy)
+            }
+            .id(selectedPolicy.id)
+          } else {
+            ContentUnavailableView(
+              "选择代理策略",
+              systemImage: "arrow.triangle.branch",
+              description: Text("从左侧表格选择策略以查看详情，或添加一个新策略")
+            )
+          }
+        }
+        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
       }
       .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -51,557 +148,82 @@ struct ProxyPolicyView: View {
     Group {
       content
         .simultaneousGesture(
-          TapGesture()
-            .onEnded {
-              isSearchFocused = false
-            }
+          TapGesture().onEnded {
+            isSearchFocused = false
+          }
         )
-        .searchable(
-          text: $searchText,
-          placement: .toolbar,
-          prompt: "搜索规则"
-        )
+        .searchable(text: $searchText, placement: .toolbar, prompt: "搜索策略")
         .searchFocused($isSearchFocused)
     }
-    .sheet(item: $proxyPolicyViewModel) { viewModel in
-      ProxyPolicyFormView(proxyPolicyViewModel: viewModel)
-    }
     .alert(
-      "打开策略表单失败",
+      "代理策略操作失败",
       isPresented: Binding(
-        get: { formError != nil },
+        get: { actionError != nil },
         set: { isPresented in
-          if isPresented == false {
-            formError = nil
+          if !isPresented {
+            actionError = nil
           }
         }
       )
     ) {
       Button("好", role: .cancel) {
-        formError = nil
+        actionError = nil
       }
     } message: {
-      Text(formError ?? "")
+      Text(actionError ?? "")
     }
     .onAppear {
       toolbarButtons = [
         ContentToolbarButton(title: "增加策略", systemImage: "plus") {
-          do {
-            proxyPolicyViewModel = try ProxyPolicyViewModel(
-              modelContainer: modelContext.container
-            )
-            formError = nil
-          } catch {
-            formError = error.localizedDescription
-          }
+          add()
         }
       ]
     }
-  }
-
-  /// 观察有限规则和策略集合，并将规则表格交给公共原生表格。
-  private struct ProxyPolicyRulePageView: View {
-    @Query private var policies: [MagentProxyPolicy]
-    @Binding private var selectedRuleID: Int?
-    @State private var associationError: String?
-
-    private let searchText: String
-    private let maximumCachedModelCount: Int
-
-    /// 创建按规则 id 稳定排序且数量有上限的 SwiftData 查询。
-    init(
-      searchText: String,
-      maximumCachedModelCount: Int,
-      selectedRuleID: Binding<Int?>
-    ) {
-      var policyDescriptor = FetchDescriptor<MagentProxyPolicy>(
-        sortBy: [
-          SortDescriptor(\MagentProxyPolicy.name, order: .forward),
-          SortDescriptor(\MagentProxyPolicy.id, order: .forward),
-        ]
-      )
-      policyDescriptor.fetchLimit = maximumCachedModelCount
-      _policies = Query(policyDescriptor)
-
-      _selectedRuleID = selectedRuleID
-      self.searchText = searchText
-      self.maximumCachedModelCount = maximumCachedModelCount
-    }
-
-    var body: some View {
-      let sortDescriptors = [SortDescriptor(\MagentProxyRule.id, order: .forward)]
-      let descriptor: FetchDescriptor<MagentProxyRule> = {
-        if searchText.isEmpty {
-          return FetchDescriptor<MagentProxyRule>(sortBy: sortDescriptors)
-        }
-
-        let query = searchText
-        return FetchDescriptor<MagentProxyRule>(
-          predicate: #Predicate<MagentProxyRule> { rule in
-            rule.matchValue.contains(query)
-          },
-          sortBy: sortDescriptors
-        )
-      }()
-
-      ScrollTableView(
-        selection: $selectedRuleID,
-        descriptor: descriptor,
-        queryID: searchText,
-        maximumCachedModelCount: maximumCachedModelCount,
-      ) {
-        TableColumn("匹配值") { rule in
-          Text(rule.matchValue)
-            .lineLimit(1)
-        }
-        .width(min: 80, ideal: 140)
-
-        TableColumn("类型") { rule in
-          Text(rule.matchType)
-            .lineLimit(1)
-        }
-        .width(56)
-
-        TableColumn("规则") { rule in
-          Text(rule.decision)
-            .lineLimit(1)
-        }
-        .width(56)
-
-        TableColumn("策略") { rule in
-          ProxyPolicyPickerView(
-            ruleID: rule.id,
-            policies: policies,
-            associationError: $associationError
-          )
-        }
-        .width(min: 80, ideal: 100, max: 120)
-      }
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .alert(
-        "更新代理策略失败",
-        isPresented: Binding(
-          get: { associationError != nil },
-          set: { isPresented in
-            if isPresented == false {
-              associationError = nil
-            }
-          }
-        )
-      ) {
-        Button("好", role: .cancel) {
-          associationError = nil
-        }
-      } message: {
-        Text(associationError ?? "")
+    .onDisappear {
+      if let proxyPolicyViewModel, proxyPolicyViewModel.isNew {
+        proxyPolicyViewModel.rollback()
+        self.proxyPolicyViewModel = nil
       }
     }
   }
 
-  /// 观察单条规则的可选策略关联，并在用户选择时持久化关系。
-  private struct ProxyPolicyPickerView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query private var policyRules: [MagentProxyPolicyRule]
-    let policies: [MagentProxyPolicy]
-    @Binding var associationError: String?
-    private let ruleID: Int
+  /// 打开使用独立上下文的新策略表单，支持保存前取消。
+  private func add() {
+    proxyPolicyViewModel?.rollback()
+    do {
+      proxyPolicyViewModel = try ProxyPolicyViewModel(modelContainer: modelContext.container)
+      actionError = nil
+    } catch {
+      actionError = error.localizedDescription
+    }
+  }
 
-    /// 创建只观察指定规则关联记录的 SwiftData 查询。
-    init(
-      ruleID: Int,
-      policies: [MagentProxyPolicy],
-      associationError: Binding<String?>
-    ) {
-      let targetRuleID = ruleID
-      var descriptor = FetchDescriptor<MagentProxyPolicyRule>(
+  /// 删除当前详情中的策略及其规则关联，并清理表格选择。
+  private func delete(_ policy: MagentProxyPolicy) {
+    do {
+      let targetPolicyID = policy.id
+      let descriptor = FetchDescriptor<MagentProxyPolicyRule>(
         predicate: #Predicate<MagentProxyPolicyRule> { policyRule in
-          policyRule.ruleID == targetRuleID
+          policyRule.policyID == targetPolicyID
         }
       )
-      descriptor.fetchLimit = 1
-      _policyRules = Query(descriptor)
-      self.policies = policies
-      _associationError = associationError
-      self.ruleID = ruleID
-    }
-
-    var body: some View {
-      let policyRule = policyRules.first
-      let policyIDs = Set(policies.map(\.id))
-
-      Picker(
-        "策略",
-        selection: Binding<Int?>(
-          get: {
-            guard let policyRule, policyIDs.contains(policyRule.policyID) else {
-              return nil
-            }
-            return policyRule.policyID
-          },
-          set: { policyID in
-            if policyRule?.policyID == policyID {
-              return
-            }
-
-            do {
-              switch (policyRule, policyID) {
-              case (.some(let policyRule), .some(let policyID)):
-                policyRule.policyID = policyID
-                policyRule.updatedAt = .now
-              case (.some(let policyRule), .none):
-                modelContext.delete(policyRule)
-              case (.none, .some(let policyID)):
-                modelContext.insert(
-                  MagentProxyPolicyRule(policyID: policyID, ruleID: ruleID)
-                )
-              case (.none, .none):
-                return
-              }
-
-              try modelContext.save()
-              associationError = nil
-            } catch {
-              modelContext.rollback()
-              associationError = error.localizedDescription
-            }
-          }
-        )
-      ) {
-        Text("未选择")
-          .tag(nil as Int?)
-
-        ForEach(policies) { policy in
-          Text(policy.name)
-            .tag(policy.id as Int?)
-        }
+      for policyRule in try modelContext.fetch(descriptor) {
+        modelContext.delete(policyRule)
       }
-      .labelsHidden()
-      .frame(maxWidth: .infinity, alignment: .leading)
+      modelContext.delete(policy)
+      try modelContext.save()
+      selectedPolicy = nil
+      actionError = nil
+    } catch {
+      if policy.isDeleted {
+        modelContext.rollback()
+      }
+      actionError = error.localizedDescription
     }
   }
 
-  /// 以双列卡片网格展示代理策略，并承载卡片内的直接修改。
-  private struct ProxyPolicyGridView: View {
-    @Query private var policies: [MagentProxyPolicy]
-    @Query private var nodes: [MagentProxyNode]
-    @State private var actionError: String?
-
-    /// 创建按 id 稳定排序且数量有上限的策略与节点查询。
-    init(maximumCachedModelCount: Int) {
-      precondition(maximumCachedModelCount > 0, "maximumCachedModelCount must be positive")
-
-      var descriptor = FetchDescriptor<MagentProxyPolicy>(
-        sortBy: [SortDescriptor(\MagentProxyPolicy.id, order: .forward)]
-      )
-      descriptor.fetchLimit = maximumCachedModelCount
-      _policies = Query(descriptor)
-
-      var nodeDescriptor = FetchDescriptor<MagentProxyNode>(
-        sortBy: [
-          SortDescriptor(\MagentProxyNode.name, order: .forward),
-          SortDescriptor(\MagentProxyNode.id, order: .forward),
-        ]
-      )
-      nodeDescriptor.fetchLimit = maximumCachedModelCount
-      _nodes = Query(nodeDescriptor)
-    }
-
-    var body: some View {
-      Group {
-        if policies.isEmpty {
-          ContentUnavailableView(
-            "暂无代理策略",
-            systemImage: "arrow.triangle.branch",
-            description: Text("点击工具栏的增加策略按钮后会显示在这里")
-          )
-        } else {
-          ScrollView {
-            LazyVGrid(
-              columns: [
-                GridItem(.flexible(minimum: 0), spacing: 12, alignment: .top),
-                GridItem(.flexible(minimum: 0), spacing: 12, alignment: .top),
-              ],
-              spacing: 12
-            ) {
-              ForEach(policies) { policy in
-                ProxyPolicyCardView(
-                  policy: policy,
-                  nodes: nodes,
-                  actionError: $actionError
-                )
-              }
-            }
-            .padding(12)
-          }
-        }
-      }
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .alert(
-        "操作代理策略失败",
-        isPresented: Binding(
-          get: { actionError != nil },
-          set: { isPresented in
-            if isPresented == false {
-              actionError = nil
-            }
-          }
-        )
-      ) {
-        Button("好", role: .cancel) {
-          actionError = nil
-        }
-      } message: {
-        Text(actionError ?? "")
-      }
-    }
-  }
-
-  /// 在标题输入框存在期间监听发生在其原生边界之外的鼠标点击。
-  private struct ProxyPolicyNameEditingBoundary: NSViewRepresentable {
-    let onClickOutside: () -> Void
-
-    func makeNSView(context: Context) -> ProxyPolicyNameEditingProbeView {
-      let probeView = ProxyPolicyNameEditingProbeView()
-      probeView.onClickOutside = onClickOutside
-      probeView.startMonitoring()
-      return probeView
-    }
-
-    func updateNSView(_ nsView: ProxyPolicyNameEditingProbeView, context: Context) {
-      nsView.onClickOutside = onClickOutside
-      nsView.startMonitoring()
-    }
-
-    static func dismantleNSView(
-      _ nsView: ProxyPolicyNameEditingProbeView,
-      coordinator: Void
-    ) {
-      nsView.stopMonitoring()
-    }
-  }
-
-  /// 以标题输入框的原生边界判断一次鼠标点击是否发生在输入框外。
-  @MainActor
-  private final class ProxyPolicyNameEditingProbeView: NSView {
-    var onClickOutside: () -> Void = {}
-    private var localMouseMonitor: Any?
-    private var windowDidResignObserver: NSObjectProtocol?
-
-    override func viewDidMoveToWindow() {
-      super.viewDidMoveToWindow()
-      if window == nil {
-        stopMonitoring()
-      } else {
-        startMonitoring()
-      }
-    }
-
-    func startMonitoring() {
-      observeWindowResignation()
-      guard localMouseMonitor == nil else { return }
-
-      localMouseMonitor = NSEvent.addLocalMonitorForEvents(
-        matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
-      ) { [weak self] event in
-        guard let self else { return event }
-
-        if let window, event.window === window,
-          bounds.contains(convert(event.locationInWindow, from: nil))
-        {
-          return event
-        }
-
-        Task { @MainActor [weak self] in
-          self?.onClickOutside()
-        }
-        return event
-      }
-    }
-
-    func stopMonitoring() {
-      if let localMouseMonitor {
-        NSEvent.removeMonitor(localMouseMonitor)
-        self.localMouseMonitor = nil
-      }
-      if let windowDidResignObserver {
-        NotificationCenter.default.removeObserver(windowDidResignObserver)
-        self.windowDidResignObserver = nil
-      }
-    }
-
-    private func observeWindowResignation() {
-      guard let window, windowDidResignObserver == nil else { return }
-      windowDidResignObserver = NotificationCenter.default.addObserver(
-        forName: NSWindow.didResignKeyNotification,
-        object: window,
-        queue: .main
-      ) { [weak self] _ in
-        Task { @MainActor [weak self] in
-          self?.onClickOutside()
-        }
-      }
-    }
-  }
-
-  /// 展示一条策略的名称和节点，并在卡片内完成修改与删除。
-  private struct ProxyPolicyCardView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Bindable var policy: MagentProxyPolicy
-    let nodes: [MagentProxyNode]
-    @Binding var actionError: String?
-    @State private var draftName = ""
-    @State private var isEditingName = false
-    @FocusState private var isNameFocused: Bool
-
-    var body: some View {
-      let finishNameEditing = {
-        guard isEditingName else { return }
-        defer { isEditingName = false }
-
-        isNameFocused = false
-        let name = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard name.isEmpty == false else {
-          draftName = policy.name
-          actionError =
-            MagentXError.invalidParameter(
-              String(localized: "Name is required")
-            ).localizedDescription
-          return
-        }
-        guard name != policy.name else { return }
-
-        policy.name = name
-        policy.updatedAt = .now
-        do {
-          try modelContext.save()
-          actionError = nil
-        } catch {
-          modelContext.rollback()
-          draftName = policy.name
-          actionError = error.localizedDescription
-        }
-      }
-
-      let deleteAction = {
-        do {
-          let targetPolicyID = policy.id
-          let descriptor = FetchDescriptor<MagentProxyPolicyRule>(
-            predicate: #Predicate<MagentProxyPolicyRule> { policyRule in
-              policyRule.policyID == targetPolicyID
-            }
-          )
-          for policyRule in try modelContext.fetch(descriptor) {
-            modelContext.delete(policyRule)
-          }
-          modelContext.delete(policy)
-          try modelContext.save()
-          actionError = nil
-        } catch {
-          modelContext.rollback()
-          actionError = error.localizedDescription
-        }
-      }
-
-      GroupBox {
-        if isEditingName {
-          TextField("名称", text: $draftName)
-            .focused($isNameFocused)
-            .onAppear {
-              Task { @MainActor in
-                isNameFocused = true
-              }
-            }
-            .background {
-              ProxyPolicyNameEditingBoundary(onClickOutside: finishNameEditing)
-                .allowsHitTesting(false)
-            }
-            .onSubmit {
-              finishNameEditing()
-            }
-        } else {
-          Button {
-            draftName = policy.name
-            isEditingName = true
-          } label: {
-            Text(policy.name)
-              .font(.headline)
-              .lineLimit(1)
-              .frame(maxWidth: .infinity, alignment: .leading)
-              .contentShape(Rectangle())
-          }
-          .buttonStyle(.plain)
-          .help("点击修改名称")
-        }
-
-        Text("代理节点")
-          .font(.subheadline.weight(.semibold))
-          .frame(maxWidth: .infinity, alignment: .leading)
-
-        Picker(
-          "代理节点",
-          selection: Binding(
-            get: { policy.nodeID },
-            set: { nodeID in
-              guard nodeID != policy.nodeID else { return }
-
-              do {
-                let targetNodeID = nodeID
-                let targetPolicyID = policy.id
-                let descriptor = FetchDescriptor<MagentProxyPolicy>(
-                  predicate: #Predicate<MagentProxyPolicy> { storedPolicy in
-                    storedPolicy.nodeID == targetNodeID && storedPolicy.id != targetPolicyID
-                  }
-                )
-                guard try modelContext.fetchCount(descriptor) == 0 else {
-                  throw MagentXError.invalidParameter(
-                    String(localized: "Proxy node already belongs to another policy")
-                  )
-                }
-
-                policy.nodeID = nodeID
-                policy.updatedAt = .now
-                try modelContext.save()
-                actionError = nil
-              } catch {
-                modelContext.rollback()
-                actionError = error.localizedDescription
-              }
-            }
-          )
-        ) {
-          ForEach(nodes) { node in
-            Text(node.name)
-              .tag(node.id)
-          }
-        }
-        .pickerStyle(.menu)
-        .labelsHidden()
-        .frame(maxWidth: .infinity, alignment: .leading)
-
-        Divider()
-
-        if #available(macOS 26.0, *) {
-          Button(role: .destructive, action: deleteAction) {
-            Label("删除策略", systemImage: "trash")
-          }
-          .buttonStyle(.glass)
-          .tint(.red)
-          .help("删除策略")
-        } else {
-          Button(role: .destructive, action: deleteAction) {
-            Label("删除策略", systemImage: "trash")
-          }
-          .buttonStyle(.bordered)
-          .tint(.red)
-          .help("删除策略")
-        }
-      }
-    }
-  }
-
-  /// 在独立 SwiftData 上下文中编辑代理策略，并提供原生表单保存和取消语义。
+  /// 新建策略的独立 SwiftData 表单，在保存或取消前不修改主上下文。
   private struct ProxyPolicyFormView: View {
-    @Environment(\.dismiss) private var dismiss
     @Query(
       sort: [
         SortDescriptor(\MagentProxyNode.name, order: .forward),
@@ -609,6 +231,8 @@ struct ProxyPolicyView: View {
       ]
     ) private var nodes: [MagentProxyNode]
     let proxyPolicyViewModel: ProxyPolicyViewModel
+    let onSaved: (Int) -> Void
+    let onCancelled: () -> Void
     @State private var saveError: String?
 
     var body: some View {
@@ -621,8 +245,12 @@ struct ProxyPolicyView: View {
         }
 
       Form {
-        Section {
+        Section("策略配置") {
           TextField("名称", text: $policy.name)
+            .accessibilityIdentifier("new-policy-name")
+
+          Toggle("启用", isOn: $policy.enable)
+            .accessibilityIdentifier("new-policy-enable")
 
           Picker("代理节点", selection: $policy.nodeID) {
             ForEach(nodes) { node in
@@ -631,34 +259,29 @@ struct ProxyPolicyView: View {
             }
           }
           .pickerStyle(.menu)
+          .accessibilityIdentifier("new-policy-node")
 
           if let nameError {
             Label(nameError.localizedDescription, systemImage: "exclamationmark.triangle.fill")
               .font(.caption)
               .foregroundStyle(.red)
           }
-        } header: {
-          Text("策略配置")
-            .font(.title3.weight(.semibold))
         }
       }
       .formStyle(.grouped)
-      .frame(minWidth: 420, minHeight: 260)
-      .toolbar {
-        ToolbarItem(placement: .cancellationAction) {
-          Button("取消", role: .cancel) {
-            proxyPolicyViewModel.rollback()
-            dismiss()
-          }
-          .keyboardShortcut(.cancelAction)
-        }
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+      .safeAreaInset(edge: .bottom) {
+        HStack {
+          Button("取消", role: .cancel, action: onCancelled)
+            .keyboardShortcut(.cancelAction)
 
-        ToolbarItem(placement: .confirmationAction) {
+          Spacer()
+
           Button("保存") {
             do {
               try proxyPolicyViewModel.save()
               saveError = nil
-              dismiss()
+              onSaved(proxyPolicyViewModel.id)
             } catch {
               saveError = error.localizedDescription
             }
@@ -666,13 +289,15 @@ struct ProxyPolicyView: View {
           .keyboardShortcut(.defaultAction)
           .disabled(nameError != nil || nodes.isEmpty)
         }
+        .padding()
+        .background(.bar)
       }
       .alert(
         "保存代理策略失败",
         isPresented: Binding(
           get: { saveError != nil },
           set: { isPresented in
-            if isPresented == false {
+            if !isPresented {
               saveError = nil
             }
           }
@@ -687,6 +312,198 @@ struct ProxyPolicyView: View {
       .onDisappear {
         proxyPolicyViewModel.rollback()
       }
+    }
+  }
+}
+
+/// 单个策略的规则关联总数单元格，通过计数查询避免加载完整关联模型集合。
+@MainActor
+private struct ProxyPolicyRuleCountView: View {
+  @Environment(\.modelContext) private var modelContext
+  let policyID: Int
+  @Binding var actionError: String?
+  @State private var ruleCount: Int?
+
+  var body: some View {
+    Group {
+      if let ruleCount {
+        Text(ruleCount, format: .number)
+      } else {
+        Text("—")
+      }
+    }
+    .lineLimit(1)
+    .task(id: policyID) {
+      do {
+        let targetPolicyID = policyID
+        let descriptor = FetchDescriptor<MagentProxyPolicyRule>(
+          predicate: #Predicate<MagentProxyPolicyRule> { policyRule in
+            policyRule.policyID == targetPolicyID
+          }
+        )
+        ruleCount = try modelContext.fetchCount(descriptor)
+      } catch {
+        actionError = error.localizedDescription
+      }
+    }
+  }
+}
+
+/// 单个已有策略的绑定详情，字段修改在验证后直接提交到主 SwiftData 上下文。
+@MainActor
+private struct ProxyPolicyDetailView: View {
+  @Environment(\.modelContext) private var modelContext
+  @Query(
+    sort: [
+      SortDescriptor(\MagentProxyNode.name, order: .forward),
+      SortDescriptor(\MagentProxyNode.id, order: .forward),
+    ]
+  ) private var nodes: [MagentProxyNode]
+  let policy: MagentProxyPolicy
+  @Binding var actionError: String?
+  let onDelete: () -> Void
+  @State private var nameDraft = ""
+
+  var body: some View {
+    Form {
+      Section("策略详情") {
+        LabeledContent("名称") {
+          EditableFieldFormView(
+            onEditingBegan: {
+              nameDraft = policy.name
+              return true
+            },
+            onEditingEnded: {
+              save {
+                let name = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else {
+                  throw MagentXError.invalidParameter(String(localized: "Name is required"))
+                }
+                policy.name = name
+              }
+              nameDraft = policy.name
+            }
+          ) {
+            Text(policy.name)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          } editor: { focus, _ in
+            TextField("名称", text: $nameDraft)
+              .labelsHidden()
+              .focused(focus)
+              .multilineTextAlignment(.trailing)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          }
+          .help("点击修改名称")
+          .accessibilityIdentifier("policy-name")
+        }
+
+        Toggle(
+          "启用",
+          isOn: Binding(
+            get: { policy.enable },
+            set: { enable in
+              guard enable != policy.enable else { return }
+              save {
+                policy.enable = enable
+              }
+            }
+          )
+        )
+        .accessibilityIdentifier("policy-enable")
+
+        LabeledContent("代理节点") {
+          Picker(
+            "代理节点",
+            selection: Binding(
+              get: { policy.nodeID },
+              set: { nodeID in
+                guard nodeID != policy.nodeID else { return }
+                save {
+                  let targetNodeID = nodeID
+                  let targetPolicyID = policy.id
+                  let descriptor = FetchDescriptor<MagentProxyPolicy>(
+                    predicate: #Predicate<MagentProxyPolicy> { storedPolicy in
+                      storedPolicy.nodeID == targetNodeID && storedPolicy.id != targetPolicyID
+                    }
+                  )
+                  guard try modelContext.fetchCount(descriptor) == 0 else {
+                    throw MagentXError.invalidParameter(
+                      String(localized: "Proxy node already belongs to another policy")
+                    )
+                  }
+                  policy.nodeID = nodeID
+                }
+              }
+            )
+          ) {
+            ForEach(nodes) { node in
+              Text(node.name)
+                .tag(node.id)
+            }
+          }
+          .labelsHidden()
+          .pickerStyle(.menu)
+          .frame(maxWidth: .infinity, alignment: .trailing)
+          .accessibilityIdentifier("policy-node")
+        }
+      }
+    }
+    .formStyle(.grouped)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    .safeAreaInset(edge: .bottom) {
+      HStack {
+        Spacer()
+
+        if #available(macOS 26.0, *) {
+          Button(role: .destructive, action: onDelete) {
+            Label("删除策略", systemImage: "trash")
+              .foregroundStyle(.red)
+              .padding(5)
+          }
+          .labelStyle(.iconOnly)
+          .buttonStyle(.glass(.clear.tint(.red)))
+          .controlSize(.large)
+          .buttonBorderShape(.circle)
+          .help("删除策略")
+          .accessibilityLabel("删除策略")
+        } else {
+          Button(role: .destructive, action: onDelete) {
+            Label("删除策略", systemImage: "trash")
+          }
+          .labelStyle(.iconOnly)
+          .buttonStyle(.bordered)
+          .controlSize(.large)
+          .buttonBorderShape(.circle)
+          .tint(.red)
+          .help("删除策略")
+          .accessibilityLabel("删除策略")
+        }
+      }
+      .padding()
+      .background(.bar)
+    }
+  }
+
+  /// 校验并保存一个详情字段的修改；失败时恢复策略原值并交给页面展示错误。
+  private func save(_ changes: () throws -> Void) {
+    guard policy.modelContext != nil, !policy.isDeleted else { return }
+    let previousName = policy.name
+    let previousEnable = policy.enable
+    let previousNodeID = policy.nodeID
+    let previousUpdatedAt = policy.updatedAt
+
+    do {
+      try changes()
+      guard modelContext.hasChanges else { return }
+      policy.updatedAt = .now
+      try modelContext.save()
+      actionError = nil
+    } catch {
+      policy.name = previousName
+      policy.enable = previousEnable
+      policy.nodeID = previousNodeID
+      policy.updatedAt = previousUpdatedAt
+      actionError = error.localizedDescription
     }
   }
 }

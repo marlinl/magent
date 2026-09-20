@@ -85,6 +85,54 @@ ContentView
 - Keep one-use native components and modifiers directly in `body`.
 - Move reusable non-UI business logic to the responsible Model or Service.
 
+### Icon-Only Glass Action Buttons
+
+- Use this standard for compact action buttons that are directly visible in a toolbar or detail
+  action area. Keep the implementation as a native `Button` with a `Label`; do not draw a custom
+  background or circle.
+- Apply `.labelStyle(.iconOnly)` and provide matching `.help(...)` and
+  `.accessibilityLabel(...)` text. Use `.buttonStyle(.glass)` for a standard standalone action on
+  macOS 26 or later, and `.buttonBorderShape(.circle)` when the button is circular.
+- A button inside the native window toolbar may inherit the toolbar's system glass presentation.
+  A matching button placed in detail content must apply its glass style explicitly and keep the
+  same visible diameter as the corresponding toolbar action.
+- Do not use `.controlSize(.small)` for a detail action that must match a toolbar action. Use the
+  confirmed large circular treatment instead.
+- Destructive actions must remain visibly translucent rather than becoming a solid red control.
+  Use a red symbol over clear red-tinted glass on macOS 26 or later:
+
+  ```swift
+  if #available(macOS 26.0, *) {
+    Button(role: .destructive, action: onDelete) {
+      Label("Delete", systemImage: "trash")
+        .foregroundStyle(.red)
+        .padding(5)
+    }
+    .labelStyle(.iconOnly)
+    .buttonStyle(.glass(.clear.tint(.red)))
+    .controlSize(.large)
+    .buttonBorderShape(.circle)
+    .help("Delete")
+    .accessibilityLabel("Delete")
+  } else {
+    Button(role: .destructive, action: onDelete) {
+      Label("Delete", systemImage: "trash")
+    }
+    .labelStyle(.iconOnly)
+    .buttonStyle(.bordered)
+    .controlSize(.large)
+    .buttonBorderShape(.circle)
+    .tint(.red)
+    .help("Delete")
+    .accessibilityLabel("Delete")
+  }
+  ```
+
+- Keep the `.padding(5)` in the macOS 26 destructive pattern when matching the established
+  toolbar-button diameter. Do not replace `.glass(.clear.tint(.red))` with a default glass style
+  plus an outer red tint, because that produces an opaque-looking red control instead of the
+  required transparent red glass.
+
 ### Do Not Use
 
 - Do not begin with `HStack`, `VStack`, `ZStack`, or a custom row or container when a native

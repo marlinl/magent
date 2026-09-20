@@ -541,12 +541,13 @@ private struct ProxyNodeDetailView: View {
         if #available(macOS 26.0, *) {
           Button(role: .destructive, action: onDelete) {
             Label("删除节点", systemImage: "trash")
+              .foregroundStyle(.red)
+              .padding(5)
           }
           .labelStyle(.iconOnly)
-          .buttonStyle(.glass)
-          .controlSize(.small)
+          .buttonStyle(.glass(.clear.tint(.red)))
+          .controlSize(.large)
           .buttonBorderShape(.circle)
-          .tint(.red)
           .help("删除节点")
           .accessibilityLabel("删除节点")
         } else {
@@ -555,7 +556,7 @@ private struct ProxyNodeDetailView: View {
           }
           .labelStyle(.iconOnly)
           .buttonStyle(.bordered)
-          .controlSize(.small)
+          .controlSize(.large)
           .buttonBorderShape(.circle)
           .tint(.red)
           .help("删除节点")

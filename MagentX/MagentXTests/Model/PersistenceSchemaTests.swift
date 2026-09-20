@@ -39,7 +39,8 @@ struct PersistenceSchemaTests {
       order: 100,
       source: "user"
     )
-    let policy = MagentProxyPolicy(id: 1, name: "Default", nodeID: node.id)
+    let policy = MagentProxyPolicy(id: 1, name: "Default", enable: false, nodeID: node.id)
+    let defaultPolicy = MagentProxyPolicy(id: 2, name: "Default enabled", nodeID: UUID())
     let policyRule = MagentProxyPolicyRule(policyID: policy.id, ruleID: rule.id)
 
     modelContext.insert(node)
@@ -52,5 +53,7 @@ struct PersistenceSchemaTests {
     #expect(try modelContext.fetchCount(FetchDescriptor<MagentProxyRule>()) == 1)
     #expect(try modelContext.fetchCount(FetchDescriptor<MagentProxyPolicy>()) == 1)
     #expect(try modelContext.fetchCount(FetchDescriptor<MagentProxyPolicyRule>()) == 1)
+    #expect(try modelContext.fetch(FetchDescriptor<MagentProxyPolicy>()).first?.enable == false)
+    #expect(defaultPolicy.enable)
   }
 }

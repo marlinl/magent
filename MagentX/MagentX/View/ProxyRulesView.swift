@@ -12,7 +12,7 @@ import Magent
 import SwiftData
 import SwiftUI
 
-/// 代理规则页面，直接观察 SwiftData 规则并提供新增、修改、删除和同步交互。
+/// 代理规则页面，在原生表格和详情区域中提供直接的 SwiftData CRUD 交互。
 @MainActor
 struct ProxyRulesView: View {
   @Environment(\.modelContext) private var modelContext
@@ -20,21 +20,143 @@ struct ProxyRulesView: View {
   @Binding var toolbarButtons: [ContentToolbarButton]
   @State private var searchText = ""
   @FocusState private var isSearchFocused: Bool
-  @State private var selectedRuleID: Int?
+  @State private var selectedRule: MagentProxyRule?
   @State private var proxyRuleViewModel: ProxyRuleViewModel?
-  @State private var formError: String?
+  @State private var actionError: String?
 
   private static let maximumCachedModelCount = 1_000
 
   var body: some View {
     let normalizedSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-    let content = ProxyRuleTableView(
-      searchText: normalizedSearchText,
-      maximumCachedModelCount: Self.maximumCachedModelCount,
-      selectedRuleID: $selectedRuleID,
-      proxyRuleViewModel: $proxyRuleViewModel
-    )
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    let sortDescriptors = [SortDescriptor(\MagentProxyRule.id, order: .forward)]
+    let descriptor: FetchDescriptor<MagentProxyRule> = {
+      if normalizedSearchText.isEmpty {
+        return FetchDescriptor<MagentProxyRule>(sortBy: sortDescriptors)
+      }
+
+      let query = normalizedSearchText
+      return FetchDescriptor<MagentProxyRule>(
+        predicate: #Predicate<MagentProxyRule> { rule in
+          rule.matchValue.contains(query)
+        },
+        sortBy: sortDescriptors
+      )
+    }()
+    let content = GeometryReader { geometry in
+      HSplitView {
+        ScrollTableView(
+          selection: Binding(
+            get: { selectedRule?.id },
+            set: { ruleID in
+              guard ruleID != selectedRule?.id else { return }
+              guard let ruleID else {
+                selectedRule = nil
+                return
+              }
+
+              do {
+                var descriptor = FetchDescriptor<MagentProxyRule>(
+                  predicate: #Predicate { $0.id == ruleID }
+                )
+                descriptor.fetchLimit = 1
+                guard let rule = try modelContext.fetch(descriptor).first else {
+                  throw MagentXError.missingMagentProxyRule(ruleID)
+                }
+                selectedRule = rule
+                actionError = nil
+              } catch {
+                actionError = error.localizedDescription
+              }
+            }
+          ),
+          descriptor: descriptor,
+          queryID: normalizedSearchText,
+          maximumCachedModelCount: Self.maximumCachedModelCount,
+        ) {
+          TableColumn("匹配值") { rule in
+            Text(rule.matchValue)
+              .lineLimit(1)
+          }
+          // 首列吸收表格剩余宽度，避免最后一列右侧出现无法使用的空白区域。
+          .width(min: 72, ideal: 140)
+
+          TableColumn("类型") { rule in
+            switch MatchType(rawValue: rule.matchType) {
+            case .exactDomain:
+              Text("精确域名")
+            case .domainSuffix:
+              Text("域名后缀")
+            case .domainKeyword:
+              Text("域名关键字")
+            case .ipCIDR:
+              Text("IP 网段")
+            case .urlRegex:
+              Text("URL 正则")
+            case .none:
+              Text(rule.matchType)
+            }
+          }
+          .width(min: 50, ideal: 64, max: 76)
+
+          TableColumn("顺序") { rule in
+            Text(rule.order, format: .number)
+              .lineLimit(1)
+          }
+          .width(min: 34, ideal: 44, max: 52)
+
+          TableColumn("规则") { rule in
+            Text(rule.decision.uppercased())
+              .lineLimit(1)
+          }
+          .width(min: 40, ideal: 52, max: 60)
+        }
+        .accessibilityIdentifier("proxy-rules-table")
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(width: geometry.size.width * 0.55)
+        .frame(maxHeight: .infinity)
+
+        Group {
+          if let proxyRuleViewModel, proxyRuleViewModel.isNew {
+            ProxyRuleFormView(
+              proxyRuleViewModel: proxyRuleViewModel,
+              onSaved: { ruleID in
+                do {
+                  let descriptor = FetchDescriptor<MagentProxyRule>(
+                    predicate: #Predicate<MagentProxyRule> { rule in rule.id == ruleID }
+                  )
+                  guard let savedRule = try modelContext.fetch(descriptor).first else {
+                    throw MagentXError.missingMagentProxyRule(ruleID)
+                  }
+                  selectedRule = savedRule
+                  self.proxyRuleViewModel = nil
+                  actionError = nil
+                } catch {
+                  actionError = error.localizedDescription
+                }
+              },
+              onCancelled: {
+                proxyRuleViewModel.rollback()
+                self.proxyRuleViewModel = nil
+                actionError = nil
+              }
+            )
+          } else if let selectedRule {
+            ProxyRuleDetailView(rule: selectedRule, actionError: $actionError) {
+              delete(selectedRule)
+            }
+            .id(selectedRule.id)
+          } else {
+            ContentUnavailableView(
+              "选择代理规则",
+              systemImage: "list.bullet.rectangle",
+              description: Text("从左侧表格选择规则以查看详情，或添加一条新规则")
+            )
+          }
+        }
+        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
     .padding(.top, 1)
     .overlay(alignment: .top) {
       Divider()
@@ -43,46 +165,36 @@ struct ProxyRulesView: View {
     Group {
       content
         .simultaneousGesture(
-          TapGesture()
-            .onEnded {
-              isSearchFocused = false
-            }
+          TapGesture().onEnded {
+            isSearchFocused = false
+          }
         )
         .searchable(text: $searchText, placement: .toolbar, prompt: "搜索规则")
         .searchFocused($isSearchFocused)
     }
-    .sheet(item: $proxyRuleViewModel) { viewModel in
-      ProxyRuleFormView(
-        proxyRuleViewModel: viewModel,
-        onSaved: { ruleID in
-          selectedRuleID = ruleID
-          searchText = ""
-        }
-      )
-    }
     .alert(
-      "打开规则表单失败",
+      "代理规则操作失败",
       isPresented: Binding(
-        get: { formError != nil },
+        get: { actionError != nil },
         set: { isPresented in
-          if isPresented == false {
-            formError = nil
+          if !isPresented {
+            actionError = nil
           }
         }
       )
     ) {
       Button("好", role: .cancel) {
-        formError = nil
+        actionError = nil
       }
     } message: {
-      Text(formError ?? "")
+      Text(actionError ?? "")
     }
     .alert(
       "规则同步失败",
       isPresented: Binding(
         get: { syncProxyRulesCoordinator.syncError != nil },
         set: { isPresented in
-          if isPresented == false {
+          if !isPresented {
             syncProxyRulesCoordinator.syncError = nil
           }
         }
@@ -112,14 +224,7 @@ struct ProxyRulesView: View {
       } else {
         toolbarButtons = [
           ContentToolbarButton(title: "增加规则", systemImage: "plus") {
-            do {
-              proxyRuleViewModel = try ProxyRuleViewModel(
-                modelContainer: modelContext.container
-              )
-              formError = nil
-            } catch {
-              formError = error.localizedDescription
-            }
+            add()
           },
           ContentToolbarButton(title: "同步规则", systemImage: "arrow.clockwise") {
             syncProxyRulesCoordinator.sync()
@@ -127,141 +232,45 @@ struct ProxyRulesView: View {
         ]
       }
     }
-  }
-
-  /// 观察有数量上限的代理规则模型，并由系统表格管理可见行及缓冲区。
-  private struct ProxyRuleTableView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Binding private var selectedRuleID: Int?
-    @Binding private var proxyRuleViewModel: ProxyRuleViewModel?
-    @State private var editError: String?
-
-    private let searchText: String
-    private let maximumCachedModelCount: Int
-
-    /// 接收规则页面持有的选择和编辑绑定，并将查询条件交给公共表格。
-    init(
-      searchText: String,
-      maximumCachedModelCount: Int,
-      selectedRuleID: Binding<Int?>,
-      proxyRuleViewModel: Binding<ProxyRuleViewModel?>
-    ) {
-      _selectedRuleID = selectedRuleID
-      _proxyRuleViewModel = proxyRuleViewModel
-      self.searchText = searchText
-      self.maximumCachedModelCount = maximumCachedModelCount
-    }
-
-    var body: some View {
-      let sortDescriptors = [SortDescriptor(\MagentProxyRule.id, order: .forward)]
-      let descriptor: FetchDescriptor<MagentProxyRule> = {
-        if searchText.isEmpty {
-          return FetchDescriptor<MagentProxyRule>(sortBy: sortDescriptors)
-        }
-
-        let query = searchText
-        return FetchDescriptor<MagentProxyRule>(
-          predicate: #Predicate<MagentProxyRule> { rule in
-            rule.matchValue.contains(query)
-          },
-          sortBy: sortDescriptors
-        )
-      }()
-
-      ScrollTableView(
-        selection: $selectedRuleID,
-        descriptor: descriptor,
-        queryID: searchText,
-        maximumCachedModelCount: maximumCachedModelCount,
-      ) {
-        TableColumn("匹配值") { rule in
-          Text(rule.matchValue)
-            .lineLimit(1)
-        }
-        .width(min: 64, ideal: 280)
-
-        TableColumn("类型") { rule in
-          Text(rule.matchType)
-            .lineLimit(1)
-        }
-        .width(min: 44, ideal: 80, max: 110)
-
-        TableColumn("顺序") { rule in
-          Text(rule.order, format: .number)
-            .lineLimit(1)
-        }
-        .width(min: 40, ideal: 56, max: 72)
-
-        TableColumn("来源") { rule in
-          Text(rule.source.isEmpty ? "-" : rule.source)
-            .lineLimit(1)
-        }
-        .width(min: 44, ideal: 76, max: 100)
-
-        TableColumn("规则") { rule in
-          Text(rule.decision.uppercased())
-            .lineLimit(1)
-        }
-        .width(min: 44, ideal: 64, max: 84)
-
-        TableColumn("操作") { rule in
-          Menu {
-            Button {
-              do {
-                proxyRuleViewModel = try ProxyRuleViewModel(
-                  modelContainer: modelContext.container,
-                  ruleID: rule.id
-                )
-                editError = nil
-              } catch {
-                editError = error.localizedDescription
-              }
-            } label: {
-              Label("编辑规则", systemImage: "pencil")
-            }
-
-            Button(role: .destructive) {
-              if proxyRuleViewModel?.id == rule.id {
-                proxyRuleViewModel = nil
-              }
-              if selectedRuleID == rule.id { selectedRuleID = nil }
-              modelContext.delete(rule)
-            } label: {
-              Label("删除规则", systemImage: "trash")
-            }
-          } label: {
-            Label("规则操作", systemImage: "ellipsis.circle")
-              .labelStyle(.iconOnly)
-          }
-          .help("规则操作")
-        }
-        .width(min: 72, ideal: 88, max: 96)
-      }
-      .alert(
-        "读取代理规则失败",
-        isPresented: Binding(
-          get: { editError != nil },
-          set: { isPresented in
-            if isPresented == false {
-              editError = nil
-            }
-          }
-        )
-      ) {
-        Button("好", role: .cancel) {
-          editError = nil
-        }
-      } message: {
-        Text(editError ?? "")
+    .onDisappear {
+      if let proxyRuleViewModel, proxyRuleViewModel.isNew {
+        proxyRuleViewModel.rollback()
+        self.proxyRuleViewModel = nil
       }
     }
   }
 
-  /// 直接编辑独立 SwiftData 上下文中的代理规则，并内化保存与取消交互。
+  /// 打开使用独立上下文的新规则表单，支持保存前取消。
+  private func add() {
+    proxyRuleViewModel?.rollback()
+    do {
+      proxyRuleViewModel = try ProxyRuleViewModel(modelContainer: modelContext.container)
+      actionError = nil
+    } catch {
+      actionError = error.localizedDescription
+    }
+  }
+
+  /// 删除当前详情中的规则，并清理表格选择。
+  private func delete(_ rule: MagentProxyRule) {
+    do {
+      modelContext.delete(rule)
+      try modelContext.save()
+      selectedRule = nil
+      actionError = nil
+    } catch {
+      if rule.isDeleted {
+        modelContext.rollback()
+      }
+      actionError = error.localizedDescription
+    }
+  }
+
+  /// 新建规则的独立 SwiftData 表单，在保存或取消前不修改主上下文。
   private struct ProxyRuleFormView: View {
-    @Environment(\.dismiss) private var dismiss
     let proxyRuleViewModel: ProxyRuleViewModel
     let onSaved: (Int) -> Void
+    let onCancelled: () -> Void
     @State private var saveError: String?
 
     var body: some View {
@@ -274,12 +283,13 @@ struct ProxyRulesView: View {
         }
 
       Form {
-        Section {
+        Section("规则配置") {
           Picker("匹配类型", selection: $rule.matchType) {
-            ForEach(MatchType.allCases, id: \.rawValue) { matchType in
-              Text(matchType.rawValue)
-                .tag(matchType.rawValue)
-            }
+            Text("精确域名").tag(MatchType.exactDomain.rawValue)
+            Text("域名后缀").tag(MatchType.domainSuffix.rawValue)
+            Text("域名关键字").tag(MatchType.domainKeyword.rawValue)
+            Text("IP 网段").tag(MatchType.ipCIDR.rawValue)
+            Text("URL 正则").tag(MatchType.urlRegex.rawValue)
           }
           .pickerStyle(.menu)
 
@@ -290,6 +300,7 @@ struct ProxyRulesView: View {
           .pickerStyle(.menu)
 
           TextField("匹配值", text: $rule.matchValue)
+            .accessibilityIdentifier("new-rule-match-value")
           if let matchValueError {
             Label(
               matchValueError.localizedDescription,
@@ -298,28 +309,22 @@ struct ProxyRulesView: View {
             .font(.caption)
             .foregroundStyle(.red)
           }
-        } header: {
-          Text("规则配置")
-            .font(.title3.weight(.semibold))
         }
       }
       .formStyle(.grouped)
-      .toolbar {
-        ToolbarItem(placement: .cancellationAction) {
-          Button("取消", role: .cancel) {
-            proxyRuleViewModel.rollback()
-            dismiss()
-          }
-          .keyboardShortcut(.cancelAction)
-        }
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+      .safeAreaInset(edge: .bottom) {
+        HStack {
+          Button("取消", role: .cancel, action: onCancelled)
+            .keyboardShortcut(.cancelAction)
 
-        ToolbarItem(placement: .confirmationAction) {
+          Spacer()
+
           Button("保存") {
             do {
               try proxyRuleViewModel.save()
               saveError = nil
               onSaved(proxyRuleViewModel.id)
-              dismiss()
             } catch {
               saveError = error.localizedDescription
             }
@@ -327,13 +332,15 @@ struct ProxyRulesView: View {
           .keyboardShortcut(.defaultAction)
           .disabled(matchValueError != nil)
         }
+        .padding()
+        .background(.bar)
       }
       .alert(
         "保存代理规则失败",
         isPresented: Binding(
           get: { saveError != nil },
           set: { isPresented in
-            if isPresented == false {
+            if !isPresented {
               saveError = nil
             }
           }
@@ -348,6 +355,218 @@ struct ProxyRulesView: View {
       .onDisappear {
         proxyRuleViewModel.rollback()
       }
+    }
+  }
+}
+
+/// 单条已存规则的详情区域，使用字段草稿确保无效输入不会写入持久化模型。
+@MainActor
+private struct ProxyRuleDetailView: View {
+  @Environment(\.modelContext) private var modelContext
+  let rule: MagentProxyRule
+  @Binding var actionError: String?
+  let onDelete: () -> Void
+  @State private var matchTypeDraft: String
+  @State private var decisionDraft: String
+  @State private var orderDraft: String
+  @State private var matchValueDraft: String
+
+  /// 用当前规则值初始化详情草稿，避免切换规则时显示上一条记录的编辑状态。
+  init(
+    rule: MagentProxyRule,
+    actionError: Binding<String?>,
+    onDelete: @escaping () -> Void
+  ) {
+    self.rule = rule
+    _actionError = actionError
+    self.onDelete = onDelete
+    _matchTypeDraft = State(initialValue: rule.matchType)
+    _decisionDraft = State(initialValue: rule.decision)
+    _orderDraft = State(initialValue: String(rule.order))
+    _matchValueDraft = State(initialValue: rule.matchValue)
+  }
+
+  var body: some View {
+    Form {
+      Section("规则详情") {
+        LabeledContent("匹配类型") {
+          Picker("匹配类型", selection: $matchTypeDraft) {
+            Text("精确域名").tag(MatchType.exactDomain.rawValue)
+            Text("域名后缀").tag(MatchType.domainSuffix.rawValue)
+            Text("域名关键字").tag(MatchType.domainKeyword.rawValue)
+            Text("IP 网段").tag(MatchType.ipCIDR.rawValue)
+            Text("URL 正则").tag(MatchType.urlRegex.rawValue)
+          }
+          .labelsHidden()
+          .pickerStyle(.menu)
+          .frame(maxWidth: .infinity, alignment: .trailing)
+          .onChange(of: matchTypeDraft) { _, matchType in
+            save(
+              { rule.matchType = matchType },
+              resetDraft: { matchTypeDraft = rule.matchType }
+            )
+          }
+          .accessibilityIdentifier("rule-match-type")
+        }
+
+        LabeledContent("动作") {
+          Picker("动作", selection: $decisionDraft) {
+            Text("DIRECT").tag("direct")
+            Text("PROXY").tag("proxy")
+          }
+          .labelsHidden()
+          .pickerStyle(.menu)
+          .frame(maxWidth: .infinity, alignment: .trailing)
+          .onChange(of: decisionDraft) { _, decision in
+            save(
+              { rule.decision = decision },
+              resetDraft: { decisionDraft = rule.decision }
+            )
+          }
+          .accessibilityIdentifier("rule-decision")
+        }
+
+        LabeledContent("顺序") {
+          EditableFieldFormView(
+            onEditingBegan: {
+              orderDraft = String(rule.order)
+              return true
+            },
+            onEditingEnded: {
+              save(
+                {
+                  let value = orderDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                  guard let order = Int(value) else {
+                    throw MagentXError.invalidParameter(
+                      String(localized: "Order must be an integer")
+                    )
+                  }
+                  rule.order = order
+                },
+                resetDraft: { orderDraft = String(rule.order) }
+              )
+            }
+          ) {
+            Text(rule.order, format: .number.grouping(.never))
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          } editor: { focus, _ in
+            TextField("顺序", text: $orderDraft)
+              .labelsHidden()
+              .focused(focus)
+              .multilineTextAlignment(.trailing)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          }
+          .help("点击修改顺序")
+          .accessibilityIdentifier("rule-order")
+        }
+
+        LabeledContent("匹配值") {
+          EditableFieldFormView(
+            onEditingBegan: {
+              matchValueDraft = rule.matchValue
+              return true
+            },
+            onEditingEnded: {
+              save(
+                {
+                  let matchValue = matchValueDraft.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                  )
+                  guard !matchValue.isEmpty else {
+                    throw MagentXError.invalidParameter(
+                      String(localized: "Match value is required")
+                    )
+                  }
+                  rule.matchValue = matchValue
+                },
+                resetDraft: { matchValueDraft = rule.matchValue }
+              )
+            }
+          ) {
+            Text(rule.matchValue)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          } editor: { focus, _ in
+            TextField("匹配值", text: $matchValueDraft)
+              .labelsHidden()
+              .focused(focus)
+              .multilineTextAlignment(.trailing)
+              .frame(maxWidth: .infinity, alignment: .trailing)
+          }
+          .help("点击修改匹配值")
+          .accessibilityIdentifier("rule-match-value")
+        }
+      }
+    }
+    .formStyle(.grouped)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    .safeAreaInset(edge: .bottom) {
+      HStack {
+        Spacer()
+
+        if #available(macOS 26.0, *) {
+          Button(role: .destructive, action: onDelete) {
+            Label("删除规则", systemImage: "trash")
+              .foregroundStyle(.red)
+              .padding(5)
+          }
+          .labelStyle(.iconOnly)
+          .buttonStyle(.glass(.clear.tint(.red)))
+          .controlSize(.large)
+          .buttonBorderShape(.circle)
+          .help("删除规则")
+          .accessibilityLabel("删除规则")
+        } else {
+          Button(role: .destructive, action: onDelete) {
+            Label("删除规则", systemImage: "trash")
+          }
+          .labelStyle(.iconOnly)
+          .buttonStyle(.bordered)
+          .controlSize(.large)
+          .buttonBorderShape(.circle)
+          .tint(.red)
+          .help("删除规则")
+          .accessibilityLabel("删除规则")
+        }
+      }
+      .padding()
+      .background(.bar)
+    }
+  }
+
+  /// 校验并保存一个详情字段的修改；失败时恢复模型和对应草稿的原始值。
+  private func save(
+    _ changes: () throws -> Void,
+    resetDraft: () -> Void
+  ) {
+    // 删除后旧编辑控件的失焦通知不能再次读取或修改已删除的规则。
+    guard rule.modelContext != nil, !rule.isDeleted else { return }
+    let previousMatchType = rule.matchType
+    let previousDecision = rule.decision
+    let previousOrder = rule.order
+    let previousMatchValue = rule.matchValue
+    let previousSource = rule.source
+    let previousUpdatedAt = rule.updatedAt
+
+    do {
+      try changes()
+      let rules = try modelContext.fetch(FetchDescriptor<MagentProxyRule>())
+      if let validationError = rule.validationError(in: rules) {
+        throw validationError
+      }
+      guard modelContext.hasChanges else { return }
+      rule.source = "user"
+      rule.updatedAt = .now
+      try modelContext.save()
+      actionError = nil
+    } catch {
+      rule.matchType = previousMatchType
+      rule.decision = previousDecision
+      rule.order = previousOrder
+      rule.matchValue = previousMatchValue
+      rule.source = previousSource
+      rule.updatedAt = previousUpdatedAt
+      resetDraft()
+      actionError = error.localizedDescription
     }
   }
 }

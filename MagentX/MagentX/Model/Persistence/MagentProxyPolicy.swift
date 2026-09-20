@@ -15,6 +15,7 @@ final class MagentProxyPolicy {
   @Attribute(.unique)
   var id: Int
   var name: String
+  var enable: Bool = true
   @Attribute(.unique)
   var nodeID: UUID
   var createdAt: Date
@@ -25,18 +26,21 @@ final class MagentProxyPolicy {
   /// - Parameters:
   ///   - id: 策略的唯一整数业务主键。
   ///   - name: 策略名称。
+  ///   - enable: 策略是否启用，默认启用。
   ///   - nodeID: 关联代理节点的 UUID；一个节点只能属于一个策略。
   ///   - createdAt: 创建时间。
   ///   - updatedAt: 最后更新时间。
   init(
     id: Int,
     name: String,
+    enable: Bool = true,
     nodeID: UUID,
     createdAt: Date = .now,
     updatedAt: Date = .now
   ) {
     self.id = id
     self.name = name
+    self.enable = enable
     self.nodeID = nodeID
     self.createdAt = createdAt
     self.updatedAt = updatedAt

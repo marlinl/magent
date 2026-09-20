@@ -32,6 +32,7 @@ CREATE UNIQUE INDEX idx_magent_proxy_rules_match_type_match_value
 CREATE TABLE magent_proxy_policies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    enable INTEGER NOT NULL DEFAULT 1 CHECK (enable IN (0, 1)),
     node_id BLOB NOT NULL UNIQUE CHECK (length(node_id) = 16),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
