@@ -9,11 +9,9 @@
 import Foundation
 @preconcurrency import Magent
 @preconcurrency import NIOCore
-import OSLog
+import SwiftData
 
-/// Magent 运行服务，统一管理核心代理实例的生命周期。
-///
-/// `Magent.close()` 会回收核心实例自己的 EventLoopGroup；本 actor 会在下一次启动时重建核心实例。
+/// Magent 运行服务，统一管理核心代理实例和运行配置。
 actor MagentService {
   /// Magent 核心服务的当前运行状态。
   enum State: Equatable, Sendable {
@@ -23,168 +21,207 @@ actor MagentService {
 
   /// 当前 Magent 核心服务的运行状态。
   private(set) var state = State.idle
-  private var magent: Magent?
-  private var lifecycleOperation: LifecycleOperation?
+  private var magent: Magent
 
-  /// 标识当前启动或关闭操作，用于在 actor 重入时复用同一个任务。
-  private struct LifecycleOperation {
-    let identifier: UUID
-    let task: Task<Void, Error>
+  /// 根据应用设置初始化非空的 Magent 核心实例。
+  ///
+  /// - Parameter appSettings: 提供核心服务线程数的应用设置。
+  @MainActor init(appSettings: AppSettings = AppSettings.load()) {
+    magent = Magent(threadNumber: appSettings.serviceThreadNumber)
   }
 
-  /// 使用本地代理监听端点构造默认直连配置并启动 Magent。
-  ///
-  /// - Parameters:
-  ///   - address: 本地代理监听地址。
-  ///   - port: 本地代理监听端口。
-  func start(address: String, port: Int) async throws {
-    let normalizedAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard normalizedAddress.isEmpty == false else {
-      throw MagentXError.invalidParameter(String(localized: "Listen address is required"))
-    }
-    guard (1...65_535).contains(port) else {
-      throw MagentXError.invalidParameter(
-        String(format: String(localized: "Listen port is invalid: %d"), port)
-      )
-    }
-    let placeholderNode = try ProxyNode(
-      id: UUID(),
-      address: SocketAddress(ipAddress: "127.0.0.1", port: 9),
-      cipher: .chacha20IetfPoly1305,
-      password: "unused-direct-route"
-    )
-    let configuration = MagentConfig(
-      address: .domain(normalizedAddress, port: port),
-      defaultDecision: .direct,
-      defaultProxyNode: placeholderNode,
-      enableMatchTable: false
-    )
-    try await start(configuration)
-  }
-
-  /// 使用给定配置启动 Magent；已启动或正在启动时保持幂等。
-  ///
-  /// 副作用：创建并启动 Magent 核心监听器，并向系统日志写入生命周期事件。
-  func start(_ configuration: MagentConfig) async throws {
-    switch state {
-    case .idle:
-      if let lifecycleOperation, let magent {
-        try await completeShutdown(magent: magent, operation: lifecycleOperation)
-        try await start(configuration)
-        return
-      }
-
-      AppLog.proxy.info("Starting Magent core service")
-      let magent = Magent(threadNumber: 2)
-      let operation = LifecycleOperation(
-        identifier: UUID(),
-        task: Task {
-          try await magent.start(configuration)
-        }
-      )
-      self.magent = magent
-      state = .running
-      lifecycleOperation = operation
-      try await completeStartup(magent: magent, operation: operation)
-    case .running:
-      if let lifecycleOperation, let magent {
-        try await completeStartup(magent: magent, operation: lifecycleOperation)
-      } else {
-        AppLog.proxy.debug("Magent core service is already running")
-      }
-    }
-  }
-
-  /// 关闭当前 Magent 实例；未启动或正在关闭时保持幂等。
-  ///
-  /// 副作用：关闭 Magent 核心监听器，并向系统日志写入生命周期事件。
-  func stop() async throws {
-    switch state {
-    case .idle:
-      if let lifecycleOperation, let magent {
-        try await completeShutdown(magent: magent, operation: lifecycleOperation)
-      } else {
-        AppLog.proxy.debug("Magent core service is already stopped")
-      }
-    case .running:
-      guard let magent else {
-        state = .idle
-        return
-      }
-      if let lifecycleOperation {
-        try await completeStartup(magent: magent, operation: lifecycleOperation)
-        try await stop()
-        return
-      }
-
-      AppLog.proxy.info("Stopping Magent core service")
-      let operation = LifecycleOperation(
-        identifier: UUID(),
-        task: Task {
-          try await magent.close()
-        }
-      )
-      state = .idle
-      lifecycleOperation = operation
-      try await completeShutdown(magent: magent, operation: operation)
-    }
-  }
-
-  /// 等待启动任务结束，并将仍属于该任务的失败状态恢复为空闲。
-  ///
-  /// - Parameters:
-  ///   - magent: 本次启动创建的 Magent 实例。
-  ///   - operation: 本次启动操作。
-  private func completeStartup(
-    magent: Magent,
-    operation: LifecycleOperation
+  /// 启动 Magent 核心服务。
+  func start(
+    modelContainer: ModelContainer,
+    appSettings: AppSettings,
+    generalSettings: GeneralSettings
   ) async throws {
-    do {
-      try await operation.task.value
-      if lifecycleOperation?.identifier == operation.identifier {
-        lifecycleOperation = nil
-        AppLog.proxy.info("Magent core service started")
-      }
-    } catch {
-      if lifecycleOperation?.identifier == operation.identifier {
-        lifecycleOperation = nil
-        if self.magent === magent {
-          self.magent = nil
-          state = .idle
-        }
-      }
-      AppLog.proxy.error("Magent core service failed to start")
-      throw error
+  }
+
+  /// 关闭 Magent 核心服务。
+  func close() async throws {
+  }
+
+  /// 读取持久化的 Magent 模型并构建核心运行配置。
+  ///
+  /// - Parameters:
+  ///   - modelContainer: 存储 Magent 节点、规则、策略及关联记录的模型容器。
+  ///   - appSettings: 提供当前代理模式的应用设置。
+  ///   - generalSettings: 提供本地代理监听地址和端口的常规设置。
+  /// - Returns: 包含启用规则和可用代理节点的 Magent 运行配置。
+  func getConfig(
+    modelContainer: ModelContainer,
+    appSettings: AppSettings,
+    generalSettings: GeneralSettings
+  ) throws -> MagentConfig {
+    let modelContext = ModelContext(modelContainer)
+
+    // 1. 查询全部已启用的代理策略。
+    let enabledPolicies = try modelContext.fetch(
+      FetchDescriptor<MagentProxyPolicy>(
+        predicate: #Predicate { $0.enable },
+        sortBy: [SortDescriptor(\MagentProxyPolicy.id, order: .forward)]
+      )
+    )
+    let nodeIDByPolicyID = Dictionary(
+      uniqueKeysWithValues: enabledPolicies.map { ($0.id, $0.nodeID) }
+    )
+
+    // 2. 根据已启用策略的 nodeID 查询并构建全部代理节点。
+    let proxyNodes = queryNodeList(
+      enabledPolicies.map(\.nodeID),
+      modelContext: modelContext
+    )
+    let proxyNodesByID = Dictionary(uniqueKeysWithValues: proxyNodes.map { ($0.id, $0) })
+    let policyProxyNode = enabledPolicies.lazy.compactMap {
+      proxyNodesByID[$0.nodeID]
+    }.first
+    let defaultProxyNode: ProxyNode
+    if let policyProxyNode {
+      defaultProxyNode = policyProxyNode
+    } else {
+      // MagentConfig 的 defaultProxyNode 当前不可为空；无策略时仅用作必填占位，不加入节点列表。
+      defaultProxyNode = ProxyNode(
+        address: try SocketAddress(ipAddress: "127.0.0.1", port: 9),
+        cipher: .chacha20IetfPoly1305,
+        password: "unused-direct-route"
+      )
+    }
+
+    // 3. 根据已启用策略的 ID 查询关联表，并构建全部代理规则。
+    let rules = queryRuleList(
+      enabledPolicies.map(\.id),
+      nodeIDByPolicyID: nodeIDByPolicyID,
+      modelContext: modelContext
+    )
+
+    // 4. 使用查询方法返回的节点和策略规则组装 MagentConfig。
+    let defaultDecision: Decision
+    let enableMatchTable: Bool
+    switch appSettings.proxyMode {
+    case .policy:
+      defaultDecision = .direct
+      enableMatchTable = true
+    case .global:
+      defaultDecision = policyProxyNode == nil ? .direct : .proxy(defaultProxyNode.id)
+      enableMatchTable = false
+    case .direct:
+      defaultDecision = .direct
+      enableMatchTable = false
+    }
+
+    return MagentConfig(
+      address: .domain(
+        generalSettings.proxyListenAddress,
+        port: generalSettings.proxyListenPort
+      ),
+      defaultDecision: defaultDecision,
+      defaultProxyNode: defaultProxyNode,
+      enableMatchTable: enableMatchTable,
+      rules: rules,
+      proxyNodes: proxyNodes.filter { $0.id != defaultProxyNode.id }
+    )
+  }
+
+  /// 根据节点 ID 列表查询持久化节点，并转换为 Magent 代理节点。
+  private func queryNodeList(
+    _ nodeIDList: [UUID],
+    modelContext: ModelContext
+  ) -> [ProxyNode] {
+    guard nodeIDList.isEmpty == false else { return [] }
+
+    guard
+      let storedNodes = try? modelContext.fetch(
+        FetchDescriptor<MagentProxyNode>(
+          predicate: #Predicate { nodeIDList.contains($0.id) },
+          sortBy: [
+            SortDescriptor(\MagentProxyNode.createdAt, order: .forward),
+            SortDescriptor(\MagentProxyNode.id, order: .forward),
+          ]
+        )
+      )
+    else { return [] }
+
+    return storedNodes.compactMap { storedNode in
+      guard let type = ProxyNodeType(rawValue: storedNode.type),
+        let cipher = ProxyCipher(rawValue: storedNode.cipher),
+        let address = try? SocketAddress.makeAddressResolvingHost(
+          storedNode.address,
+          port: storedNode.port
+        )
+      else { return nil }
+
+      return ProxyNode(
+        id: storedNode.id,
+        type: type,
+        address: address,
+        cipher: cipher,
+        password: storedNode.password,
+        timeout: storedNode.timeout
+      )
     }
   }
 
-  /// 等待关闭任务结束，并释放已关闭的 Magent 实例。
-  ///
-  /// - Parameters:
-  ///   - magent: 本次关闭的 Magent 实例。
-  ///   - operation: 本次关闭操作。
-  private func completeShutdown(
-    magent: Magent,
-    operation: LifecycleOperation
-  ) async throws {
-    do {
-      try await operation.task.value
-      if lifecycleOperation?.identifier == operation.identifier {
-        lifecycleOperation = nil
-        if self.magent === magent {
-          self.magent = nil
-        }
-        AppLog.proxy.info("Magent core service stopped")
+  /// 根据策略 ID 列表查询关联规则，并转换为 Magent 代理规则。
+  private func queryRuleList(
+    _ policyIDList: [Int],
+    nodeIDByPolicyID: [Int: UUID],
+    modelContext: ModelContext
+  ) -> [ProxyRule] {
+    guard policyIDList.isEmpty == false else { return [] }
+
+    guard
+      let policyRules = try? modelContext.fetch(
+        FetchDescriptor<MagentProxyPolicyRule>(
+          predicate: #Predicate { policyIDList.contains($0.policyID) },
+          sortBy: [
+            SortDescriptor(\MagentProxyPolicyRule.policyID, order: .forward),
+            SortDescriptor(\MagentProxyPolicyRule.ruleID, order: .forward),
+          ]
+        )
+      )
+    else { return [] }
+    let associatedRuleIDs = policyRules.map(\.ruleID)
+    guard associatedRuleIDs.isEmpty == false else { return [] }
+
+    guard
+      let storedRules = try? modelContext.fetch(
+        FetchDescriptor<MagentProxyRule>(
+          predicate: #Predicate { associatedRuleIDs.contains($0.id) },
+          sortBy: [
+            SortDescriptor(\MagentProxyRule.order, order: .forward),
+            SortDescriptor(\MagentProxyRule.id, order: .forward),
+          ]
+        )
+      )
+    else { return [] }
+
+    let policyIDByRuleID = Dictionary(
+      uniqueKeysWithValues: policyRules.map { ($0.ruleID, $0.policyID) }
+    )
+    return storedRules.compactMap { storedRule in
+      guard let policyID = policyIDByRuleID[storedRule.id],
+        let nodeID = nodeIDByPolicyID[policyID],
+        let matchType = MatchType(rawValue: storedRule.matchType),
+        matchType != .urlRegex
+      else { return nil }
+
+      let decision: Decision
+      switch storedRule.decision {
+      case "direct":
+        decision = .direct
+      case "proxy":
+        decision = .proxy(nodeID)
+      default:
+        return nil
       }
-    } catch {
-      if lifecycleOperation?.identifier == operation.identifier {
-        lifecycleOperation = nil
-        if self.magent === magent {
-          state = .running
-        }
-      }
-      AppLog.proxy.error("Magent core service failed to stop")
-      throw error
+
+      return try? ProxyRule(
+        matchType: matchType,
+        matchValue: storedRule.matchValue,
+        decision: decision,
+        order: storedRule.order
+      )
     }
   }
 }
