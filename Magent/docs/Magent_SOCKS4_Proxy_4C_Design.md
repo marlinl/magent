@@ -1,7 +1,7 @@
 ---
 desc: Magent SOCKS4和SOCKS4a CONNECT解析、路由、Wire编解码与连接生命周期
-updated_at: 2026-07-24
-commit: af5ba87
+updated_at: 2026-09-21
+baseline: current-working-tree
 ---
 
 # Magent SOCKS4 代理链路 4C 产品设计文档
@@ -91,7 +91,7 @@ VN | CD | DSTPORT | 0.0.0.x | USERID | 0x00 | DOMAIN | 0x00
 
 `Socks4Connection` 只对目标调用一次 `MagentCore.routeTCPWire(_:)`：
 
-- 返回 `nil`：直连目标，超时固定为 10 秒。
+- 返回 `nil`：直连目标，超时使用 `MagentConfig.defaultTimeout`（毫秒，默认 10 秒）。
 - 返回 `Wire`：连接 `wire.getTargetAddress()`，超时使用 `wire.getTimeout()`。
 - `.proxy(nodeID)` 找不到节点：抛出 `proxyNodeNotFound`，不得降级为直连。
 
@@ -130,7 +130,7 @@ Shadowsocks server 的响应。
   -> 校验 request 后没有 remainder
   -> 解析 command 与 target
   -> routeTCPWire(target)
-  -> direct: connect(target, 10_000 ms)
+  -> direct: connect(target, core.defaultTimeout)
   -> proxy:  connect(wire target, wire timeout)
   -> 保存 wireChannel
   -> proxy 路径发送 wire.start(target)
@@ -169,6 +169,8 @@ payload。
 - `wireChannel` 失效时，`Socks4Connection` 关闭 `proxyChannel`。
 - `wireChannel` error 通过 `proxyChannel.pipeline.fireErrorCaught` 进入上游统一错误关闭路径。
 - `closed` 守卫保证双方 close 不形成循环。
+- 两端关闭 autoRead，每批 writeAndFlush 成功后才读取来源。
+- input half-close 只关闭另一端 output 并保留反向读取；握手期间完整请求后的 FIN 延迟到 tunnel 建立再传播，未完成请求的 FIN 则结束连接。
 
 # 4. Corners
 
@@ -180,11 +182,11 @@ payload。
 | 请求后同包携带 payload | rejected；当前采用严格请求/响应顺序，不接受提前 tunnel 数据 |
 | `BIND` | rejected |
 | SOCKS4a 空域名 | rejected |
-| direct connect timeout | 10 秒后 rejected |
+| direct connect timeout | 使用 defaultTimeout，默认 10 秒；超时后 rejected |
 | proxy connect timeout | 使用节点 timeout，超时后 rejected |
 | no-auth | 产品设计，允许开放代理 |
 | TCP read/write idle timeout | 尚未实现 |
-| 双向背压联动 | 尚未实现 |
+| 双向流控 | autoRead=false；对端 writeAndFlush 完成后再读来源 |
 
 ## 4.2 验证重点
 
@@ -194,3 +196,5 @@ payload。
 - route direct 与 proxy 的拨号地址。
 - Shadowsocks 启动帧只写一次。
 - proxy/wire 任一侧关闭后另一侧最终关闭。
+
+源码与现有测试：[Socks4Connection](../Sources/Connection/Socks4Connection.swift)、[Socks4ConnectionTests](../Tests/Connection/Socks4ConnectionTests.swift)。本次只静态对齐文档，未重跑测试。

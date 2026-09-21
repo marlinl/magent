@@ -1,5 +1,16 @@
 # Magent Package Context
 
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md): public API boundaries, layers, ownership, and lifecycle.
+- [SOCKS4 specification](docs/SOCKS4_PROXY_SPEC.md): protocol design, packet vectors, and acceptance criteria.
+- [SOCKS5 specification](docs/SOCKS5_PROXY_SPEC.md): TCP/UDP protocol design, routing, and acceptance criteria.
+- [HTTP specification](docs/HTTP_PROXY_SPEC.md): forward proxy and CONNECT design, request/response handling, and acceptance criteria.
+- [W-TinyLFU cache design](docs/WTiny_LFU_Cache_Design.md): cache contracts, expiration, concurrency, and maintenance.
+
+The HTTP and SOCKS specifications include proposed capabilities beyond the current implementation. Check source and tests
+before treating a specification requirement as implemented behavior.
+
 ## Concurrency design constraint
 
 Do not default to an immutable snapshot design for every consistency or concurrency issue. First determine the

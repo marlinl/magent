@@ -18,6 +18,7 @@ internal final class MagentCore: @unchecked Sendable {
   private var udpWires: [UUID: Wire]
 
   /// 装载当前运行周期的完整节点和规则；没有规则时不缓存默认决策。
+  /// 默认代理节点在完整节点列表装载后校验，确保初始化成功的 Core 可直接使用默认决策。
   internal init(
     defaultDecision: Decision, proxyNodes: [ProxyNode],
     defaultTimeout: Int64, rules: [ProxyRule]
@@ -30,6 +31,9 @@ internal final class MagentCore: @unchecked Sendable {
     self.addressNodes = [:]
     self.udpWires = [:]
     try putAllProxyNodes(proxyNodes)
+    if case .proxy(let nodeID) = defaultDecision, nodes[nodeID] == nil {
+      throw MagentError.proxyNodeNotFound(nodeID)
+    }
   }
 
   /// 根据代理节点类型创建对应的 UDP Wire；创建失败时原样向上抛出异常。
@@ -48,30 +52,23 @@ internal final class MagentCore: @unchecked Sendable {
   }
 
   /// 批量写入代理节点；相同 UUID 按数组顺序覆盖，未包含的已有节点保持不变。
-  internal func putAllProxyNodes(_ nodes: [ProxyNode]) throws {
-    for node in nodes {
-      try putProxyNode(node)
-    }
-  }
+  /// 每个 UDP Wire 都经由 `createUDPWire(_:)` 创建，使节点类型与 Wire 的映射只保留在一个位置。
+  internal func putAllProxyNodes(_ proxyNodes: [ProxyNode]) throws {
+    for node in proxyNodes {
+      if let existingNodeID = addressNodes[node.address], existingNodeID != node.id {
+        throw MagentError.invalidPolicy(
+          "proxy node address \(node.address) is already used by \(existingNodeID)"
+        )
+      }
 
-  /// 写入或覆盖单个代理节点。
-  ///
-  /// UDP Wire 必须经由 `createUDPWire(_:)` 创建，
-  /// 使节点类型与对应 Wire 的映射只保留在一个位置。
-  internal func putProxyNode(_ node: ProxyNode) throws {
-    if let existingNodeID = addressNodes[node.address], existingNodeID != node.id {
-      throw MagentError.invalidPolicy(
-        "proxy node address \(node.address) is already used by \(existingNodeID)"
-      )
+      let udpWire = try createUDPWire(node)
+      if let previousNode = nodes[node.id], previousNode.address != node.address {
+        addressNodes.removeValue(forKey: previousNode.address)
+      }
+      nodes[node.id] = node
+      addressNodes[node.address] = node.id
+      udpWires[node.id] = udpWire
     }
-
-    let udpWire = try createUDPWire(node)
-    if let previousNode = nodes[node.id], previousNode.address != node.address {
-      addressNodes.removeValue(forKey: previousNode.address)
-    }
-    nodes[node.id] = node
-    addressNodes[node.address] = node.id
-    udpWires[node.id] = udpWire
   }
 
   /// 返回规则匹配结果，规则为空或未命中时使用默认决策。

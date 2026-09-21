@@ -22,7 +22,7 @@ public enum MagentError: Error, Equatable, Sendable {
   /// 代理规则配置不合法，例如匹配值为空或 proxy 规则没有引用节点。
   case invalidPolicy(String)
 
-  /// 代理规则引用的节点 UUID 在当前节点表中不存在。
+  /// 默认决策或代理规则引用的节点 UUID 在当前节点表中不存在。
   case proxyNodeNotFound(UUID)
 
   /// 连接已经关闭，不能继续读写或推进代理链路。

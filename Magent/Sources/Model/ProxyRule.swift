@@ -7,38 +7,6 @@
 import Foundation
 import NIOCore
 
-// MARK: - MatchType
-
-/// 代理规则的匹配方式。
-public enum MatchType: String, Codable, Sendable, Equatable, Hashable, CaseIterable {
-  /// 完整域名精确匹配。
-  case exactDomain
-
-  /// 域名后缀匹配。
-  case domainSuffix
-
-  /// 域名关键字匹配。
-  case domainKeyword
-
-  /// IP CIDR 匹配。
-  case ipCIDR
-
-  /// URL 正则匹配。
-  case urlRegex
-
-}
-
-// MARK: - Decision
-
-/// 代理规则命中后的动作。
-public enum Decision: Sendable, Equatable {
-  /// 使用指定 UUID 的代理节点。
-  case proxy(UUID)
-
-  /// 直连目标地址。
-  case direct
-}
-
 // MARK: - ProxyRule
 
 /// 一条访问控制匹配规则。

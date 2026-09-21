@@ -59,7 +59,7 @@ import Magent
 
 let listenAddress = NetworkAddress.domain("127.0.0.1", port: 1080)
 let service = Magent(threadNumber: 2)
-let directConfig = MagentConfig(address: listenAddress)
+let directConfig = MagentConfig(listener: listenAddress)
 
 try await service.start(directConfig)
 ```
@@ -85,7 +85,7 @@ let node = ProxyNode(
 )
 
 let globalConfig = MagentConfig(
-    address: listenAddress,
+    listener: listenAddress,
     defaultDecision: .proxy(node.id),
     proxyNodes: [node]
 )
@@ -98,10 +98,10 @@ let rule = try ProxyRule(
 )
 
 let ruleConfig = MagentConfig(
-    address: listenAddress,
+    listener: listenAddress,
     rules: [rule],
     proxyNodes: [node],
-    dnsAddress: try SocketAddress(ipAddress: "192.0.2.53", port: 53)
+    dnsListener: try SocketAddress(ipAddress: "192.0.2.53", port: 53)
 )
 ```
 
@@ -112,26 +112,27 @@ let ruleConfig = MagentConfig(
 | 按规则路由 | 本次运行使用的规则 | 未命中规则时采用 |
 
 `order` 越小，规则优先级越高。规则为空或没有规则命中时，使用 `defaultDecision`。
-如果决策引用的节点不存在，会在使用该路由时失败，不会降级为直连。
-路由器目前不支持 `urlRegex` 枚举值。
+如果 `defaultDecision` 引用的节点不存在，会在 Core 初始化时失败，此时尚未绑定新监听；
+在 `restart` 中发生该错误时，旧运行周期继续运行。规则引用缺失节点则在使用该路由时失败。
+这两种情况都不会降级为直连。路由器目前不支持 `urlRegex` 枚举值。
 
 ## 配置参数
 
-`MagentConfig` 描述一次启动或重启的完整配置，只有 `address` 必填。
+`MagentConfig` 描述一次启动或重启的完整配置，只有 `listener` 必填。
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `address` | 必填 | 本地 TCP 监听地址；端口必须在 `1...65535` 范围内。 |
+| `listener` | 必填 | 本地 TCP 监听地址；端口必须在 `1...65535` 范围内。 |
 | `defaultDecision` | `.direct` | 规则为空或未命中时采用的决策。 |
 | `rules` | `[]` | 本次运行参与匹配的规则。 |
 | `proxyNodes` | `[]` | 所有可用节点，包含默认决策选中的节点。 |
 | `defaultTimeout` | `10_000` | 直连 TCP 建连和 UDP DNS 查询的超时时间，单位为毫秒。 |
-| `dnsAddress` | `nil` | UDP 直连域名目标使用的单个 DNS 服务器地址。 |
+| `dnsListener` | `nil` | UDP 直连域名目标使用的单个 DNS 服务器地址。 |
 
 代理 TCP 建连使用 `ProxyNode.timeout`，单位为**秒**，默认值为 `30`。
 它与使用毫秒的 `MagentConfig.defaultTimeout` 不同。
 
-`dnsAddress` 仅影响 SOCKS5 UDP 直连域名解析。为 `nil` 时，UDP IP 目标和经代理访问的域名目标仍然可用，
+`dnsListener` 仅影响 SOCKS5 UDP 直连域名解析。为 `nil` 时，UDP IP 目标和经代理访问的域名目标仍然可用，
 但 UDP 直连域名目标会被拒绝。该参数不覆盖 TCP 域名解析行为，也不提供第二个 DNS 服务器的回退。
 
 Magent 不设置应用层连接数上限。EventLoop 线程数和监听 backlog 均不代表已建立连接的数量上限；
@@ -170,7 +171,6 @@ try await service.close()
 - **其他 HTTP 版本：** 不支持 HTTP/2、HTTP/3 和 Extended CONNECT。
 
 以上描述当前已实现的协议边界，不表示完整符合 HTTP 或 SOCKS RFC。
-详细行为和已知限制见[设计文档](../docs/Magent/Magent_Design.md)。
 
 ## 部署职责
 
@@ -212,6 +212,7 @@ xcrun swift-format lint --strict --parallel --recursive Package.swift Sources Te
 | `Sources/Model` | 地址、节点、规则与协议类型。 |
 | `Sources/Wire/Shadowsocks` | Shadowsocks 分帧、地址编码与 AEAD 加密。 |
 | `Tests` | XCTest 单元测试与本地网络测试。 |
+| `docs` | 架构、协议、路由、缓存设计与模型映射。 |
 
 ## 许可证与贡献
 

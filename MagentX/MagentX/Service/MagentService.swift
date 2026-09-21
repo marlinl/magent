@@ -97,7 +97,7 @@ actor MagentService {
     }
 
     return MagentConfig(
-      address: .domain(
+      listener: .domain(
         generalSettings.proxyListenAddress,
         port: generalSettings.proxyListenPort
       ),

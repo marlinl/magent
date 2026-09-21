@@ -63,7 +63,7 @@ import Magent
 
 let listenAddress = NetworkAddress.domain("127.0.0.1", port: 1080)
 let service = Magent(threadNumber: 2)
-let directConfig = MagentConfig(address: listenAddress)
+let directConfig = MagentConfig(listener: listenAddress)
 
 try await service.start(directConfig)
 ```
@@ -92,7 +92,7 @@ let node = ProxyNode(
 )
 
 let globalConfig = MagentConfig(
-    address: listenAddress,
+    listener: listenAddress,
     defaultDecision: .proxy(node.id),
     proxyNodes: [node]
 )
@@ -105,10 +105,10 @@ let rule = try ProxyRule(
 )
 
 let ruleConfig = MagentConfig(
-    address: listenAddress,
+    listener: listenAddress,
     rules: [rule],
     proxyNodes: [node],
-    dnsAddress: try SocketAddress(ipAddress: "192.0.2.53", port: 53)
+    dnsListener: try SocketAddress(ipAddress: "192.0.2.53", port: 53)
 )
 ```
 
@@ -119,27 +119,29 @@ let ruleConfig = MagentConfig(
 | Rule-based | Rules for the current run | Used when no rule matches |
 
 Rules with smaller `order` values take precedence. If no rule matches, or the
-rule list is empty, routing uses `defaultDecision`. A decision referencing a
-missing node fails when that route is used; it does not fall back to a direct
-connection. The `urlRegex` enum case is currently unsupported by the router.
+rule list is empty, routing uses `defaultDecision`. A missing node referenced by
+`defaultDecision` fails Core initialization, before a new listener is bound;
+if this happens during `restart`, the old runtime remains running. Missing nodes
+referenced by rules fail when those routes are used. Neither case falls back to
+a direct connection. The `urlRegex` enum case is currently unsupported by the router.
 
 ## Configuration
 
-`MagentConfig` describes one complete start or restart. Only `address` is required.
+`MagentConfig` describes one complete start or restart. Only `listener` is required.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `address` | Required | Local TCP listener address; port must be in `1...65535`. |
+| `listener` | Required | Local TCP listener address; port must be in `1...65535`. |
 | `defaultDecision` | `.direct` | Decision used when rules are empty or no rule matches. |
 | `rules` | `[]` | Rules to match during this run. |
 | `proxyNodes` | `[]` | All available nodes, including any selected by the default decision. |
 | `defaultTimeout` | `10_000` | Direct TCP connection and UDP DNS query timeout, in milliseconds. |
-| `dnsAddress` | `nil` | One DNS server address for direct SOCKS5 UDP domain destinations. |
+| `dnsListener` | `nil` | One DNS server address for direct SOCKS5 UDP domain destinations. |
 
 `ProxyNode.timeout` controls proxied TCP connection attempts. It is expressed in
 **seconds** and defaults to `30`, unlike `MagentConfig.defaultTimeout`.
 
-`dnsAddress` only affects direct SOCKS5 UDP domain resolution. With `nil`, UDP
+`dnsListener` only affects direct SOCKS5 UDP domain resolution. With `nil`, UDP
 IP destinations and proxied domain destinations still work, but direct UDP
 domain destinations are rejected. It does not override TCP hostname resolution,
 and there is no fallback to a second configured DNS server.
@@ -188,8 +190,7 @@ wait for NIO futures. Calls from outside the actor use `await`.
 - **Other HTTP versions:** HTTP/2, HTTP/3, and Extended CONNECT are not supported.
 
 These are the implemented protocol boundaries, not a claim of full HTTP or
-SOCKS RFC compliance. See the [design document](../docs/Magent/Magent_Design.md)
-for detailed behavior and known limitations.
+SOCKS RFC compliance.
 
 ## Deployment responsibilities
 
@@ -235,6 +236,7 @@ xcrun swift-format lint --strict --parallel --recursive Package.swift Sources Te
 | `Sources/Model` | Addresses, nodes, rules, and protocol types. |
 | `Sources/Wire/Shadowsocks` | Shadowsocks framing, addresses, and AEAD encryption. |
 | `Tests` | XCTest unit tests and local networking tests. |
+| `docs` | Architecture, protocol designs, routing, cache, and model mappings. |
 
 ## License and contributions
 

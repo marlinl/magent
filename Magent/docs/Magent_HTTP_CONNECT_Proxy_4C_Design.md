@@ -1,7 +1,7 @@
 ---
 desc: Magent HTTP CONNECT 请求解析、路由、Wire 编解码与 TCP tunnel 生命周期
-updated_at: 2026-07-24
-commit: af5ba87
+updated_at: 2026-09-21
+baseline: current-working-tree
 ---
 
 # Magent HTTP CONNECT 代理链路 4C 产品设计文档
@@ -37,8 +37,9 @@ local HTTP client
   -> direct target 或 ShadowsocksTCPWire + Shadowsocks server
 ```
 
-`HttpProtocol` 是无状态 parser。`HttpConnectConnection` 持有 `proxyChannel`、`wireChannel`、
-连接状态和可选 `Wire`。Wire 不知道 HTTP 状态码。
+`NIOHTTP1.HTTPRequestDecoder` 解析 request parts，临时 `HTTPConnectHandshakeHandler` 校验
+请求并在完成后移除 decoder。`HttpProtocol` 负责 authority、Host、版本语义和本地响应常量。
+`HttpConnectConnection` 持有 `proxyChannel`、`wireChannel`、状态和可选 Wire；Wire 不处理 HTTP 状态码。
 
 # 2. Contract
 
@@ -54,7 +55,8 @@ local HTTP client
 - HTTP 版本只接受 `HTTP/1.0` 和 `HTTP/1.1`。
 - HTTP/1.1 必须且只能有一个 `Host`；HTTP/1.0 最多一个。
 - 存在 `Host` 时必须与 request-target 的 host、port 一致。
-- 请求缓冲上限为 64 KiB。
+- 拒绝 `Content-Length`（包括 0）和 `Transfer-Encoding`，不接受 CONNECT body 或 trailers。
+- 原始请求字节累计上限为 64 KiB，NIO decoder 还可能施加更小的语法限制。
 - 支持 header 分片并等待 `\r\n\r\n`。
 - 完整 CONNECT header 后不得存在 tunnel remainder；存在额外字节时返回 400 并关闭。
 
@@ -72,7 +74,7 @@ local HTTP client
 let wire = try core.routeTCPWire(target)
 ```
 
-- `nil`：连接原始 target，connect timeout 固定 10 秒。
+- `nil`：连接原始 target，connect timeout 使用 `MagentConfig.defaultTimeout`（毫秒，默认 10 秒）。
 - 非空：连接 `wire.getTargetAddress()`，connect timeout 使用 `wire.getTimeout()`。
 - 代理节点缺失：失败关闭，不得回退直连。
 
@@ -106,10 +108,12 @@ Direct 路径没有 `DirectNodeWire` 类型，`wire == nil` 就表示明文透�
 ## 3.1 建连链路
 
 ```text
-累积 CONNECT header
-  -> HttpProtocol.parseIfComplete
-  -> checkConnect
-  -> 拒绝 remainder
+累计原始请求字节并交给 HTTPRequestDecoder
+  -> HTTPConnectHandshakeHandler 接收 head/body/end
+  -> HttpProtocol.parseAuthority / checkConnect
+  -> 拒绝 body framing
+  -> 当前 decode 批次结束后移除 decoder 和临时 handler
+  -> 拒绝 decoder leftovers / 提前 payload
   -> routeTCPWire(target)
   -> direct: connect target
   -> proxy: connect proxy node
@@ -148,6 +152,8 @@ Shadowsocks 解码可能因半帧暂时返回空数据，连接继续等待后�
 - `wireChannel` 被动关闭：`HttpConnectConnection` 关闭 `proxyChannel`。
 - `wireChannel` error：错误转发给 `proxyChannel` pipeline，由 accepted 连接统一关闭。
 - 所有 close 路径先检查 `closed`，避免两端互相 close 形成循环。
+- tunnel 两端 `autoRead=false`；写入对端成功后再读取来源，解密半帧无明文时继续读下游。
+- input half-close 传播到另一侧 output，保留反向传输；握手期间完整请求后的 FIN 延迟到 tunnel 建立再传播，未完成请求的 FIN 则结束连接。
 
 # 4. Corners
 
@@ -160,10 +166,10 @@ Shadowsocks 解码可能因半帧暂时返回空数据，连接继续等待后�
 | HTTP/1.1 缺少或重复 Host | 400 |
 | Host 与 authority 不一致 | 400 |
 | IPv6 authority | 必须使用 `[address]:port` |
-| direct connect timeout | 10 秒，返回 504 |
+| direct connect timeout | 使用 defaultTimeout，默认 10 秒；超时返回 504 |
 | proxy connect timeout | 使用节点 timeout，返回 504 |
 | 后端建立后目标站迟迟无数据 | 当前没有 read idle timeout |
-| 双向写入背压 | 尚未联动 `isWritable/autoRead` |
+| 双向流控 | autoRead=false；对端 writeAndFlush 完成后再读来源 |
 | 本地认证 | 无认证开放代理是当前产品设计 |
 
 ## 4.2 不应跨层的职责
@@ -180,3 +186,5 @@ Shadowsocks 解码可能因半帧暂时返回空数据，连接继续等待后�
 - direct/proxy 拨号地址和 timeout。
 - 200 必须晚于下游 Channel 建立。
 - 任一侧 inactive/error 后两端最终关闭。
+
+源码与现有测试：[HttpConnectConnection](../Sources/Connection/HttpConnectConnection.swift)、[HttpConnectConnectionTests](../Tests/Connection/HttpConnectConnectionTests.swift)。本次只静态对齐文档，未重跑测试。

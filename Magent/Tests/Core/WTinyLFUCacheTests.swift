@@ -36,6 +36,63 @@ final class WTinyLFUCacheTests: XCTestCase {
     XCTAssertEqual(cache.get("k1"), "v1")
   }
 
+  /// Swift String 规范等价的不同编码必须共用 entry，涵盖读取、加载、更新和删除。
+  func testCanonicallyEquivalentKeysShareEntry() {
+    let equivalentKeys = [
+      ("\u{00E9}", "e\u{0301}"),
+      ("\u{AC00}", "\u{1100}\u{1161}"),
+      ("a\u{0315}\u{0300}", "a\u{0300}\u{0315}"),
+    ]
+
+    for (first, second) in equivalentKeys {
+      let cache = WTinyLFUCache<String>(capacity: 4)
+      defer { shutdown(cache) }
+      XCTAssertEqual(first, second)
+
+      cache.put(first, "original")
+      XCTAssertTrue(cache.contains(second))
+      XCTAssertEqual(cache.get(second), "original")
+      XCTAssertEqual(
+        cache.getOrLoad(second) { _ in
+          XCTFail("Equivalent key should hit the existing entry")
+          return "unexpected"
+        }, "original")
+
+      cache.put(second, "updated")
+      XCTAssertEqual(cache.estimatedSize(), 1)
+      XCTAssertEqual(cache.get(first), "updated")
+      cache.invalidate(second)
+      XCTAssertNil(cache.get(first))
+      XCTAssertEqual(cache.estimatedSize(), 0)
+
+      XCTAssertEqual(
+        cache.getOrLoad(second) { key in
+          XCTAssertEqual(Array(key.utf8), Array(second.utf8))
+          return "loaded"
+        }, "loaded")
+      XCTAssertEqual(cache.get(first), "loaded")
+      cache.invalidate(first)
+      XCTAssertFalse(cache.contains(second))
+      XCTAssertEqual(cache.estimatedSize(), 0)
+    }
+  }
+
+  /// 规范等价不能扩展成大小写折叠、空白裁剪或 Unicode 兼容字符合并。
+  func testDistinctKeysPreserveCaseWhitespaceAndCompatibilityCharacters() {
+    let cache = WTinyLFUCache<String>(capacity: 8)
+    defer { shutdown(cache) }
+    let keys = ["abc", "ABC", " abc", "abc ", "A", "\u{FF21}", "ffi", "\u{FB03}"]
+
+    for key in keys {
+      cache.put(key, key)
+    }
+
+    XCTAssertEqual(cache.estimatedSize(), 8)
+    for key in keys {
+      XCTAssertEqual(cache.get(key), key)
+    }
+  }
+
   /// `afterRead` 新节点应以创建时间作为首次读取时间，不能在第一次读取时直接过期。
   func testAfterReadFirstReadReturnsStoredObject() {
     let cache = WTinyLFUCache<String>(capacity: 4, expiration: .afterRead(.seconds(60)))
@@ -91,6 +148,132 @@ final class WTinyLFUCacheTests: XCTestCase {
     Thread.sleep(forTimeInterval: 0.35)
     XCTAssertEqual(cache.get("k1"), "v1")
     XCTAssertTrue(eventually(timeout: 1) { cache.contains("k1") == false })
+  }
+
+  /// 过期但未清理的节点必须先退出生命周期，再写入新节点；旧值回调可重入 cache。
+  func testExpiredPutCreatesFreshEntryAndEvictsOldValueOnce() {
+    let policies: [MagentCacheExpiration] = [
+      .afterRead(.milliseconds(500)), .afterWrite(.milliseconds(500)),
+    ]
+    for expiration in policies {
+      let evictions = LockedIntCounter()
+      let reference = WTinyLFUCacheReference<String>()
+      let cache = WTinyLFUCache<String>(capacity: 4, expiration: expiration) { object in
+        XCTAssertEqual(object, "old")
+        evictions.increment()
+        reference.cache?.put("key", "new")
+      }
+      reference.cache = cache
+      defer { shutdown(cache) }
+
+      cache.put("key", "old")
+      Thread.sleep(forTimeInterval: 0.6)
+      cache.put("key", "new")
+
+      XCTAssertEqual(cache.get("key"), "new")
+      XCTAssertEqual(cache.estimatedSize(), 1)
+      XCTAssertEqual(evictions.value, 1)
+      // 等待已排队的 maintenance 完成，再确认新值没有被旧节点的清理破坏。
+      shutdown(cache)
+      XCTAssertEqual(cache.get("key"), "new")
+      XCTAssertEqual(cache.estimatedSize(), 1)
+      XCTAssertEqual(evictions.value, 1)
+    }
+  }
+
+  /// 更新尚未过期的 afterRead 节点和 contains 均不能延长原有的读取期限。
+  func testAfterReadPutAndContainsDoNotRenewUnexpiredEntry() {
+    let evictions = LockedIntCounter()
+    let cache = WTinyLFUCache<String>(capacity: 4, expiration: .afterRead(.milliseconds(500))) {
+      object in
+      XCTAssertEqual(object, "updated")
+      evictions.increment()
+    }
+    defer { shutdown(cache) }
+
+    cache.put("key", "original")
+    Thread.sleep(forTimeInterval: 0.2)
+    cache.put("key", "updated")
+    XCTAssertTrue(cache.contains("key"))
+    XCTAssertEqual(evictions.value, 0)
+
+    Thread.sleep(forTimeInterval: 0.35)
+    XCTAssertFalse(cache.contains("key"))
+    XCTAssertEqual(cache.estimatedSize(), 0)
+    XCTAssertEqual(evictions.value, 1)
+  }
+
+  /// afterWrite 的未过期条目仍从最近一次 put 开始计算 TTL。
+  func testAfterWritePutRenewsUnexpiredEntry() {
+    let cache = WTinyLFUCache<String>(capacity: 4, expiration: .afterWrite(.milliseconds(500)))
+    defer { shutdown(cache) }
+
+    cache.put("key", "original")
+    Thread.sleep(forTimeInterval: 0.2)
+    cache.put("key", "updated")
+    Thread.sleep(forTimeInterval: 0.35)
+
+    XCTAssertEqual(cache.get("key"), "updated")
+    XCTAssertEqual(cache.estimatedSize(), 1)
+    XCTAssertTrue(eventually(timeout: 1) { cache.contains("key") == false })
+  }
+
+  /// 原创建时间已到期、读取已续期时，并发写入和过期校验必须保留有效节点。
+  func testAfterReadRenewalSurvivesConcurrentWritesAndExpirationChecks() {
+    let evictions = LockedIntCounter()
+    let cache = WTinyLFUCache<String>(capacity: 4, expiration: .afterRead(.seconds(1))) { _ in
+      evictions.increment()
+    }
+    defer { shutdown(cache) }
+
+    cache.put("key", "value")
+    Thread.sleep(forTimeInterval: 0.4)
+    XCTAssertEqual(cache.get("key"), "value")
+    Thread.sleep(forTimeInterval: 0.7)
+
+    DispatchQueue.concurrentPerform(iterations: 200) { index in
+      switch index % 3 {
+      case 0:
+        cache.put("key", "value")
+      case 1:
+        XCTAssertEqual(cache.get("key"), "value")
+      default:
+        XCTAssertTrue(cache.contains("key"))
+      }
+    }
+
+    XCTAssertEqual(cache.get("key"), "value")
+    XCTAssertEqual(cache.estimatedSize(), 1)
+    XCTAssertEqual(evictions.value, 0)
+  }
+
+  /// 过期校验和重写争抢旧节点时，只有删除获胜者通知旧值，后续旧事件不能删除新节点。
+  func testExpiredPutRacingReadsEvictsOnlyOldNode() {
+    let evictions = LockedIntCounter()
+    let cache = WTinyLFUCache<String>(capacity: 4, expiration: .afterRead(.milliseconds(500))) {
+      object in
+      XCTAssertEqual(object, "old")
+      evictions.increment()
+    }
+    defer { shutdown(cache) }
+
+    cache.put("key", "old")
+    Thread.sleep(forTimeInterval: 0.6)
+    DispatchQueue.concurrentPerform(iterations: 200) { index in
+      switch index % 3 {
+      case 0:
+        cache.put("key", "new")
+      case 1:
+        _ = cache.get("key")
+      default:
+        _ = cache.contains("key")
+      }
+    }
+
+    shutdown(cache)
+    XCTAssertEqual(cache.get("key"), "new")
+    XCTAssertEqual(cache.estimatedSize(), 1)
+    XCTAssertEqual(evictions.value, 1)
   }
 
   /// `Sendable` value 的 cache 应可安全传入并发边界。
@@ -927,6 +1110,37 @@ final class WTinyLFUInternalStructureTests: XCTestCase {
     _ = data.putOrUpdate("next", keyHash: nextHash, 3, generation: 0)
     let next = try XCTUnwrap(data.getNodeAndObject("next", keyHash: nextHash)?.node)
     XCTAssertEqual(policy.applyWrites([.add(next)]), [2])
+  }
+
+  /// 旧节点的延迟删除和读取事件不能误删同 key 新节点，也不能把旧节点重新链入 policy。
+  func testPolicyStaleExpirationEventsPreserveReplacement() throws {
+    let data = ConcurrentStringMap<String>()
+    let policy = PolicyState(maximum: 1, data: data)
+    let keyHash = stableHash("key")
+    _ = data.putOrUpdate("key", keyHash: keyHash, "old", generation: 0)
+    let old = try XCTUnwrap(data.getNodeAndObject("key", keyHash: keyHash)?.node)
+    XCTAssertTrue(policy.applyWrites([.add(old)]).isEmpty)
+
+    XCTAssertTrue(data.removeIfSameNode("key", keyHash: keyHash, old))
+    _ = data.putOrUpdate("key", keyHash: keyHash, "new", generation: 0)
+    let replacement = try XCTUnwrap(data.getNodeAndObject("key", keyHash: keyHash)?.node)
+    XCTAssertFalse(old === replacement)
+
+    XCTAssertTrue(policy.applyWrites([.remove(old), .add(replacement), .remove(old)]).isEmpty)
+    policy.applyReads([.hit(keyHash: keyHash, node: old, generation: 0)])
+    XCTAssertFalse(data.removeIfSameNode("key", keyHash: keyHash, old))
+    XCTAssertEqual(data.getNodeAndObject("key", keyHash: keyHash)?.object, "new")
+    XCTAssertEqual(data.estimatedSize(), 1)
+    XCTAssertFalse(old.isAlive)
+    XCTAssertFalse(old.isLinked)
+    XCTAssertTrue(replacement.isLinked)
+
+    let triggerHash = stableHash("trigger")
+    _ = data.putOrUpdate("trigger", keyHash: triggerHash, "trigger", generation: 0)
+    let trigger = try XCTUnwrap(data.getNodeAndObject("trigger", keyHash: triggerHash)?.node)
+    XCTAssertEqual(policy.applyWrites([.add(trigger)]), ["new"])
+    XCTAssertNil(data.getNodeAndObject("key", keyHash: keyHash))
+    XCTAssertEqual(data.estimatedSize(), 1)
   }
 
   /// probation 命中应晋升 protected，protected 超额时应把最旧 protected 降回 probation。

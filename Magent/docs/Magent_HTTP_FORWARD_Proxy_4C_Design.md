@@ -1,7 +1,7 @@
 ---
 desc: Magent HTTP Forward 单请求改写、路由、Wire 编解码与响应转发
-updated_at: 2026-07-24
-commit: af5ba87
+updated_at: 2026-09-21
+baseline: current-working-tree
 ---
 
 # Magent HTTP Forward 代理链路 4C 产品设计文档
@@ -32,25 +32,16 @@ HTTP forward 没有 `200 Connection Established`。下游建连成功后直接�
 
 ## 1.2 协议探测
 
-`MagentTCPConnection` 当前识别以下方法：
-
-- `DELETE`
-- `GET`
-- `HEAD`
-- `OPTIONS`
-- `POST`
-- `PUT`
-- `PATCH`
-- `TRACE`
-
-前缀不完整时继续累计；匹配后创建 `HttpForwardConnection`。
+`ProxyProbe` 接受最长 32 字节的合法 HTTP token method，不限于固定方法列表。
+`CONNECT ` 单独进入 CONNECT 前端；其他方法的 target 以 `/`、`*`、`http://` 或 `https://` 开头时进入
+Forward 前端。不完整前缀继续累计。探测选中 Forward 不代表该请求最终合法：HTTPS absolute-form 会在语义校验时被拒绝。
 
 ## 1.3 分层
 
 ```text
 local HTTP client
   -> MagentTCPConnection（方法探测）
-  -> HttpForwardConnection / HttpForwardProtocol
+  -> HttpForwardConnection / HTTPForwardRequestHandler / HTTPRequestDecoder
   -> MagentCore（规则匹配与 Channel 创建）
   -> direct target 或 ShadowsocksTCPWire + Shadowsocks server
 ```
@@ -62,16 +53,17 @@ HTTP request 的语法、目标解析和 header 改写属于前端。Core 只接
 
 ## 2.1 请求完整性
 
-`HttpForwardProtocol.parseIfComplete(_:)`：
+`NIOHTTP1.HTTPRequestDecoder` 与临时 `HTTPForwardRequestHandler`：
 
 - 等待 `\r\n\r\n`。
-- 解析 request-line 和 headers。
+- 解析 HTTP/1.0 或 HTTP/1.1 的 head/body/end。
+- 拒绝重复 Host、Expect、Upgrade 和 trailers。
 - 支持无 body，或由单个合法 `Content-Length` 指定的固定长度 body。
-- 数据不足时返回 `nil`。
+- 数据不足时 decoder 保留未完成输入并等待后续字节，handler 不发起下游建连。
 - 禁止多个 `Content-Length`。
 - 禁止 `Transfer-Encoding`，因此当前不支持 chunked request。
 - 完整 request 后禁止任何额外字节。
-- request 缓冲上限为 64 KiB。
+- 原始请求累计上限为 64 KiB；包含 headers 和 body，不提供大 body 流式转发。
 
 当前一条 accepted TCP connection 只支持一个 HTTP forward request。进入 `forward` 后再次从
 `proxyChannel` 收到数据会返回 400 并关闭；不支持 keep-alive 上的后续请求和 pipelining。
@@ -80,13 +72,14 @@ HTTP request 的语法、目标解析和 header 改写属于前端。Core 只接
 
 目标来源按以下顺序解析：
 
-1. request-target 是 `http://` 或 `https://` absolute URI 时，使用 URI host/port。
-2. 否则使用 `Host` header；未提供端口时默认 80。
+1. `http://` absolute-form 使用 URI host/port，省略端口时为 80；拒绝 userinfo 和 fragment。
+2. `/` 开头的 origin-form 使用唯一且非空的 `Host`，省略端口时为 80。
+3. `*` 也通过 Host 选择目标，但只允许 `OPTIONS *`。
 
 IPv6 Host 使用 `[address]:port`。端口必须在 `1...65535`。
 
-`https://` absolute URI 只参与地址解析，当前 HTTP forward 链路不会替客户端创建 TLS 会话；
-标准 HTTPS 代理访问应使用 HTTP CONNECT。
+`https://` absolute-form 返回 400；HTTPS 访问应使用 HTTP CONNECT。
+合法数字 IPv4/IPv6 会构造对应的 IP 类型，参与 CIDR 路由；path/query 保留百分号编码。
 
 ## 2.3 请求改写
 
@@ -111,7 +104,7 @@ IPv6 Host 使用 `[address]:port`。端口必须在 `1...65535`。
 
 ## 2.5 路由和响应
 
-- direct：连接原始 target，connect timeout 固定 10 秒。
+- direct：连接原始 target，connect timeout 使用 `MagentConfig.defaultTimeout`（毫秒，默认 10 秒）。
 - proxy：连接 `wire.getTargetAddress()`，timeout 使用 `wire.getTimeout()`。
 - proxy 节点不存在：失败关闭，不回退 direct。
 
@@ -130,20 +123,24 @@ IPv6 Host 使用 `[address]:port`。端口必须在 `1...65535`。
 ## 3.1 首个请求
 
 ```text
-累计 header/body
-  -> parseIfComplete
-  -> 解析 target
+累计原始请求字节
+  -> HTTPRequestDecoder 产生 head/body/end
+  -> HTTPForwardRequestHandler 校验 framing 并缓存 body
+  -> buildRequest 解析 target
   -> absolute-form/header 改写
+  -> 移除 decoder / 临时 handler，拒绝 leftovers
   -> routeTCPWire(target)
   -> direct: connect target
   -> proxy: connect proxy node
   -> 保存 wireChannel
-  -> proxy 路径发送 wire.start(target)
-  -> state = forward
-  -> 发送改写后的 request payload
+  -> proxy 路径先写 wire.start(target)，再写编码后的 request
+  -> direct 路径写改写后的 request
+  -> 请求写入 Future 成功
+  -> state = forward，启动响应读取
 ```
 
-先把状态切换为 `forward`，再调用 outbound，保证写入路径满足自身状态约束。
+请求发送期间仍处于 `request` 状态且停止接收新的首请求数据；写入成功后才进入 `forward`。
+这保证下游响应读取不会先于请求写入完成。
 
 ## 3.2 代理路径
 
@@ -173,6 +170,8 @@ wireChannel bytes
 - `proxyChannel` inactive/error：由 `MagentTCPConnection` 调用 `closeConnection(error:)`，
   只向下关闭 `wireChannel`。
 - `closed` 状态阻止循环关闭。
+- 每批响应写回 client 完成后再读取下游，解密无完整明文时继续读取。
+- client input half-close 在首请求完整时传播为下游 output close，等待目标响应；下游 input half-close 关闭 client output。
 
 # 4. Corners
 
@@ -186,12 +185,15 @@ wireChannel bytes
 | 多个 `Content-Length` | 400 |
 | pipelining | 400 |
 | 一条连接上的第二个 request | 400 |
-| absolute-form | 改写为 origin-form |
+| http absolute-form | 改写为 origin-form |
+| https absolute-form / userinfo / fragment | 400 |
+| OPTIONS * | 支持；其他方法使用 * 返回 400 |
+| Expect / Upgrade | 400 |
 | origin-form | 使用 Host 解析 target |
 | hop-by-hop headers | 剥离并强制 `Connection: close` |
 | response framing | 不解析，直到下游关闭 |
 | read/write idle timeout | 尚未实现 |
-| 双向背压 | 尚未实现 |
+| 响应流控 | 写回 client 完成后才读取下一批下游响应 |
 | 本地认证 | 无认证开放代理是当前产品设计 |
 
 ## 4.2 不应跨层的职责
@@ -208,3 +210,5 @@ wireChannel bytes
 - hop-by-hop、`Proxy-Authorization` 和动态 Connection header 移除。
 - body 分片、非法 framing、pipelining 拒绝。
 - direct/proxy 拨号地址、timeout 和错误响应。
+
+源码与现有测试：[HttpForwardConnection](../Sources/Connection/HttpForwardConnection.swift)、[HttpForwardConnectionTests](../Tests/Connection/HttpForwardConnectionTests.swift)。本次只静态对齐文档，未重跑测试。

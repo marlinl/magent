@@ -12,13 +12,13 @@ import NIOPosix
 public struct MagentConfig: Sendable {
 
   /// 本地 TCP listener 的绑定地址。
-  public let address: NetworkAddress
+  public let listener: NetworkAddress
 
   /// 直连 TCP channel 和远端 DNS 查询的默认超时时间（毫秒）。
   public let defaultTimeout: Int64
 
   /// SOCKS5 UDP 直连域名使用的 DNS 地址；nil 表示不支持 UDP 直连域名解析。
-  public let dnsAddress: SocketAddress?
+  public let dnsListener: SocketAddress?
 
   /// 规则未命中时采用的路由决策。
   public let defaultDecision: Decision
@@ -31,12 +31,13 @@ public struct MagentConfig: Sendable {
 
   /// 创建监听、路由和 DNS 配置；服务不设置已接入连接数上限。
   public init(
-    address: NetworkAddress, defaultDecision: Decision = .direct, rules: [ProxyRule] = [],
-    proxyNodes: [ProxyNode] = [], defaultTimeout: Int64 = 10_000, dnsAddress: SocketAddress? = nil
+    listener: NetworkAddress, defaultDecision: Decision = .direct, rules: [ProxyRule] = [],
+    proxyNodes: [ProxyNode] = [], defaultTimeout: Int64 = 10_000,
+    dnsListener: SocketAddress? = nil
   ) {
-    self.address = address
+    self.listener = listener
     self.defaultTimeout = defaultTimeout
-    self.dnsAddress = dnsAddress
+    self.dnsListener = dnsListener
     self.defaultDecision = defaultDecision
     self.rules = rules
     self.proxyNodes = proxyNodes
@@ -73,7 +74,12 @@ public actor Magent {
     }
     try validate(config)
     var tcpChannel: Channel?
-    let core = try makeCore(config)
+    let core = try MagentCore(
+      defaultDecision: config.defaultDecision,
+      proxyNodes: config.proxyNodes,
+      defaultTimeout: config.defaultTimeout,
+      rules: config.rules
+    )
     let shutdownPromise = group.next().makePromise(of: Void.self)
 
     do {
@@ -107,7 +113,12 @@ public actor Magent {
     }
     try validate(config)
 
-    let newCore = try makeCore(config)
+    let newCore = try MagentCore(
+      defaultDecision: config.defaultDecision,
+      proxyNodes: config.proxyNodes,
+      defaultTimeout: config.defaultTimeout,
+      rules: config.rules
+    )
     let shutdownPromise = group.next().makePromise(of: Void.self)
 
     // 结束旧运行周期及其 accepted connections，保留 EventLoopGroup 创建新 listener。
@@ -146,7 +157,7 @@ public actor Magent {
           MagentTCPConnection(
             channel,
             core: core,
-            dnsAddress: config.dnsAddress,
+            dnsAddress: config.dnsListener,
             shutdownFuture: shutdownFuture
           )
         )
@@ -155,36 +166,26 @@ public actor Magent {
         }
         return initialization
       }
-      .bind(host: config.address.host, port: config.address.port)
+      .bind(host: config.listener.host, port: config.listener.port)
       .wait()
   }
 
   /// 在创建运行周期前校验监听地址、超时和 DNS 服务器配置。
   private func validate(_ config: MagentConfig) throws {
-    guard !config.address.host.isEmpty, (1...65_535).contains(config.address.port) else {
+    guard !config.listener.host.isEmpty, (1...65_535).contains(config.listener.port) else {
       throw MagentError.invalidAddress("invalid Magent listen address")
     }
     guard config.defaultTimeout > 0 else {
       throw MagentError.invalidOptions("default timeout must be greater than zero")
     }
-    if let dnsAddress = config.dnsAddress {
-      guard dnsAddress.port.map({ (1...65_535).contains($0) }) == true else {
+    if let dnsListener = config.dnsListener {
+      guard dnsListener.port.map({ (1...65_535).contains($0) }) == true else {
         throw MagentError.invalidAddress("invalid DNS server address")
       }
-      if case .unixDomainSocket = dnsAddress {
+      if case .unixDomainSocket = dnsListener {
         throw MagentError.invalidAddress("DNS server must be an IPv4 or IPv6 address")
       }
     }
-  }
-
-  /// 根据本次运行的规则与完整节点列表创建独立的 Core。
-  private func makeCore(_ config: MagentConfig) throws -> MagentCore {
-    try MagentCore(
-      defaultDecision: config.defaultDecision,
-      proxyNodes: config.proxyNodes,
-      defaultTimeout: config.defaultTimeout,
-      rules: config.rules
-    )
   }
 
   private func shutdown(keepEventLoopGroup: Bool, tcpChannel: Channel?) throws {

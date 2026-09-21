@@ -7,6 +7,9 @@ proxy implementations remain implementation details of the package.
 
 ## Source Layout
 
+Paths in this document are relative to the package root. The source tree is
+available at [Sources](../Sources/).
+
 ```text
 Sources/
 ├── Magent.swift
@@ -162,9 +165,38 @@ the original destination.
 - A `Wire` owns only backend protocol state; it never owns the channel carrying
   that state.
 
-`restart(_:)` closes the current running cycle and creates a new `MagentCore`
-while reusing the service-owned `EventLoopGroup`. `close()` also shuts down the
-group and is terminal for that `Magent` instance.
+Each runtime has its own shutdown promise. Accepted connections subscribe to
+that runtime's shutdown signal; closing a SOCKS5 control connection also releases
+its UDP channels and optional DNS client. A restart creates a new Core and a new
+shutdown promise, so old connections never adopt the replacement configuration.
+
+`ProxyConnection.closeConnection(error:)` closes downstream resources only.
+The accepted channel remains owned by `MagentTCPConnection`. Inactive and error
+callbacks check the closed state before propagating cleanup to avoid close loops.
+
+`start(_:)` validates the configuration and creates Core before binding the
+listener. Configuration or Core initialization failure leaves the group available
+for another attempt. Listener startup failure completes the shutdown promise and
+shuts down the group; create a new `Magent` instance after that failure.
+
+`restart(_:)` validates the new configuration and creates a new `MagentCore`
+before closing the current running cycle, then binds the replacement listener
+using the service-owned `EventLoopGroup`. Configuration or Core initialization
+failure leaves the old cycle running. Replacement bind failure leaves the
+service stopped with the group available for another `start`.
+
+`close()` also shuts down the group and is terminal for that `Magent` instance.
+It is not idempotent: `close` and `restart` throw when the service is stopped,
+and `start` throws when it is already running. Restart closes existing tunnels.
+Lifecycle methods are actor-isolated synchronous boundaries that wait for NIO
+futures; call them from outside NIO EventLoops. External actor callers use `await`.
+
+See [Magent.swift](../Sources/Magent.swift) for the lifecycle implementation and
+[MagentTests](../Tests/MagentTests.swift) for its regression tests.
+
+The default proxy node is validated when Core is initialized. Nodes referenced
+by individual rules are checked when the route is used. Magent does not impose
+an established-connection count limit; the listener backlog is a separate setting.
 
 ## Where New Behavior Belongs
 

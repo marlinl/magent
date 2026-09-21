@@ -19,7 +19,7 @@ final class MagentTests: XCTestCase {
     try await portProbe.close().get()
 
     let config = MagentConfig(
-      address: .domain("127.0.0.1", port: port)
+      listener: .domain("127.0.0.1", port: port)
     )
     let magent = Magent(threadNumber: 2)
     var clients: [Channel] = []
@@ -54,7 +54,9 @@ final class MagentTests: XCTestCase {
       let restartedGreetingData = try await restartedGreeting.get()
       XCTAssertEqual(restartedGreetingData, Data([0x05, 0x00]))
 
-      let currentRuntimeClosed = expectation(description: "close ends the current runtime connection")
+      let currentRuntimeClosed = expectation(
+        description: "close ends the current runtime connection"
+      )
       restartedClient.closeFuture.whenComplete { _ in
         currentRuntimeClosed.fulfill()
       }
@@ -80,7 +82,7 @@ final class MagentTests: XCTestCase {
     var supportChannels: [Channel] = []
     let config: (Int) -> MagentConfig = { port in
       MagentConfig(
-        address: .domain("127.0.0.1", port: port)
+        listener: .domain("127.0.0.1", port: port)
       )
     }
     let magent = Magent(threadNumber: 1)

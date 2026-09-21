@@ -127,19 +127,10 @@ package class WTinyLFUCache<Object: Sendable>: @unchecked Sendable {
 
   /// 校验节点是否仍在 TTL 内。
   private func validateExpiration(of node: Node<Object>) -> Bool {
-    let timestamp: ManagedAtomic<Int64>
-    switch expiration {
-    case .never:
+    guard let timestamp = expirationTimestamp(for: node), let ttl else {
       return true
-    case .afterWrite:
-      timestamp = node.writtenAtMilliseconds
-    case .afterRead:
-      timestamp = node.readAtMilliseconds
     }
 
-    guard let ttl else {
-      return false
-    }
     let nowMilliseconds = currentMilliseconds()
     let timestampMilliseconds = timestamp.load(ordering: .acquiring)
     guard timestampMilliseconds >= 0 else {
@@ -151,6 +142,18 @@ package class WTinyLFUCache<Object: Sendable>: @unchecked Sendable {
     }
 
     return true
+  }
+
+  /// 所有过期检查、认领和写入路径必须选择同一个原子时间戳。
+  private func expirationTimestamp(for node: Node<Object>) -> ManagedAtomic<Int64>? {
+    switch expiration {
+    case .never:
+      return nil
+    case .afterWrite:
+      return node.writtenAtMilliseconds
+    case .afterRead:
+      return node.readAtMilliseconds
+    }
   }
 
   private func lookup(_ key: String, keyHash: Int, recordAccess: Bool) -> Object? {
@@ -218,7 +221,8 @@ package class WTinyLFUCache<Object: Sendable>: @unchecked Sendable {
     return object
   }
 
-  /// 写入或更新缓存对象。
+  /// 写入或更新缓存对象；已过期的节点先删除，再以新节点开始 TTL。
+  /// 未过期的 afterRead 节点只更新值，不延长读取期限。
   package func put(_ key: String, _ object: Object) {
     put(key, keyHash: stableHash(key), object)
   }
@@ -233,6 +237,26 @@ package class WTinyLFUCache<Object: Sendable>: @unchecked Sendable {
       writeLock.unlock()
       return
     }
+
+    if let ttl {
+      while let hit = data.getNodeAndObject(key, keyHash: keyHash),
+        let timestamp = expirationTimestamp(for: hit.node)
+      {
+        let observedTimestamp = timestamp.load(ordering: .acquiring)
+        guard observedTimestamp < 0 || currentMilliseconds() - observedTimestamp >= ttl else {
+          break
+        }
+        if removeExpiredNodeLocked(
+          hit.node, timestamp: timestamp, expectedTimestampMilliseconds: observedTimestamp,
+          evictedObjects: &evictedObjects
+        ) {
+          break
+        }
+        // 读取续期不持有 writeLock；CAS 失败后重新检查有效期，不能误删刚续期的节点。
+        // 若容量淘汰已先删除旧节点，下次查询会结束循环，再插入新节点。
+      }
+    }
+
     let writeGeneration = currentGeneration()
     switch data.putOrUpdate(key, keyHash: keyHash, object, generation: writeGeneration) {
     case .inserted(let node, let replaced):
@@ -350,23 +374,30 @@ package class WTinyLFUCache<Object: Sendable>: @unchecked Sendable {
 
   /// 时间戳仍等于读取时观察值时才认领并删除节点；竞争失败时留到后续周期处理。
   private func invalidateExpiredNode(_ node: Node<Object>, expectedTimestampMilliseconds: Int64) {
-    guard isCacheRunning else { return }
+    guard isCacheRunning, let timestamp = expirationTimestamp(for: node) else { return }
 
-    let timestamp: ManagedAtomic<Int64>
-    switch expiration {
-    case .never:
-      return
-    case .afterWrite:
-      timestamp = node.writtenAtMilliseconds
-    case .afterRead:
-      timestamp = node.readAtMilliseconds
-    }
-
+    var evictedObjects: [Object] = []
     writeLock.lock()
     guard isCacheRunning else {
       writeLock.unlock()
       return
     }
+    let removed = removeExpiredNodeLocked(
+      node, timestamp: timestamp, expectedTimestampMilliseconds: expectedTimestampMilliseconds,
+      evictedObjects: &evictedObjects
+    )
+    writeLock.unlock()
+    guard removed else { return }
+    notifyEvictions(evictedObjects)
+    scheduleDrain()
+  }
+
+  /// 调用方持有 writeLock；仅认领并移除仍是该节点的 entry，回调由调用方在锁外执行。
+  /// 写入和读取校验共用此路径，使旧节点的延迟清理不会删除替换节点或重复通知旧值。
+  private func removeExpiredNodeLocked(
+    _ node: Node<Object>, timestamp: ManagedAtomic<Int64>,
+    expectedTimestampMilliseconds: Int64, evictedObjects: inout [Object]
+  ) -> Bool {
     guard
       timestamp.compareExchange(
         expected: expectedTimestampMilliseconds,
@@ -374,18 +405,14 @@ package class WTinyLFUCache<Object: Sendable>: @unchecked Sendable {
         ordering: .acquiringAndReleasing
       ).exchanged
     else {
-      writeLock.unlock()
-      return
+      return false
     }
     guard data.removeIfSameNode(node.key, keyHash: node.keyHash, node) else {
-      writeLock.unlock()
-      return
+      return false
     }
-    var evictedObjects = [node.object]
+    evictedObjects.append(node.object)
     offerWrite(.remove(node), evictedObjects: &evictedObjects)
-    writeLock.unlock()
-    notifyEvictions(evictedObjects)
-    scheduleDrain()
+    return true
   }
 
   private func scheduleDrain() {
@@ -1351,10 +1378,15 @@ struct FrequencySketch {
 
 // MARK: - Hashing
 
-/// FNV-1a 64-bit 稳定哈希，作为字典 key 的哈希来源，避免再对 String 做 SipHash。
+/// 对规范等价的 String 计算相同的 FNV-1a 64-bit 哈希，供分桶、字典和 sketch 共用。
+/// ASCII 已是规范形式，直接使用原字符串；其他 key 仅在哈希时转换为 NFC，
+/// 不改变存储的 key 或 loader 接收的原字符串，也不折叠大小写或兼容字符。
 func stableHash(_ key: String) -> Int {
+  let canonicalKey =
+    key.utf8.allSatisfy { $0 < 0x80 }
+    ? key : key.precomposedStringWithCanonicalMapping
   var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-  for byte in key.utf8 {
+  for byte in canonicalKey.utf8 {
     hash ^= UInt64(byte)
     hash &*= 0x0000_0100_0000_01b3
   }

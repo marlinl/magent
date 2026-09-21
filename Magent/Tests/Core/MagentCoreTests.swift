@@ -51,6 +51,23 @@ final class MagentCoreTests: XCTestCase {
     }
   }
 
+  func testInitThrowsWhenDefaultProxyNodeIsMissing() throws {
+    let missingNodeID = try XCTUnwrap(
+      UUID(uuidString: "11111111-2222-3333-4444-555555555555")
+    )
+
+    XCTAssertThrowsError(
+      try MagentCore(
+        defaultDecision: .proxy(missingNodeID),
+        proxyNodes: [],
+        defaultTimeout: 10_000,
+        rules: []
+      )
+    ) { error in
+      XCTAssertEqual(error as? MagentError, .proxyNodeNotFound(missingNodeID))
+    }
+  }
+
   func testTCPProxyRouteUsesRegisteredNodeAddress() throws {
     let node = makeProxyNode(id: UUID(), host: "192.0.2.10")
     let target = NetworkAddress.domain("target.example", port: 443)
@@ -62,7 +79,7 @@ final class MagentCoreTests: XCTestCase {
         order: 0
       )
     ])
-    try core.putProxyNode(node)
+    try core.putAllProxyNodes([node])
 
     let wire = try XCTUnwrap(core.routeTCPWire(target))
 
@@ -114,7 +131,7 @@ final class MagentCoreTests: XCTestCase {
         order: 0
       )
     ])
-    try core.putProxyNode(node)
+    try core.putAllProxyNodes([node])
 
     let routeWire = try XCTUnwrap(core.routeUDPWire(target))
 
@@ -140,7 +157,7 @@ final class MagentCoreTests: XCTestCase {
     XCTAssertEqual(try core.routeUDPWire(target)?.getTargetAddress(), last.address)
   }
 
-  func testPutProxyNodeRejectsDuplicateAddressForDifferentIDs() throws {
+  func testPutAllProxyNodesRejectsDuplicateAddressForDifferentIDs() throws {
     let address = try SocketAddress(ipAddress: "192.0.2.14", port: 8388)
     let first = ProxyNode(
       id: UUID(),
@@ -154,9 +171,7 @@ final class MagentCoreTests: XCTestCase {
       cipher: .aes256Gcm,
       password: "second-password"
     )
-    try core.putProxyNode(first)
-
-    XCTAssertThrowsError(try core.putProxyNode(second)) { error in
+    XCTAssertThrowsError(try core.putAllProxyNodes([first, second])) { error in
       guard case MagentError.invalidPolicy(let message) = error else {
         return XCTFail("unexpected error: \(error)")
       }
