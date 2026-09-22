@@ -77,7 +77,14 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
           sourceAddress = envelope.remoteAddress
         }
 
-        if envelope.remoteAddress == sourceAddress {
+        guard let sourceAddress, let source = NetworkAddress(sourceAddress),
+          let remote = NetworkAddress(envelope.remoteAddress)
+        else {
+          throw MagentError.invalidAddress("UDP source must be an IP endpoint")
+        }
+        // Compare numeric identity across IPv4 and mapped IPv6, but retain the original
+        // SocketAddress for replies on the client's actual transport family.
+        if try remote.normalized() == source.normalized() {
           operation = try outbound(envelope)
         } else {
           operation = try inbound(envelope)
@@ -884,7 +891,9 @@ extension Socks5Connection {
     else {
       throw MagentError.malformedRequest("incomplete SOCKS5 address")
     }
-    return (command, address)
+    // ASSOCIATE carries a source hint, not a business target. Preserve its original
+    // type for source-hint policy; CONNECT and UDP payload targets share normalization.
+    return (command, command == .connect ? try address.normalized() : address)
   }
 
   /// 解析本地 client 发往 UDP relay 的独立 SOCKS5 datagram。
@@ -901,7 +910,7 @@ extension Socks5Connection {
     guard let (address, consumed) = try parseAddress(data, offset: 3, zeroPort: false) else {
       throw MagentError.malformedRequest("SOCKS5 UDP address is incomplete")
     }
-    return (target: address, data: Data(data.dropFirst(consumed)))
+    return (target: try address.normalized(), data: Data(data.dropFirst(consumed)))
   }
 
   /// 将真实远端来源地址和 payload 编码成 SOCKS5 UDP response。

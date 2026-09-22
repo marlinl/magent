@@ -2,7 +2,7 @@
 
 本文档只描述 MagentX macOS App 自己使用的设置和 UI 状态模型，不属于 Magent 跨平台共享业务模型。
 
-当前共享持久化模型为 `MagentProxyNode`、`MagentProxyRule`、`MagentProxyPolicy` 和 `MagentProxyPolicyRule`；其 SQL 契约及运行配置转换见 [Magent 模型与 SQL 映射](../../Magent/docs/Magent_Model_SQL_Design.md)。
+节点、规则和策略的持久化模型也由 MagentX 应用负责，包括 `MagentProxyNode`、`MagentProxyRule`、`MagentProxyPolicy` 和 `MagentProxyPolicyRule`。SQL 契约以应用的 [schema.sql](../../MagentX/docs/database/schema.sql) 为准；转换为 `MagentConfig` 的逻辑位于 [MagentService.swift](../../MagentX/MagentX/Service/MagentService.swift)。Magent 库不持有数据库或定义存储表。
 
 当前 MagentX 专属模型包括：
 

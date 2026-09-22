@@ -11,7 +11,7 @@ baseline: current-working-tree
 本文以当前 [MagentCore.swift](../Sources/Core/MagentCore.swift)、
 [ProxyRule.swift](../Sources/Model/ProxyRule.swift) 和 [Magent.swift](../Sources/Magent.swift) 为准。
 文件名沿用旧访问控制文档；当前实现是运行周期独有的 `MagentCore` 和文件内私有 `MagentRouter`。
-第 5 节单独保留旧 matcher 的 benchmark，不代表当前代码性能。
+旧 matcher 的性能数据已迁入[规则匹配与缓存压力测试](benchmark/MATCH_BENCHMARK.md)，不代表当前代码性能。
 
 # 1. Context
 
@@ -174,67 +174,8 @@ swift test --filter MagentCoreTests
 
 列出测试表示源码中存在相应断言，不表示本次文档更新已执行测试，也不证明穷尽所有规则组合。
 
-# 5. 旧 matcher benchmark 归档
+# 5. Benchmark 记录
 
-以下为 2026-06-25 的历史数据，属于已替换的 `MagentAccessControl` matcher。
-历史 `MagentAccessControlBenchmark.swift` 源文件和 executable target 均已不在当前 package，
-不能运行旧命令复测，也不能将这些数据解释为当前 `MagentRouter` 的性能。
-本节出现的优化点、类型和结论只描述当时版本。
-
-历史运行配置：
-```text
-durationPerScenario = 10s
-warmupRequests = 2000
-hitRate = 85%
-build = release
-date = 2026-06-25
-```
-
-优化点：
-
-- matcher 维护每个 phase 的 `bestPossible`。
-- 当前命中已无法被后续 phase 打败时提前返回。
-- 正则规则按策略优先级排序。
-- 正则匹配到不可被后续规则打败的规则后停止。
-
-### 阶段构建与 warmup 耗时
-
-| Phase | Rules | Policy Generation | Service Compile | Warmup |
-|---|---:|---:|---:|---:|
-| `exactDomain` | 100 | 67.08us | 1.44ms | 5.81ms |
-| `domainSuffix` | 100 | 17.00us | 699.54us | 7.59ms |
-| `domainKeyword` | 100 | 6.50us | 478.83us | 13.73ms |
-| `ipCIDR` | 100 | 19.83us | 529.62us | 8.48ms |
-| `urlRegex` | 100 | 132.96us | 1.70ms | 91.62ms |
-| `exactDomain` | 1,000 | 135.54us | 1.55ms | 4.35ms |
-| `domainSuffix` | 1,000 | 139.33us | 3.15ms | 7.33ms |
-| `domainKeyword` | 1,000 | 48.29us | 1.46ms | 14.07ms |
-| `ipCIDR` | 1,000 | 179.17us | 2.12ms | 8.45ms |
-| `urlRegex` | 1,000 | 1.07ms | 3.72ms | 801.73ms |
-
-### Match 场景结果
-
-| Phase | Rules | Target QPS | Operations | Match Loop | Actual QPS | Avg | p90 | p95 | p99 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `exactDomain` | 100 | 100 | 1,000 | 2.53ms | 395217.86/s | 2.48us | 2.75us | 2.92us | 2.96us |
-| `exactDomain` | 100 | 1000 | 10,000 | 22.36ms | 447137.20/s | 2.19us | 2.46us | 2.58us | 2.83us |
-| `domainSuffix` | 100 | 100 | 1,000 | 3.58ms | 279030.78/s | 3.54us | 3.58us | 3.62us | 3.79us |
-| `domainSuffix` | 100 | 1000 | 10,000 | 35.59ms | 280996.89/s | 3.52us | 3.62us | 3.67us | 3.83us |
-| `domainKeyword` | 100 | 100 | 1,000 | 6.84ms | 146125.85/s | 6.81us | 8.21us | 8.33us | 8.67us |
-| `domainKeyword` | 100 | 1000 | 10,000 | 68.46ms | 146064.21/s | 6.80us | 8.33us | 8.50us | 8.71us |
-| `ipCIDR` | 100 | 100 | 1,000 | 4.07ms | 245433.95/s | 4.04us | 4.38us | 4.46us | 4.67us |
-| `ipCIDR` | 100 | 1000 | 10,000 | 39.96ms | 250241.90/s | 3.96us | 4.33us | 4.38us | 4.50us |
-| `urlRegex` | 100 | 100 | 1,000 | 48.08ms | 20799.12/s | 48.00us | 78.17us | 78.67us | 81.08us |
-| `urlRegex` | 100 | 1000 | 10,000 | 478.22ms | 20910.67/s | 47.73us | 78.58us | 79.67us | 82.88us |
-| `exactDomain` | 1,000 | 100 | 1,000 | 2.09ms | 478459.51/s | 2.05us | 2.29us | 2.33us | 2.38us |
-| `exactDomain` | 1,000 | 1000 | 10,000 | 21.63ms | 462274.56/s | 2.11us | 2.38us | 2.46us | 2.58us |
-| `domainSuffix` | 1,000 | 100 | 1,000 | 3.47ms | 288579.47/s | 3.42us | 3.50us | 3.54us | 3.62us |
-| `domainSuffix` | 1,000 | 1000 | 10,000 | 35.03ms | 285448.88/s | 3.45us | 3.58us | 3.62us | 3.75us |
-| `domainKeyword` | 1,000 | 100 | 1,000 | 6.97ms | 143538.95/s | 6.93us | 8.08us | 8.21us | 8.46us |
-| `domainKeyword` | 1,000 | 1000 | 10,000 | 71.52ms | 139825.75/s | 7.10us | 8.38us | 8.62us | 8.96us |
-| `ipCIDR` | 1,000 | 100 | 1,000 | 4.01ms | 249519.11/s | 3.97us | 4.33us | 4.38us | 4.58us |
-| `ipCIDR` | 1,000 | 1000 | 10,000 | 40.04ms | 249736.48/s | 3.97us | 4.33us | 4.38us | 4.58us |
-| `urlRegex` | 1,000 | 100 | 1,000 | 427.37ms | 2339.91/s | 427.28us | 744.42us | 753.58us | 766.33us |
-| `urlRegex` | 1,000 | 1000 | 10,000 | 4393.26ms | 2276.21/s | 439.24us | 741.38us | 753.21us | 779.79us |
-
-结论：`exactDomain`、`domainSuffix`、`domainKeyword`、`ipCIDR` 在无缓存下都是微秒级；`urlRegex` 仍随规则数线性放大，是访问控制匹配的主要热点。历史数据中，1,000 条正则规则的 1000 qps 等价场景 p99 从优化前的 `1.16ms` 降到 `779.79us`。
+历史数据统一保存在[规则匹配与缓存压力测试](benchmark/MATCH_BENCHMARK.md)。
+五种匹配类型是同一测试的参数维度，共用测试入口、设备信息和统计口径；10 条构建/warmup 结果和 20 条 Match 结果集中记录。
+本设计文档只保留入口，不再维护结果表。

@@ -71,8 +71,9 @@ internal final class MagentCore: @unchecked Sendable {
     }
   }
 
-  /// 返回规则匹配结果，规则为空或未命中时使用默认决策。
-  private func routeDecision(_ address: NetworkAddress) -> Decision {
+  /// 所有调用方共享地址规范化与缓存语义；规则为空或未命中时使用默认决策。
+  private func routeDecision(_ address: NetworkAddress) throws -> Decision {
+    let address = try address.normalized()
     let key = Self.routeCacheKey(address)
     if let decision = routeCache.get(key) {
       return decision
@@ -89,7 +90,7 @@ internal final class MagentCore: @unchecked Sendable {
   /// 当前规则不匹配端口，因此 cache key 不包含端口。
   /// 规则为空或没有规则命中时，使用初始化时传入的默认决策。
   internal func routeTCPWire(_ address: NetworkAddress) throws -> Wire? {
-    let decision = routeDecision(address)
+    let decision = try routeDecision(address)
     switch decision {
     case .direct:
       return nil
@@ -106,7 +107,7 @@ internal final class MagentCore: @unchecked Sendable {
   ///
   /// `.direct` 返回 `nil`；`.proxy` 引用不存在的节点时抛出错误，禁止将代理配置错误降级为直连。
   internal func routeUDPWire(_ address: NetworkAddress) throws -> Wire? {
-    let decision = routeDecision(address)
+    let decision = try routeDecision(address)
     switch decision {
     case .direct:
       return nil
@@ -122,8 +123,8 @@ internal final class MagentCore: @unchecked Sendable {
   /// 为路由决策缓存构造稳定 key，并区分域名、IPv4 和 IPv6 地址。
   private static func routeCacheKey(_ address: NetworkAddress) -> String {
     switch address {
-    case .domain(let host, _):
-      return "domain:\(host.lowercased())"
+    case .domain:
+      return "domain:\(address.hostForMatching)"
 
     case .ipv4(let bytes, _):
       return "ipv4:\(bytes.base64EncodedString())"
@@ -151,7 +152,7 @@ internal final class MagentCore: @unchecked Sendable {
       )
     }
 
-    return ClientBootstrap(group: group)
+    let bootstrap = ClientBootstrap(group: group)
       .connectTimeout(.milliseconds(timeout))
       .channelOption(ChannelOptions.autoRead, value: false)
       .channelOption(ChannelOptions.maxMessagesPerRead, value: 1)
@@ -159,13 +160,23 @@ internal final class MagentCore: @unchecked Sendable {
       .channelInitializer { channel in
         channel.pipeline.addHandler(handler)
       }
-      .connect(host: address.host, port: address.port)
-      .flatMapErrorThrowing { error in
-        if let channelError = error as? ChannelError, case .connectTimeout = channelError {
-          throw MagentError.channelConnectionTimedOut
-        }
-        throw MagentError.channelCreationFailed(String(describing: error))
+    let connection: EventLoopFuture<Channel>
+    switch address {
+    case .ipv4, .ipv6:
+      // Numeric business targets bypass the hostname resolver entirely, including
+      // addresses normalized from a SOCKS domain or mapped IPv6 representation.
+      connection = group.next().makeCompletedFuture {
+        try bootstrap.connect(to: address.socketAddress())
+      }.flatMap { $0 }
+    case .domain:
+      connection = bootstrap.connect(host: address.host, port: address.port)
+    }
+    return connection.flatMapErrorThrowing { error in
+      if let channelError = error as? ChannelError, case .connectTimeout = channelError {
+        throw MagentError.channelConnectionTimedOut
       }
+      throw MagentError.channelCreationFailed(String(describing: error))
+    }
   }
 
   /// 使用已经解析完成的 NIO SocketAddress 创建下游 TCP client Channel。
@@ -393,8 +404,8 @@ private struct MagentRouter: Sendable {
     }
 
     switch address {
-    case .domain(let host, _):
-      guard let normalizedHost = try? Self.normalizedDomain(host) else { return nil }
+    case .domain:
+      let normalizedHost = address.hostForMatching
 
       consider(exactDomains[normalizedHost])
 
@@ -417,34 +428,6 @@ private struct MagentRouter: Sendable {
 
     guard let bestIndex else { return nil }
     return rules[bestIndex].decision
-  }
-
-  /// 将配置域名和请求域名转换为同一种比较形式，
-  /// 并拒绝无法作为 DNS 主机名执行的规则。
-  private static func normalizedDomain(_ value: String) throws -> String {
-    let domain = value.trimmingCharacters(in: .whitespacesAndNewlines)
-      .lowercased()
-      .trimmingCharacters(in: CharacterSet(charactersIn: "."))
-    let labels = domain.split(separator: ".", omittingEmptySubsequences: false)
-
-    guard domain.isEmpty == false, domain.utf8.count <= 253 else {
-      throw MagentError.invalidPolicy("invalid domain: \(value)")
-    }
-
-    for label in labels {
-      let bytes = label.utf8
-      let hasValidLength = bytes.isEmpty == false && bytes.count <= 63
-      let hasValidEdges = bytes.first != 45 && bytes.last != 45
-      let hasValidCharacters = bytes.allSatisfy { byte in
-        (48...57).contains(byte) || (97...122).contains(byte) || byte == 45
-      }
-
-      guard hasValidLength, hasValidEdges, hasValidCharacters else {
-        throw MagentError.invalidPolicy("invalid domain: \(value)")
-      }
-    }
-
-    return domain
   }
 }
 
