@@ -7,6 +7,8 @@ proxy implementations remain implementation details of the package.
 
 ## Design and Specification Index
 
+### Architecture-related specifications
+
 - [Model specifications](MODELS_SPEC.md): proposed NetworkAddress, HttpProtocol,
   ProxyNode, and ProxyRule contracts, associated enums, ownership boundaries, and
   acceptance criteria.
@@ -16,16 +18,35 @@ proxy implementations remain implementation details of the package.
   and acceptance criteria.
 - [HTTP specification](HTTP_PROXY_SPEC.md): forward proxy and CONNECT design,
   request/response handling, and acceptance criteria.
-- [W-TinyLFU cache design](WTiny_LFU_Cache_Design.md): cache contracts, expiration,
-  concurrency, and maintenance.
+- [W-TinyLFU cache specification](W-TinyLFU_CACHE_SPCE.md): proposed cache
+  functionality, constraints, algorithm invariants, and acceptance criteria.
+
+### Product designs and supporting evidence
+
+- [MagentCache design](design/MagentCache_Design.md): target cache business scope,
+  caller contract, Core integration, and edge cases, governed by the cache specification.
+- [Routing and access control design](design/MagentAccessControl_Design.md):
+  current routing rules, node selection, runtime ownership, and decision caching.
 - [Match benchmark](benchmark/MATCH_BENCHMARK.md): routing match/cache workload,
   test entry points, device metadata, and results across matching types.
+- [Cache benchmark](benchmark/MAGENT_CACHE_BENCHMARK.md): target measurement scope
+  and archived results from the previous implementation; target results are pending.
 
 This document owns package boundaries, resource ownership, lifecycle, and
 protocol integration constraints. The model SPEC owns proposed model contracts;
-the protocol SPECs own detailed message formats, product profiles, and acceptance
+the cache SPEC owns proposed cache semantics and algorithm invariants; the
+protocol SPECs own detailed message formats, product profiles, and acceptance
 matrices. Do not maintain a separate per-protocol implementation design document
 that duplicates these responsibilities.
+
+Component product designs live under `docs/design/` and use `Context`, `Contract`,
+`Core Logic`, and `Corners` to describe business scope, caller behavior, workflows,
+and edge cases. Each design must identify its status and reference the relevant
+architecture or specification for shared contracts. Algorithm constraints belong
+in SPECs; benchmark methods, analysis, and results belong under `docs/benchmark/`.
+SPECs define standalone functionality and constraints without references to
+product designs. Designs reference and implement SPECs; comparisons and migration
+details belong in the design, while this index may link to both.
 
 The SPECs include proposed capabilities and product choices that differ from the
 current package. Check source and tests before treating a requirement as

@@ -1,39 +1,39 @@
-# Magent 模型 SPEC
+# Magent Model SPEC
 
-版本：0.1.0 · 日期：2026-09-22 · 状态：待实现的设计规范
+Version: 0.1.0 · Date: 2026-09-22 · Status: design specification pending implementation
 
-本文定义重新设计后的 `NetworkAddress`、`HttpProtocol`、`ProxyNode`、`ProxyRule` 模型及其验收契约。关联枚举在对应模型章节内说明。允许调整模型 API 和实际涉及的序列化格式，不保留绕过校验的旧构造入口。本文中的接口是设计草图，不代表当前源码已经实现；本次文档变更不修改生产代码或测试。
+This document defines redesigned `NetworkAddress`, `HttpProtocol`, `ProxyNode`, and `ProxyRule` models and their acceptance contracts. Related enums are described in their respective model sections. The model APIs and the serialization formats they actually use may change; legacy construction paths that bypass validation are not retained. The interfaces in this document are design sketches and do not mean the current source implements them; this documentation change does not modify production code or tests.
 
 ## NetworkAddress
 
-### 1. 定位与职责
+### 1. Purpose and responsibilities
 
-`NetworkAddress` 是一个不可变的值类型，表示 **一个 IP 或主机名，加一个端口**。它描述代理请求中的逻辑地址，也可以表达协议响应中的地址字段。
+`NetworkAddress` is an immutable value type representing **one IP address or hostname plus one port**. It describes the logical address in a proxy request and can also express an address field in a protocol response.
 
-构造成功必须意味着地址符合本模型的格式契约，并且已经完成规范化。Core 和 Wire 可以直接消费该值，不需要再次修复、清洗或规范化。
+Successful construction must mean that the address satisfies this model's format contract and has already been normalized. Core and Wire can consume the value directly, without repairing, sanitizing, or normalizing it again.
 
-模型负责：
+The model is responsible for:
 
-- IP 与主机名的结构校验。
-- 主机名大小写、IP 文本与原始字节、IPv4-mapped IPv6 的统一表示。
-- 端口的数值范围。
-- 确定的相等性、哈希和序列化语义。
+- Structural validation of IP addresses and hostnames.
+- Unified representation of hostname case, IP text and raw bytes, and IPv4-mapped IPv6.
+- The numeric port range.
+- Deterministic equality, hashing, and serialization semantics.
 
-以下工作由对应的使用层负责：
+The respective consuming layers are responsible for:
 
-- HTTP、SOCKS、Shadowsocks 报文的解析、长度字段和命令语义。
-- DNS 查询、缓存、解析期限及搜索后缀策略。
-- 监听、连接建立、地址族选择和 Channel 生命周期。
-- 端口 `0` 是否适用于当前操作。
-- 路由规则匹配、目标安全策略和协议错误回复。
+- Parsing HTTP, SOCKS, and Shadowsocks messages, their length fields, and command semantics.
+- DNS queries, caching, resolution lifetimes, and search-suffix policy.
+- Listening, connection establishment, address-family selection, and Channel lifecycle.
+- Whether port `0` is valid for the current operation.
+- Route-rule matching, destination safety policy, and protocol error replies.
 
-构造成功只保证格式有效，不保证域名存在、目标可连接或访问已获授权。
+Successful construction guarantees only format validity; it does not guarantee that a domain exists, a destination is reachable, or access is authorized.
 
-### 2. 类型与构造入口
+### 2. Types and construction entry points
 
-公开类型使用 `struct`，内部使用枚举区分地址种类。只读枚举供包内 Core 和 Wire 分支处理，不对外提供接受任意枚举值的初始化方法。
+The public type is a `struct`, with an internal enum distinguishing address kinds. The read-only enum is for package-internal Core and Wire branches; no public initializer accepts an arbitrary enum value.
 
-以下是接口草图，方法体省略，不能作为完整 Swift 源文件直接编译：
+The following is an interface sketch. Method bodies are omitted, so it cannot be compiled directly as a complete Swift source file:
 
 ```swift
 public struct NetworkAddress: Sendable, Hashable, Codable {
@@ -47,28 +47,28 @@ public struct NetworkAddress: Sendable, Hashable, Codable {
     public let port: UInt16
 
     public init(host: String, port: UInt16) throws {
-        // 校验、规范化并写入不可变存储。
+        // Validate, normalize, and write immutable storage.
     }
 
     internal init(ipBytes: [UInt8], port: UInt16) throws {
-        // 校验字节数，处理 mapped IPv6，再写入不可变存储。
+        // Validate byte count, handle mapped IPv6, then write immutable storage.
     }
 
     public var host: String {
-        // 从有效存储生成确定的 host 文本。
+        // Generate deterministic host text from valid storage.
     }
 
     public init(from decoder: any Decoder) throws {
-        // 解码字段后调用同一构造入口。
+        // Call the same construction entry point after decoding fields.
     }
 
     public func encode(to encoder: any Encoder) throws {
-        // 编码规范化的 host 和 port。
+        // Encode normalized host and port.
     }
 }
 ```
 
-使用方式：
+Usage:
 
 ```swift
 let server = try NetworkAddress(host: "API.Example.COM.", port: 443)
@@ -76,170 +76,170 @@ let local = try NetworkAddress(host: "127.0.0.1", port: 8080)
 let ipv6 = try NetworkAddress(host: "2001:db8::1", port: 443)
 ```
 
-构造入口必须满足以下约束：
+Construction entry points must satisfy the following constraints:
 
-1. 文本构造只接受独立的 host。URL、HTTP authority、方括号、内嵌端口由调用方先解析。
-2. IP 字节构造接受 4 或 16 字节，并应用与文本入口相同的 IP 规范化规则。
-3. `Host` 只是包内的表示形式；不得新增将未经验证的 `Host` 直接装入地址的初始化方法。
-4. 所有入口，包括解码入口，都必须建立同一组存储不变量。
-5. 不提供 `unchecked` 构造、可写属性或测试专用构造通道。
-6. 不设置 `allowZeroPort`、`forBinding`、`forRouting`、`strict` 等改变模型含义的构造开关。
+1. Text construction accepts only a standalone host. Callers parse URLs, HTTP authority, brackets, and embedded ports first.
+2. IP-byte construction accepts 4 or 16 bytes and applies the same IP normalization rules as the text entry point.
+3. `Host` is only a package-internal representation; do not add an initializer that places an unvalidated `Host` directly in an address.
+4. Every entry point, including decoding, must establish the same storage invariants.
+5. Do not provide `unchecked` construction, writable properties, or test-only construction paths.
+6. Do not add construction switches such as `allowZeroPort`, `forBinding`, `forRouting`, or `strict` that change the model's meaning.
 
-### 3. 存储不变量
+### 3. Storage invariants
 
-| 存储 | 不变量 |
+| Storage | Invariant |
 |---|---|
-| `ipv4` | 恰好 4 字节，按网络字节顺序存储 |
-| `ipv6` | 恰好 16 字节，按网络字节顺序存储；不存储 mapped IPv6 |
-| `domain` | 符合第 5 节 ASCII 主机名语法，已经小写化，保留合法的显式根点 |
-| `port` | `UInt16`，范围为 `0...65535` |
+| `ipv4` | Exactly 4 bytes, stored in network byte order |
+| `ipv6` | Exactly 16 bytes, stored in network byte order; mapped IPv6 is not stored |
+| `domain` | Satisfies the §5 ASCII hostname grammar, has been lowercased, and retains a valid explicit root dot |
+| `port` | `UInt16`, in the range `0...65535` |
 
-IP 字节采用 `[UInt8]`，使用从零开始的数组索引。协议解析器从 `Data` 或 `ByteBuffer` 取出地址字段后，应将该字段复制为字节数组。不能假定 `Data` 切片的 `startIndex` 为零。
+IP bytes use `[UInt8]` with zero-based array indexing. After extracting an address field from `Data` or `ByteBuffer`, a protocol parser should copy that field to a byte array. It cannot assume a `Data` slice has a zero `startIndex`.
 
-`host` 是从有效存储生成的文本视图：
+`host` is a text view generated from valid storage:
 
-- IPv4 输出普通十进制 dotted-quad，不含前导零。
-- IPv6 输出统一的小写压缩文本，不带方括号或 scope 后缀。
-- 域名输出已经规范化的名称，保留显式根点。
-- 不输出端口，不添加 HTTP 语法。
-- 不返回空字符串或其他错误占位值，不触发 DNS。
+- IPv4 emits ordinary decimal dotted-quad notation without leading zeroes.
+- IPv6 emits canonical lowercase compressed text without brackets or a scope suffix.
+- A domain emits its normalized name, retaining an explicit root dot.
+- It does not emit a port or add HTTP syntax.
+- It does not return an empty string or another error placeholder, and it does not trigger DNS.
 
-IP 的相等性和规则匹配使用字节，不依赖展示文本。实现可以采用现有数值地址解析和格式化能力，但必须保证没有名称解析副作用。
+IP equality and rule matching use bytes rather than display text. An implementation may use existing numeric-address parsing and formatting capabilities, but must guarantee no name-resolution side effect.
 
-### 4. IP 解析与规范化
+### 4. IP parsing and normalization
 
-文本入口先区分严格的 IP 字面量与主机名，再构造最终存储。不得把非标准数值地址留给宽松的系统名称解析器解释。
+The text entry point first distinguishes strict IP literals from hostnames, then constructs final storage. It must not leave non-standard numeric addresses for a permissive system name resolver to interpret.
 
-IPv4 文本只接受四段十进制整数，每段为 `0...255`，除单个 `0` 外不得带前导零。
+IPv4 text accepts only four decimal integer components, each `0...255`, without leading zeroes except for a single `0`.
 
-IPv6 文本接受常规完整和压缩表示，解析为 16 字节。只有前 80 位为零、随后 16 位为 `0xffff` 的 IPv4-mapped IPv6 转换为等价 IPv4；其他 IPv6，包括 IPv4-compatible 和 NAT64 前缀地址，保持 IPv6。
+IPv6 text accepts ordinary full and compressed representations and parses to 16 bytes. Only IPv4-mapped IPv6 whose first 80 bits are zero and whose following 16 bits are `0xffff` converts to equivalent IPv4; all other IPv6, including IPv4-compatible and NAT64-prefix addresses, remains IPv6.
 
-文本与字节入口必须产生相同结果：
+Text and byte entry points must produce the same result:
 
-| 输入 | 结果 |
+| Input | Result |
 |---|---|
 | `192.0.2.1` | IPv4 `[192, 0, 2, 1]` |
-| `::ffff:192.0.2.1` | 同一个 IPv4 值 |
-| 对应 mapped IPv6 的 16 字节 | 同一个 IPv4 值 |
-| `2001:db8::1` | 原生 IPv6 |
-| `::192.0.2.1` | 保持 IPv6 |
-| `64:ff9b::192.0.2.1` | 保持 IPv6 |
-| `127.1`、`2130706433` | 拒绝省略段或整数形式 |
-| `127.000.0.1`、`0177.0.0.1` | 拒绝前导零形式 |
-| `0x7f000001`、`0X7F.0.0.1` | 拒绝十六进制形式 |
-| `256.0.0.1`、`1.2.3.4.5`、`192..2.1` | 拒绝无效数值表达 |
-| `192.0.2.1.` | 拒绝带根点的纯数值表达，不作为域名转交解析器 |
-| `[::1]`、`fe80::1%en0` | 拒绝方括号和 scope 文本扩展 |
+| `::ffff:192.0.2.1` | The same IPv4 value |
+| The corresponding 16 bytes of mapped IPv6 | The same IPv4 value |
+| `2001:db8::1` | Native IPv6 |
+| `::192.0.2.1` | Remains IPv6 |
+| `64:ff9b::192.0.2.1` | Remains IPv6 |
+| `127.1`, `2130706433` | Reject abbreviated components and integer form |
+| `127.000.0.1`, `0177.0.0.1` | Reject leading-zero forms |
+| `0x7f000001`, `0X7F.0.0.1` | Reject hexadecimal forms |
+| `256.0.0.1`, `1.2.3.4.5`, `192..2.1` | Reject invalid numeric expressions |
+| `192.0.2.1.` | Reject a pure numeric expression with a root dot; do not pass it to the resolver as a domain |
+| `[::1]`, `fe80::1%en0` | Reject bracket and scope text extensions |
 
-数字歧义检查是本模型明确采用的输入策略：仅由数字和点组成的文本，以及各段均为十进制数字或 `0x` 风格十六进制数值的文本，必须通过严格 IPv4 语法才能被接受；空段、空十六进制主体同样拒绝。不得通过先 trim、删除根点或补齐缺失段来接受它们。
+The numeric-ambiguity check is an explicit input policy of this model: text made only of digits and dots, and text whose components are each decimal digits or `0x`-style hexadecimal numbers, must pass strict IPv4 grammar to be accepted; empty components and an empty hexadecimal body are also rejected. They must not be accepted by trimming first, removing a root dot, or filling in missing components.
 
-该检查不能误伤包含普通名称标签的域名，例如 `0xfeed.example`。这类名称继续执行主机名语法校验。
+This check must not wrongly reject a domain containing an ordinary name label, such as `0xfeed.example`. Such names continue through hostname grammar validation.
 
-### 5. 主机名契约
+### 5. Hostname contract
 
-本模型接受 ASCII 主机名，不直接接受原始 Unicode 域名。主机名规则如下：
+This model accepts ASCII hostnames and does not directly accept raw Unicode domains. Hostname rules are as follows:
 
-| 项目 | 规则 |
+| Item | Rule |
 |---|---|
-| 空名称 | 拒绝 |
-| 字符集 | ASCII 字母、数字、连字符及标签间的点 |
-| 大小写 | 构造时转换为 ASCII 小写 |
-| 标签长度 | 每个标签 `1...63` 字节 |
-| 总长度 | 去掉一个合法末尾根点后为 `1...253` 字节 |
-| 连字符 | 标签首尾不允许 |
-| 根点 | 允许一个末尾根点，存储和转发时保留 |
-| 单标签 | 允许符合其他规则的普通名称，例如 `localhost`；纯数值歧义仍按第 4 节拒绝 |
-| 空白、控制字符、NUL | 拒绝，不 trim、不截断 |
-| 空标签、前导点、连续点、多个根点 | 拒绝 |
-| `_`、`/`、`\`、`@`、`:`、`[`、`]`、`%` | 不属于允许的主机名字符 |
+| Empty name | Reject |
+| Character set | ASCII letters, digits, hyphens, and dots between labels |
+| Case | Convert to ASCII lowercase during construction |
+| Label length | `1...63` bytes per label |
+| Total length | `1...253` bytes after removing one valid trailing root dot |
+| Hyphen | Not allowed at the start or end of a label |
+| Root dot | One trailing root dot is allowed and retained in storage and forwarding |
+| Single label | Ordinary names satisfying the other rules are allowed, e.g. `localhost`; pure numeric ambiguity is still rejected as §4 requires |
+| Whitespace, control characters, NUL | Reject; do not trim or truncate |
+| Empty label, leading dot, consecutive dots, multiple root dots | Reject |
+| `_`, `/`, `\`, `@`, `:`, `[`, `]`, `%` | Not allowed hostname characters |
 
-带根点的合法名称最长可为 254 字节。协议自身的地址字段长度限制必须由协议解析器和编码器处理，不能用线协议的 255 字节上限替代主机名长度规则。
+A valid name with a root dot can be at most 254 bytes. A protocol parser and encoder must handle the length limits of their own address fields; the wire protocol's 255-byte upper limit cannot replace the hostname-length rules.
 
-UI 和配置导入层需要支持 Unicode 时，应使用明确版本、具备测试向量的 IDNA 实现完成转换和验证，再调用本模型。不能在模型内手写不完整的 Punycode 算法。
+When UI and configuration-import layers need Unicode support, they should convert and validate with a versioned IDNA implementation that has test vectors, then call this model. The model cannot hand-write an incomplete Punycode algorithm.
 
-本模型只承诺 ASCII 主机名语法，不把 `xn--` 前缀和 LDH 字符检查视为完整 A-label 有效性证明。如果某协议入口承诺完整 IDNA 有效性，该入口必须调用相应的完整校验实现；这项额外契约必须单独验收。现有 SOCKS5 SPEC 的有效 A-label 要求不能仅凭本模型通过而标记完成。
+This model promises only ASCII hostname grammar; it does not treat an `xn--` prefix and LDH-character checks as proof of complete A-label validity. If a protocol entry point promises complete IDNA validity, it must call the appropriate complete validation implementation; that additional contract must be accepted separately. The existing SOCKS5 SPEC's valid-A-label requirement cannot be marked complete merely because this model passes.
 
-### 6. 端口与操作语义
+### 6. Ports and operation semantics
 
-端口统一使用 `UInt16`。从配置整数、字符串或序列化输入转换时必须精确转换；溢出、负数或非整数必须失败，禁止截断、回绕和替换为默认值。
+Ports use `UInt16` consistently. Conversion from configuration integers, strings, or serialized input must be exact; overflow, negative numbers, and non-integers must fail, with no truncation, wrapping, or replacement by a default.
 
-模型允许 `0`，具体操作入口决定是否允许使用：
+The model permits `0`; the specific operation entry point decides whether it may be used:
 
-| 使用场景 | 职责 |
+| Use case | Responsibility |
 |---|---|
-| CONNECT 目标、UDP 业务目标 | 对应操作入口拒绝端口 `0` |
-| 临时 socket 绑定 | 绑定策略可以允许 `0`，表示系统分配 |
-| SOCKS5 ASSOCIATE 来源提示、协议响应地址 | 按对应字段语义处理，不能套用 CONNECT 目标规则 |
-| 路由匹配和 Wire 编码 | 消费前面建立的模型与操作契约，不重复执行同一端口策略 |
+| CONNECT destination, UDP data destination | The corresponding operation entry point rejects port `0` |
+| Ephemeral socket binding | Binding policy may allow `0` to mean system assignment |
+| SOCKS5 ASSOCIATE source hint, protocol response address | Handle according to the semantics of that field; CONNECT-destination rules cannot be applied |
+| Route matching and Wire encoding | Consume the established model and operation contract without repeating the same port policy |
 
-模型允许端口 `0` 不等于自动改变 Magent listener 的产品策略。listener 是否支持临时端口，需要在监听配置的契约中明确。
+The model permitting port `0` does not automatically change Magent listener product policy. Whether the listener supports an ephemeral port needs to be explicit in the listening-configuration contract.
 
-### 7. 相等性与哈希
+### 7. Equality and hashing
 
-`Equatable` 和 `Hashable` 使用规范化后的地址种类、存储内容和端口。两者必须采用相同的身份语义。
+`Equatable` and `Hashable` use normalized address kind, stored contents, and port. Both must use the same identity semantics.
 
-| 两个值，除特别标明外端口相同 | 相等性 |
+| Two values, with the same port unless stated otherwise | Equality |
 |---|---|
-| `API.Example.COM` 与 `api.example.com` | 相等 |
-| 相同 IP 的不同文本写法 | 相等 |
-| IPv4 与对应 mapped IPv6 | 相等 |
-| 文本入口与字节入口构造的同一个 IP | 相等 |
-| host 相同、端口不同 | 不相等 |
-| `example.com` 与 `example.com.` | 不相等，显式根点属于模型保留的信息 |
-| 某域名与它当前解析出的 IP | 不相等，不为比较执行 DNS |
+| `API.Example.COM` and `api.example.com` | Equal |
+| Different text forms of the same IP | Equal |
+| IPv4 and its corresponding mapped IPv6 | Equal |
+| The same IP constructed from text and from the byte entry point | Equal |
+| Same host, different port | Not equal |
+| `example.com` and `example.com.` | Not equal; the explicit root dot is information retained by the model |
+| A domain and the IP it currently resolves to | Not equal; do not perform DNS for comparison |
 
-端口和根点不能为了路由缓存复用而从地址相等性中删除。`Hashable` 不承诺跨进程稳定的哈希数值，不得把 `hashValue` 用作持久化标识。
+Ports and root dots cannot be removed from address equality to reuse a route cache. `Hashable` does not promise a stable hash value across processes; `hashValue` must not be used as a persistent identifier.
 
-### 8. 路由、缓存和转发
+### 8. Routing, caching, and forwarding
 
-目标地址的数据路径为：
+The data path for a destination address is:
 
 ```text
-协议报文 / 应用配置 / Codable 输入
+protocol message / application configuration / Codable input
                   ↓
-       构造 NetworkAddress
-       校验并规范化，得到不可变值
+       construct NetworkAddress
+       validate and normalize to obtain an immutable value
                   ↓
-       操作入口检查命令和端口策略
+       operation entry point checks command and port policy
                   ↓
-       路由 → DNS 或拨号 → Wire
-            消费同一个地址值
+       routing → DNS or dial → Wire
+            consumes the same address value
 ```
 
-不得在 Core 内仅规范化临时副本用于路由，而让调用方将原始表示用于拨号和 Wire 握手。HTTP CONNECT、HTTP forward、SOCKS4a、SOCKS5 CONNECT 和 UDP 目标必须遵循同一构造契约。
+Core must not normalize only a temporary copy for routing while callers use the original representation for dialing and the Wire handshake. HTTP CONNECT, HTTP forward, SOCKS4a, SOCKS5 CONNECT, and UDP destinations must follow the same construction contract.
 
-路由匹配视图由 `MagentCore` 拥有：
+`MagentCore` owns the route-matching view:
 
-- 域名规则匹配可以去掉一个根点，例如两个地址的匹配名称均为 `api.example.com`。
-- 当前规则不匹配端口，因此路由缓存 key 可以忽略端口；新增端口规则时必须同步修改 key。
-- key 必须区分域名、IPv4 和 IPv6，使用规范化后的名称或 IP 字节。
-- Wire 和解析器收到的模型仍保留显式根点。
-- DNS 缓存和实际端点缓存根据自己的语义设计 key，不能直接套用路由缓存 key。
+- Domain-rule matching may remove one root dot; for example, both addresses use `api.example.com` as their matching name.
+- Current rules do not match ports, so a route-cache key may ignore the port; adding port rules must change the key at the same time.
+- The key must distinguish domains, IPv4, and IPv6, using normalized names or IP bytes.
+- The model received by Wire and parsers still retains the explicit root dot.
+- A DNS cache and actual-endpoint cache design their keys for their own semantics and cannot directly reuse the route-cache key.
 
-模型不再提供 `normalized()` 或 `hostForMatching`。根点是否影响实际解析以及是否使用绝对名称解析，由解析器所属层明确定义，不由路由缓存隐式决定。
+The model no longer provides `normalized()` or `hostForMatching`. Whether a root dot affects actual resolution or absolute-name resolution is used is explicitly defined by the layer owning the resolver, not decided implicitly by the route cache.
 
-### 9. NetworkAddress 与 SocketAddress
+### 9. NetworkAddress and SocketAddress
 
-| 类型 | 含义 |
+| Type | Meaning |
 |---|---|
-| `NetworkAddress` | 逻辑地址，可能包含尚未解析的域名；用于请求、路由和协议地址字段 |
-| NIO `SocketAddress` | 实际 socket 端点；用于监听、连接、UDP 收发和保留传输信息 |
+| `NetworkAddress` | A logical address that may contain an unresolved domain; used for requests, routing, and protocol address fields |
+| NIO `SocketAddress` | An actual socket endpoint; used for listening, connections, UDP send/receive, and preserving transport information |
 
-目标设计中 `MagentConfig.listener` 使用 `SocketAddress`，与节点地址和 DNS 地址的现有表示保持一致。若应用需要使用主机名配置监听，应先按应用配置策略解析为实际地址；该职责不放入本模型。
+In the target design, `MagentConfig.listener` uses `SocketAddress`, consistent with the existing representation of node and DNS addresses. If an application needs to configure listening with a hostname, it resolves it to an actual address first under application-configuration policy; this responsibility does not belong to this model.
 
-数值地址到 socket 的转换必须使用已经验证的 IP 字节和端口。域名解析由 Core 的连接路径或所属连接的异步解析器执行。本模型不得调用 `makeAddressResolvingHost`，不得隐藏同步 DNS，也不得创建 Channel、线程或 Task。
+Conversion of a numeric address to a socket must use validated IP bytes and port. Domain resolution is performed by Core's connection path or the owning connection's asynchronous resolver. This model must not call `makeAddressResolvingHost`, hide synchronous DNS, or create a Channel, thread, or Task.
 
-实际 socket 的地址族、IPv6 scope 和回复路径继续保存在 `SocketAddress` 中。不得把规范化后的逻辑地址用作原始 socket 的无损替代物：
+The actual socket's address family, IPv6 scope, and reply path remain in `SocketAddress`. A normalized logical address must not be used as a lossless substitute for the original socket:
 
-- mapped IPv6 转换为 IPv4 后，不再保留原始传输地址族。
-- 本模型不存储 scope；输入转换遇到非零 scope 时必须明确拒绝，不能只复制 IP 字节后静默丢弃。
-- 不依赖 scope 的 IPv6 字节可以构造；某业务目标是否需要 scope 才能使用，由操作入口判断并拒绝无法表达的目标。
-- UDP 回复继续使用记录的原始 `SocketAddress`。需要比较规范化 IP 身份时，不得覆盖原始端点。
-- 原始 ATYP 若对 ASSOCIATE 来源提示、协议校验或诊断有意义，由协议解析器保留；目标规范化不承担保存原始报文的职责。
+- Once mapped IPv6 converts to IPv4, the original transport address family is no longer retained.
+- This model does not store scope; input conversion encountering nonzero scope must explicitly reject it and cannot silently discard it after copying only IP bytes.
+- IPv6 bytes that do not depend on scope can be constructed; whether a business destination requires scope to be usable is decided by the operation entry point, which rejects an inexpressible destination.
+- UDP replies continue to use the recorded original `SocketAddress`. Comparing normalized IP identity must not overwrite the original endpoint.
+- If original ATYP matters for an ASSOCIATE source hint, protocol validation, or diagnostics, the protocol parser retains it; destination normalization does not preserve the original message.
 
-### 10. Codable 格式
+### 10. Codable format
 
-使用明确的 host/port 格式，不依赖内部枚举的自动合成编码布局：
+Use an explicit host/port format rather than the internally enumerated type's automatically synthesized encoding layout:
 
 ```json
 {
@@ -248,79 +248,79 @@ UI 和配置导入层需要支持 Unicode 时，应使用明确版本、具备�
 }
 ```
 
-编码输出规范化的 host 文本和数值端口。IP 不编码成原始字节数组，也不编码成带端口的 authority。
+Encoding emits normalized host text and numeric port. IP is not encoded as a raw byte array or as an authority with a port.
 
-解码必须先读取 `String` 和 `UInt16`，再通过 `init(host:port:)` 构造。缺失字段、错误字段类型、端口越界或非法 host 必须失败，不补默认 host 或默认端口。
+Decoding must first read `String` and `UInt16`, then construct through `init(host:port:)`. Missing fields, incorrect field types, out-of-range ports, and invalid hosts must fail, with no default host or default port substituted.
 
-必须保证：
+The following must hold:
 
 ```text
 decode(encode(address)) == address
 ```
 
-往返后保留地址身份、端口和根点，不要求保留原始大小写或原始 IP 文本拼写。旧 enum 的 Codable 布局不作为兼容格式；真实持久化数据的迁移由应用的存储迁移负责，不增加绕过验证的模型解码分支。
+The round trip retains address identity, port, and root dot; it need not retain original case or original IP text spelling. The former enum's Codable layout is not a compatibility format; migration of real persistent data belongs to the application's storage migration, without adding a model decoding branch that bypasses validation.
 
-### 11. 错误与职责分配
+### 11. Errors and allocation of responsibility
 
-地址内容不符合本模型契约时，构造入口抛出 `MagentError.invalidAddress`。不使用空字符串、端口 `0` 或 unspecified 地址作为失败回退值。
+When address contents do not satisfy this model's contract, a construction entry point throws `MagentError.invalidAddress`. It does not use an empty string, port `0`, or an unspecified address as a failure fallback.
 
-解码器自身的字段缺失和类型错误按 Codable 原始错误传播；读取字段后，地址构造失败按原始构造错误传播。helper 不捕获错误再包装或改名。
+The decoder's own missing-field and type errors propagate as the original Codable errors; after fields are read, address-construction failure propagates as the original construction error. Helpers do not catch an error to wrap or rename it.
 
-HTTP 状态、SOCKS 回复码、UDP 丢包或关闭行为由最高拥有边界统一选择，不进入地址模型。
+The highest owning boundary selects HTTP status, SOCKS reply code, UDP packet-drop, or close behavior uniformly; these do not enter the address model.
 
-| 层 | 必须保留的检查 | 可以移除的重复工作 |
+| Layer | Checks that must remain | Duplicate work that may be removed |
 |---|---|---|
-| 协议解析器 | 报文边界、字段长度、ATYP、UTF-8 解码、命令和字段允许的表示形式 | 各自实现的公共主机名清洗和数值规范化 |
-| NetworkAddress | IP 结构、ASCII 主机名语法、规范化、端口类型和解码契约 | 使用阶段的补救校验 |
-| 操作入口 | 端口 `0`、支持的地址族、scope 需求和具体访问策略 | 再次检查 host 非空和 IP 字节数 |
-| Core | 路由、缓存、解析和连接策略 | 再次规范化地址或仅规范化局部副本 |
-| Wire | 自身支持的地址类型和编码长度约束 | 再次检查模型已经保证的字节数和端口范围 |
+| Protocol parser | Message boundaries, field length, ATYP, UTF-8 decoding, commands, and forms allowed by the field | Its own general hostname sanitization and numeric normalization |
+| NetworkAddress | IP structure, ASCII hostname grammar, normalization, port type, and decoding contract | Remedial validation at the use stage |
+| Operation entry point | Port `0`, supported address families, scope requirements, and specific access policy | Checking nonempty host and IP-byte count again |
+| Core | Routing, caching, resolution, and connection policy | Normalizing the address again or normalizing only a local copy |
+| Wire | Its supported address kinds and encoding-length constraints | Checking again byte counts and port ranges the model already guarantees |
 
-例如 SOCKS5 Domain 字段是否允许 IPv6 文本，由 SOCKS5 解析器判断。通用文本构造支持 IPv6，不意味着所有协议的 Domain 字段都允许这种表示。
+For example, the SOCKS5 parser decides whether its Domain field permits IPv6 text. Generic text construction supporting IPv6 does not mean every protocol's Domain field permits that representation.
 
-### 12. 实施边界
+### 12. Implementation boundary
 
-本次设计允许直接调整公共 API。实现时按以下顺序推进：
+This design permits directly changing the public API. Implement it in the following order:
 
-1. 在现有 `Sources/Model/NetworkAddress.swift` 中实现受控构造、存储、相等性和显式 Codable。
-2. 将协议目标解析统一接入文本或字节构造入口，使路由和 Wire 消费同一结果。
-3. 将匹配名称和路由缓存 key 的处理留在 `MagentCore`。
-4. 调整 listener 配置及 socket 转换调用方，明确 scope 和原始地址族的保留路径。
-5. 删除旧公开 enum 构造、`normalized()`、`hostForMatching` 和包含 DNS 的模型转换方法。
-6. 删除已被新构造契约覆盖的重复验证，保留协议和操作自身的检查。
-7. 更新包与应用调用方、示例和实际涉及的持久化迁移。
+1. Implement controlled construction, storage, equality, and explicit Codable in the existing `Sources/Model/NetworkAddress.swift`.
+2. Connect all protocol-destination parsing to the text or byte construction entry point so routing and Wire consume the same result.
+3. Keep handling of matching names and route-cache keys in `MagentCore`.
+4. Adjust listener configuration and socket-conversion callers, making the preservation path for scope and original address family explicit.
+5. Remove legacy public enum construction, `normalized()`, `hostForMatching`, and model-conversion methods that include DNS.
+6. Remove redundant validation covered by the new construction contract while retaining the protocol's and operation's own checks.
+7. Update package and application callers, examples, and the persistent-data migrations actually involved.
 
-不新增 Validator、Normalizer、Factory、转发包装层或测试专用初始化方法。内部支撑类型可以继续放在同一个文件。
+Do not add a Validator, Normalizer, Factory, forwarding wrapper layer, or test-only initializer. Internal support types may remain in the same file.
 
-SOCKS 端口编解码等与模型无关的 `Data` / `UInt16` helper 应在相应协议代码中处理；读取失败不能伪装成合法端口 `0`。
+Model-independent `Data` / `UInt16` helpers, such as SOCKS port encoding and decoding, should be handled in their respective protocol code; a read failure cannot masquerade as valid port `0`.
 
-### 13. 验收标准
+### 13. Acceptance criteria
 
-以下为待实现验收项，不能仅凭本 SPEC 存在或旧测试通过而标记完成。
+The following are acceptance items pending implementation. They cannot be marked complete merely because this SPEC exists or legacy tests pass.
 
-| 编号 | 场景 | 必须验证的结果 |
+| ID | Scenario | Result that must be verified |
 |---|---|---|
-| NA-01 | 三种地址的合法构造 | 明确的存储类型、host 文本和端口 |
-| NA-02 | IP 字节长度 0、3、4、5、15、16、17 | 仅 4 和 16 接受，错误稳定传播 |
-| NA-03 | 非零起始索引的 `Data` 切片转字节数组 | 地址字节准确，读取 host 不越界 |
-| NA-04 | 文本、原始字节、mapped IPv6 表达同一 IPv4 | `==` 成立，Set 中只保留一个身份 |
-| NA-05 | 原生、compatible 和 NAT64 IPv6 | 保持 IPv6，不错误折叠 |
-| NA-06 | 非标准数值表达及 `0xfeed.example` | 第 4 节拒绝向量失败，普通名称不被误拒绝 |
-| NA-07 | 大小写、单根点和多根点 | 小写化、保留单根点、拒绝多个根点 |
-| NA-08 | 标签 63/64 字节、名称 253/254 字节 | 长度边界精确，254 字节仅可由合法名称加根点构成 |
-| NA-09 | 空串、NUL、空白、Unicode、空标签、分隔符 | 拒绝，不 trim、不截断 |
-| NA-10 | 端口 0、1、65535；解码 -1、65536、错误类型 | 模型接受有效范围，越界解码失败，操作入口单独拒绝不允许的 0 |
-| NA-11 | 不同端口、大小写、显式根点 | 相等性严格符合第 7 节 |
-| NA-12 | Codable 往返与非法输入 | 身份保留，不能绕过构造验证 |
-| NA-13 | HTTP、SOCKS4a、SOCKS5 TCP/UDP 的等价目标 | 路由决策、数值拨号与 Wire 地址编码保持一致 |
-| NA-14 | 带根点域名的匹配和转发 | 匹配 key 去根点，Wire 中根点保留 |
-| NA-15 | 仅构造、比较、哈希、编码、读取 host | 不查询 DNS、不创建网络资源 |
-| NA-16 | scoped socket、mapped IPv6 的实际端点 | 不丢 scope，不用逻辑地址覆盖原始回复端点 |
-| NA-17 | 协议 Domain 字段中的 IPv6 文本及 ASSOCIATE 提示 | 按协议字段规则处理，不被通用构造能力意外放宽 |
+| NA-01 | Valid construction of the three address kinds | Explicit storage kind, host text, and port |
+| NA-02 | IP byte lengths 0, 3, 4, 5, 15, 16, 17 | Only 4 and 16 are accepted; errors propagate consistently |
+| NA-03 | Convert a `Data` slice with nonzero start index to a byte array | Address bytes are accurate and reading host stays in bounds |
+| NA-04 | Text, raw bytes, and mapped IPv6 represent the same IPv4 | `==` holds and Set retains only one identity |
+| NA-05 | Native, compatible, and NAT64 IPv6 | Remain IPv6 and do not collapse incorrectly |
+| NA-06 | Non-standard numeric expressions and `0xfeed.example` | §4 rejection vectors fail; ordinary names are not falsely rejected |
+| NA-07 | Case, one root dot, and multiple root dots | Lowercase, retain one root dot, reject multiple root dots |
+| NA-08 | Labels of 63/64 bytes; names of 253/254 bytes | Precise length boundaries; 254 bytes can only be a valid name with a root dot |
+| NA-09 | Empty string, NUL, whitespace, Unicode, empty label, separator | Reject; do not trim or truncate |
+| NA-10 | Ports 0, 1, 65535; decode -1, 65536, incorrect type | Model accepts valid range, out-of-range decoding fails, operation entry point separately rejects disallowed 0 |
+| NA-11 | Different ports, case, explicit root dot | Equality strictly follows §7 |
+| NA-12 | Codable round trip and invalid input | Identity is retained and construction validation cannot be bypassed |
+| NA-13 | Equivalent destinations in HTTP, SOCKS4a, SOCKS5 TCP/UDP | Route decision, numeric dial, and Wire address encoding stay consistent |
+| NA-14 | Matching and forwarding a domain with a root dot | Matching key removes the root dot; Wire retains it |
+| NA-15 | Construct, compare, hash, encode, and read host only | Do not query DNS or create network resources |
+| NA-16 | Actual endpoint for scoped socket and mapped IPv6 | Do not lose scope or overwrite original reply endpoint with logical address |
+| NA-17 | IPv6 text in a protocol Domain field and ASSOCIATE hint | Handle by protocol-field rules without unintentionally relaxing them through generic construction capability |
 
-测试使用固定输入和字面量期望值。身份测试使用相等性和集合行为，不断言跨运行不稳定的 `hashValue` 数值。
+Tests use fixed inputs and literal expected values. Identity tests use equality and collection behavior, not the cross-run-unstable numeric value of `hashValue`.
 
-模型实现应运行定向测试；迁移涉及连接、缓冲、并发或清理代码时，至少执行：
+A model implementation should run targeted tests; when migration touches connection, buffering, concurrency, or cleanup code, run at least:
 
 ```bash
 swift build
@@ -331,63 +331,63 @@ swift test
 git diff --check
 ```
 
-对实际修改的 Swift 文件运行项目规定的 strict lint。应用调用方的编译、持久化迁移和真实网络行为分别验证，不能由包测试通过推断。文档单独变更只执行结构、链接和差异检查。
+Run the project's required strict lint on Swift files actually modified. Application-caller compilation, persistent-data migration, and real network behavior are verified separately and cannot be inferred from package-test success. A documentation-only change performs only structure, link, and diff checks.
 
-### 14. 相关文件与规范边界
+### 14. Related files and specification boundary
 
-- [当前 NetworkAddress 实现](../Sources/Model/NetworkAddress.swift)
-- [当前模型测试](../Tests/Model/NetworkAddressTests.swift)
-- [当前架构](ARCHITECTURE.md)
+- [Current NetworkAddress implementation](../Sources/Model/NetworkAddress.swift)
+- [Current model tests](../Tests/Model/NetworkAddressTests.swift)
+- [Current architecture](ARCHITECTURE.md)
 - [SOCKS4 / SOCKS4a SPEC](SOCKS4_PROXY_SPEC.md)
 - [SOCKS5 SPEC](SOCKS5_PROXY_SPEC.md)
 - [HTTP SPEC](HTTP_PROXY_SPEC.md)
 
-本文是新模型的设计目标；其他文档中对当前 enum、listener 类型、规范化入口和序列化格式的描述，须在实际迁移后更新。本文不宣称既有协议 SPEC 的全部能力已经实现，也不取消协议入口更严格的字段或 IDNA 契约。
+This document is the design target for the new model; descriptions in other documents of the current enum, listener type, normalization entry point, and serialization format must be updated after actual migration. It does not claim that all capabilities of existing protocol SPECs are already implemented or remove stricter field or IDNA contracts at protocol entry points.
 
 ## HttpProtocol
 
-### 1. 定位与设计目标
+### 1. Purpose and design goals
 
-`HttpProtocol` 表示 **已经校验完成的一个 HTTP 请求头所表达的代理请求语义**。它由 NIO 的 `HTTPRequestHead` 构造，确定业务目标、CONNECT 或普通转发分支，以及普通转发的出站头和请求体定界方式。
+`HttpProtocol` represents **the proxy-request semantics expressed by one HTTP request head whose validation is complete**. Constructed from NIO's `HTTPRequestHead`, it determines the business destination, the CONNECT or ordinary-forwarding branch, and the outbound head and body-framing method for ordinary forwarding.
 
-构造成功意味着头部语义符合本章契约，可以继续执行对应连接流程；不意味着请求体已经收齐、上游连接成功或响应已经发送。
+Successful construction means the head semantics satisfy this chapter's contract and the corresponding connection flow may continue; it does not mean the request body is complete, an upstream connection succeeded, or a response was sent.
 
-职责分为三层：
+Responsibilities are divided among three layers:
 
-| 层 | 责任 |
+| Layer | Responsibility |
 |---|---|
-| NIOHTTP1 decoder / encoder | HTTP 报文语法、增量解码与消息编码 |
-| `HttpProtocol` | 请求头语义、目标提取、Host 和分帧字段检查、出站头重建 |
-| HTTP Connection | 请求体接收、运行时限额、鉴权、路由与拨号、响应选择、背压和生命周期 |
+| NIOHTTP1 decoder / encoder | HTTP message grammar, incremental decoding, and message encoding |
+| `HttpProtocol` | Request-head semantics, destination extraction, Host and framing-field validation, outbound-head reconstruction |
+| HTTP Connection | Request-body receipt, runtime limits, authentication, routing and dialing, response selection, backpressure, and lifecycle |
 
-`HttpProtocol` 不持有原始接收缓冲、请求体、Channel、Wire、Core、Future 或 Task，不解析响应，也不执行 DNS。不把 `checkConnect()`、可变请求字段和静态 HTTP 响应字节继续混放在同一个对象中。
+`HttpProtocol` holds no original receive buffer, request body, Channel, Wire, Core, Future, or Task; it neither parses responses nor performs DNS. It does not continue to mix `checkConnect()`, mutable request fields, and static HTTP response bytes in the same object.
 
-### 2. 首版范围与其他 HTTP 规范的关系
+### 2. Initial scope and relationship to other HTTP specifications
 
-本章先为两条现有 HTTP 连接建立明确、共用的模型契约。首版选择一个有限的 HTTP/1 请求处理范围；这些是本模型的产品约束，不是所有 HTTP 实现都必须采用的限制。
+This chapter first establishes an explicit, shared model contract for the two existing HTTP connections. The initial version chooses a limited HTTP/1 request-processing scope; these are product constraints of this model, not limits every HTTP implementation must adopt.
 
-| 项目 | 本章首版设计 |
+| Item | Initial design in this chapter |
 |---|---|
-| 版本 | HTTP/1.0、HTTP/1.1；保留类型化版本 |
-| CONNECT | authority-form，显式非零端口，无请求体 |
-| 普通转发 | `http` absolute-form，以及由 Host 确定目标的 origin-form |
-| 请求体 | 无体，或单个 Content-Length 指定的固定长度 |
-| Transfer-Encoding / 请求 trailers | 首版拒绝，不通过删除字段伪装成支持 |
-| Expect / Upgrade | 首版拒绝，不触发 100-continue 或协议升级流程 |
-| OPTIONS | 支持发往具体目标的普通 OPTIONS；入站 `OPTIONS *` 和带 Max-Forwards 的 OPTIONS 暂不支持 |
-| TRACE | 首版按不支持的方法拒绝 |
-| 其他方法 | 保留合法、区分大小写的方法 token，不建立只含常见方法的模型白名单 |
-| 连接复用 | 首版 Connection 维持单请求流程，普通出站使用 `Connection: close` |
+| Version | HTTP/1.0 and HTTP/1.1; retain typed versions |
+| CONNECT | authority-form, explicit nonzero port, no request body |
+| Ordinary forwarding | `http` absolute-form and origin-form whose destination is determined by Host |
+| Request body | No body, or a fixed length specified by one Content-Length |
+| Transfer-Encoding / request trailers | Reject initially; do not pretend to support them by deleting fields |
+| Expect / Upgrade | Reject initially; do not trigger 100-continue or protocol-upgrade flow |
+| OPTIONS | Support ordinary OPTIONS to a specific destination; inbound `OPTIONS *` and OPTIONS with Max-Forwards are not initially supported |
+| TRACE | Initially reject as an unsupported method |
+| Other methods | Retain valid case-sensitive method tokens; do not make a model allowlist of only common methods |
+| Connection reuse | Initial Connection retains a single-request flow and ordinary outbound requests use `Connection: close` |
 
-[HTTP_PROXY_SPEC.md](HTTP_PROXY_SPEC.md) 描述了更大的目标范围，包括仅接入 HTTP/1.1、拒绝入站 origin-form、chunked、完整 OPTIONS/Max-Forwards、Expect、Upgrade 和连接复用。本章不是该完整代理规格的实现声明。
+[HTTP_PROXY_SPEC.md](HTTP_PROXY_SPEC.md) describes a broader target scope, including HTTP/1.1 only, rejecting inbound origin-form, chunked transfer, complete OPTIONS/Max-Forwards, Expect, Upgrade, and connection reuse. This chapter is not a statement that the complete proxy specification is implemented.
 
-两份文档有明确差异时，实现本模型首版以本章列出的范围为准；实现完整 HTTP 代理目标时，必须同步升级模型和 Connection 的契约与验收，不得只在枚举中预留一个没有执行路径的分支。原 HTTP SPEC 保留为后续完整能力的设计参考。
+Where the two documents explicitly differ, implementation of this model's initial version follows this chapter's scope; implementing the complete HTTP-proxy target must upgrade the model and Connection contract and acceptance together, rather than reserving an enum branch with no execution path. The original HTTP SPEC remains a design reference for later complete capability.
 
-### 3. 类型形状与唯一入口
+### 3. Type shape and sole entry point
 
-保留名称 `HttpProtocol`，作为包内不可变 `struct`。使用带关联值的枚举表达两种请求，避免 `isConnect`、可空目标、可空出站头和可空 body 字段的任意组合。
+Keep the name `HttpProtocol` as an immutable package-internal `struct`. Use associated-value enums to represent the two request kinds, avoiding arbitrary combinations of `isConnect`, optional target, optional outbound head, and optional body fields.
 
-以下为接口草图，构造实现省略，不是可直接编译的完整源文件：
+The following is an interface sketch. Construction implementation is omitted, so it is not a complete source file that can compile directly:
 
 ```swift
 import NIOHTTP1
@@ -420,124 +420,124 @@ internal struct HttpProtocol: Sendable {
     internal let request: Request
 
     internal init(head: HTTPRequestHead) throws {
-        // 检查输入、提取目标并生成最终请求语义。
+        // Validate input, extract the destination, and produce final request semantics.
     }
 }
 ```
 
-选择这些类型的理由：
+These types are chosen because:
 
-- `HTTPRequestHead`、`HTTPVersion`、`HTTPMethod`、`HTTPHeaders` 直接复用 NIO 类型。版本不再往返转换为 `"HTTP/1.1"` 字符串，headers 不再转换为普通字典或另一套字段模型。
-- `.connect` 只保留目标和入站版本，不存在发往源站的 CONNECT HTTP 请求头，也没有 HTTP 请求体状态。
-- `.forward` 保存规范化目标、准备交给编码器的出站 `HTTPRequestHead` 和明确的请求体定界方式。
-- `BodyFraming.none` 与 `.fixedLength(0)` 区分未声明请求体和显式声明零长度；二者均没有 body 字节，但出站字段不同。
-- `Failure` 仅区分模型自身产生的语义错误，供 Connection 按枚举选择响应，不按错误描述字符串分流。
+- `HTTPRequestHead`, `HTTPVersion`, `HTTPMethod`, and `HTTPHeaders` directly reuse NIO types. Versions no longer round-trip through an `"HTTP/1.1"` string, and headers no longer convert to an ordinary dictionary or another field model.
+- `.connect` retains only the destination and inbound version; it has no CONNECT HTTP request head sent to the origin server and no HTTP request-body state.
+- `.forward` retains the normalized destination, an outbound `HTTPRequestHead` ready for the encoder, and explicit request-body framing.
+- `BodyFraming.none` and `.fixedLength(0)` distinguish no declared request body from an explicitly declared zero length; neither has body bytes, but their outbound fields differ.
+- `Failure` distinguishes only semantic errors produced by the model itself, so Connection selects a response by enum rather than branching on error-description text.
 
-不提供接受 `Request` 的直接构造方法，也不暴露可写存储。包内可以读取和解构 `request`；修改取出的 `HTTPRequestHead` 副本不能改变模型本身。
+Do not provide direct construction accepting `Request` or expose writable storage. Package code can read and destructure `request`; changing an extracted `HTTPRequestHead` copy cannot change the model itself.
 
-该模型不承担缓存 key 或持久化记录的角色，首版不添加 `Hashable`、`Codable` 或保存完整请求的日志接口。验收直接检查分支、地址、NIO 字段和定界结果。
+This model does not act as a cache key or persistence record; the initial version adds no `Hashable`, `Codable`, or logging interface that retains complete requests. Acceptance directly checks the branch, address, NIO fields, and framing result.
 
-### 4. 构造阶段与验证归属
+### 4. Construction phases and validation ownership
 
-构造过程必须先验证入站含义，再删除或重建字段：
+Construction must validate inbound meaning before deleting or rebuilding fields:
 
 ```text
 HTTPRequestHead
     ↓
-版本、方法、字段基本合法性和重复关键字段
+version, method, basic field validity, and duplicate critical fields
     ↓
-读取原始 CL / TE，确定或拒绝入站分帧
+read raw CL / TE and determine or reject inbound framing
     ↓
-request-target、authority、Host → NetworkAddress
+request-target, authority, Host → NetworkAddress
     ↓
-检查 Connection tokens 及不支持的特性
+check Connection tokens and unsupported features
     ↓
-CONNECT 语义 / 普通转发出站头
+CONNECT semantics / ordinary-forwarding outbound head
 ```
 
-构造只依赖传入的 head，不访问配置单例、网络、系统代理状态或时钟。相同输入必须得到相同结果或相同错误类别。
+Construction depends only on the passed head and accesses no configuration singleton, network, system-proxy state, or clock. The same input must produce the same result or error category.
 
-NIO decoder 负责原始请求行、CRLF、字段语法和增量消息边界。模型不重新解析原始报文，但必须检查直接构造的 NIO head 也可能缺失的值约束：方法和字段名是非空 HTTP token，字段值不含 CR、LF、NUL、DEL 或除 HTAB 外的控制字符。不能认为 `HTTPRequestHead(...)` 本身等于已经完成所有语法校验。
+The NIO decoder is responsible for the raw request line, CRLF, field grammar, and incremental-message boundaries. The model does not reparse the raw message, but must check value constraints that a directly constructed NIO head may lack: method and field names are nonempty HTTP tokens, and field values contain no CR, LF, NUL, DEL, or control character other than HTAB. `HTTPRequestHead(...)` itself cannot be assumed to mean all grammar validation is complete.
 
-header 名称比较使用 ASCII 大小写不敏感语义。字段值仅在 HTTP 字段语法允许的位置移除 SP / HTAB；不对 request-target 或 host 使用通用 Unicode trim。所有字段保留重复项，检查前不得通过字典、自动合并或覆盖丢失信息。
+Header-name comparison uses ASCII case-insensitive semantics. Field values remove SP / HTAB only where HTTP field grammar permits; do not apply general Unicode trimming to request-target or host. Preserve duplicate fields; do not lose information through a dictionary, automatic merging, or overwriting before validation.
 
-若底层 decoder 在产生 `.head` 前已经拒绝输入，错误直接到 Connection；若 decoder 折叠了判定所需的信息，必须在 NIO 解码接入处解决，不能让模型猜测丢失的原始字段。网络报文测试和直接构造 head 的测试都必须覆盖这些边界。
+If the underlying decoder rejects input before producing `.head`, the error goes directly to Connection; if the decoder collapses information required for a decision, solve it at the NIO decoding integration point rather than making the model guess missing raw fields. Network-message tests and directly constructed head tests must both cover these boundaries.
 
-### 5. 请求类型与目标的唯一来源
+### 5. Request types and the sole source of destination
 
-| 方法 / request-target | 分支与业务目标 |
+| Method / request-target | Branch and business destination |
 |---|---|
-| 精确的 `CONNECT host:port` | `.connect`，目标来自 authority |
-| 非 CONNECT 的 `http://host[:port]/path?query` | `.forward`，目标来自 URI authority |
-| 非 CONNECT 的 `/path?query` | `.forward`，目标来自唯一合法 Host |
-| CONNECT 搭配 absolute-form、origin-form 或 `*` | 非法请求 |
-| 非 CONNECT 搭配裸 `host:port` | 非法请求 |
-| `OPTIONS *` | 首版能力不足，拒绝；不能伪造业务目标 |
-| 其他方法搭配 `*` | 非法请求 |
-| `https://`、`ws://`、`wss://`、`ftp://` 等 scheme | 首版不支持，不能悄悄改用明文 TCP |
+| Exact `CONNECT host:port` | `.connect`; destination comes from authority |
+| Non-CONNECT `http://host[:port]/path?query` | `.forward`; destination comes from URI authority |
+| Non-CONNECT `/path?query` | `.forward`; destination comes from the sole valid Host |
+| CONNECT with absolute-form, origin-form, or `*` | Invalid request |
+| Non-CONNECT with bare `host:port` | Invalid request |
+| `OPTIONS *` | Initial capability is insufficient; reject and do not fabricate a business destination |
+| Other methods with `*` | Invalid request |
+| Schemes such as `https://`, `ws://`, `wss://`, `ftp://` | Unsupported initially; do not silently use plaintext TCP instead |
 
-方法名区分大小写，不能把 `connect` 转为 `CONNECT`。普通方法不按 GET/POST 推断请求体是否存在；分帧独立由字段决定。
+Method names are case-sensitive; `connect` cannot become `CONNECT`. Ordinary methods do not infer a request body's presence from GET/POST; framing is determined independently by fields.
 
-scheme 按 ASCII 大小写不敏感识别；request-target 使用 ASCII URI 文本，原始 Unicode 路径需要由客户端先做合法百分号编码。origin-form 中以 `//` 开头的合法 path 仍然是路径，不能重新解释为另一个 authority。
+Schemes are recognized ASCII-case-insensitively; request-target uses ASCII URI text, so a raw Unicode path must first be validly percent-encoded by the client. A valid origin-form path beginning with `//` remains a path and cannot be reinterpreted as another authority.
 
-代理节点地址只供 Core 选择传输端点。模型里的 `target` 始终是业务目标，出站 Host 也不得替换为代理节点或 DNS 返回的数值 IP。
+Proxy-node addresses are only for Core to select transport endpoints. The model's `target` is always the business destination, and the outbound Host must not be replaced with a proxy node or numeric IP returned by DNS.
 
-authority-form 与 absolute-form 的基本区分，以及 absolute-form 使用 URI authority 重建 Host 的依据见 [RFC 9112 §3.2](https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2)。本章另行明确 origin-form 接入和 CONNECT Host 一致性的产品策略。
+For the basic distinction between authority-form and absolute-form and the basis for rebuilding Host from URI authority in absolute-form, see [RFC 9112 §3.2](https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2). This chapter separately defines the product policy for origin-form admission and CONNECT Host consistency.
 
-### 6. Authority 与 NetworkAddress 的组合
+### 6. Combining Authority and NetworkAddress
 
-HTTP 层只负责拆分 host、端口和 IPv6 方括号，再调用 [NetworkAddress](#networkaddress) 的受控构造入口。ASCII 主机名规则、数值地址歧义和 mapped IPv6 规范化不得另写一套。
+The HTTP layer only separates host, port, and IPv6 brackets, then calls the controlled [NetworkAddress](#networkaddress) construction entry point. It must not write another set of ASCII-hostname rules, numeric-address ambiguity rules, or mapped-IPv6 normalization.
 
-| 场景 | 端口规则 |
+| Scenario | Port rule |
 |---|---|
-| CONNECT request-target | 必须显式提供 `1...65535` |
-| 普通 absolute-form authority | 省略时为 80；显式端口必须非零 |
-| 普通转发 Host | 省略时为 80；显式端口必须非零 |
-| CONNECT Host | 省略时仅用于一致性比较，采用 request-target 已经确认的端口；不得因此推断为 443 |
+| CONNECT request-target | Must explicitly provide `1...65535` |
+| Ordinary absolute-form authority | Defaults to 80 when omitted; explicit port must be nonzero |
+| Ordinary-forwarding Host | Defaults to 80 when omitted; explicit port must be nonzero |
+| CONNECT Host | When omitted, used only for consistency comparison with the port already confirmed by request-target; it must not therefore be inferred as 443 |
 
-显式端口只接受非空十进制数字，执行溢出检查。前导零可作为端口输入接受，输出使用普通十进制；不接受正负号、内部空白、空端口或截断转换。
+An explicit port accepts only nonempty decimal digits and checks overflow. Leading zeroes are accepted as port input and output in ordinary decimal; signs, internal whitespace, empty ports, and truncating conversion are not accepted.
 
-HTTP authority 中 IPv6 必须有完整方括号，括号外只能出现允许的端口后缀。拒绝 userinfo、百分号编码 host、scope、IPvFuture、路径、query 和 fragment 混入 authority。
+IPv6 in HTTP authority must have complete brackets, with only an allowed port suffix outside them. Reject userinfo, percent-encoded hosts, scope, IPvFuture, path, query, and fragment mixed into authority.
 
-必须先验证括号内是合法 IPv6 字面量，再交给 `NetworkAddress`。不能在规范化后要求结果仍为 `.ipv6`，否则 `[::ffff:192.0.2.1]:443` 会因合法地转换为 IPv4 而被误拒绝。`[example.com]:443` 和 `[192.0.2.1]:443` 则必须拒绝。
+It must first validate that the bracket contents are a valid IPv6 literal, then pass them to `NetworkAddress`. It cannot require the normalized result to remain `.ipv6`, or `[::ffff:192.0.2.1]:443` would be wrongly rejected after its valid conversion to IPv4. `[example.com]:443` and `[192.0.2.1]:443` must be rejected.
 
-authority 的词法拆分可以在现有 `HttpProtocol.swift` 内共用一个私有方法，返回 host、可选的显式端口和表示信息。CONNECT 是否必须有端口由调用位置决定，不使用一串 `isConnect`、`allowMissingPort` 等布尔开关。需要复用的是拆分规则，不是抹平各字段的语义差异。
+Authority lexical splitting may share one private method within the existing `HttpProtocol.swift`, returning host, optional explicit port, and representation information. Whether CONNECT must have a port is decided by the call site; do not use a chain of Boolean switches such as `isConnect` and `allowMissingPort`. Reuse the splitting rule, not by flattening semantic differences among fields.
 
-### 7. Host 字段契约
+### 7. Host-field contract
 
-| 场景 | Host 要求 |
+| Scenario | Host requirement |
 |---|---|
-| HTTP/1.1 | 恰好一个合法、非空 Host |
-| HTTP/1.0 CONNECT / absolute-form | 可以缺失；存在时只能有一个且必须合法 |
-| HTTP/1.0 origin-form | 恰好一个合法、非空 Host，否则无法确定目标 |
-| 所有版本的重复 Host | 拒绝，包括值相同或字段名大小写不同的重复 |
+| HTTP/1.1 | Exactly one valid, nonempty Host |
+| HTTP/1.0 CONNECT / absolute-form | May be absent; if present, exactly one and valid |
+| HTTP/1.0 origin-form | Exactly one valid, nonempty Host; otherwise the destination cannot be determined |
+| Duplicate Host in every version | Reject, including duplicates with the same value or different case in field names |
 
-首版对三种目标形式作如下处理：
+The initial version handles the three target forms as follows:
 
-- absolute-form：URI authority 决定业务目标。合法但不一致的 Host 不改变路由，出站 Host 根据 URI authority 重建。
-- origin-form：Host 是唯一目标来源；没有另外的 URI authority 可供回退。
-- CONNECT：Host 存在时，用第 6 节端口规则构造比较值，与 request-target 的 `NetworkAddress` 比较；不一致即拒绝。
+- absolute-form: URI authority determines the business destination. A valid but inconsistent Host does not change routing, and outbound Host is rebuilt from URI authority.
+- origin-form: Host is the sole destination source; no other URI authority exists as a fallback.
+- CONNECT: when Host is present, use §6 port rules to construct a comparison value and compare it with request-target's `NetworkAddress`; reject inconsistency.
 
-CONNECT 的一致性比较采用地址值身份：域名大小写被统一，mapped IPv6 与 IPv4 相等，显式根点差异保留。不能使用路由去根点后的匹配 key 来证明 Host 一致，也不执行 DNS 来比较两个域名是否指向同一服务器。
+CONNECT consistency comparison uses address-value identity: domain case is unified, mapped IPv6 equals IPv4, and explicit-root-dot differences are retained. It cannot use a route matching key after root-dot removal to prove Host consistency, nor perform DNS to compare whether two domains point to the same server.
 
-CONNECT 的严格一致性检查是本章产品决策；[HTTP_PROXY_SPEC.md](HTTP_PROXY_SPEC.md) 对 CONNECT Host 采用更宽松的目标优先规则，实现首版时不得混用两个分支。absolute-form 接受合法冲突 Host 也不等于接受缺失、重复或语法非法的 HTTP/1.1 Host；字段数量和语法检查仍先执行。
+Strict CONNECT consistency checking is a product decision of this chapter; [HTTP_PROXY_SPEC.md](HTTP_PROXY_SPEC.md) uses a more permissive destination-first rule for CONNECT Host, and implementation of the initial version must not mix the two branches. Accepting a valid conflicting Host in absolute-form also does not mean accepting absent, duplicate, or grammatically invalid HTTP/1.1 Host; field-count and grammar validation still occur first.
 
-### 8. Path、query 与出站 authority
+### 8. Path, query, and outbound authority
 
-普通 absolute-form 只提取结构边界，不对 path/query 做解码后再编码。不得依赖会自动修复非法输入或改变转义文本的 URL 处理过程；如果复用 URL 解析能力，必须用下列字面向量验证其保真行为。
+Ordinary absolute-form extracts only structural boundaries and does not decode then reencode path/query. It must not rely on URL handling that automatically repairs invalid input or changes escaped text; if URL-parsing capability is reused, its preservation behavior must be verified with the following literal vectors.
 
-| 输入 URI | 出站 request-target |
+| Input URI | Outbound request-target |
 |---|---|
 | `http://example.com` | `/` |
 | `http://example.com?` | `/?` |
 | `http://example.com?x=1` | `/?x=1` |
 | `http://example.com/a%2Fb?q=%0D%0A` | `/a%2Fb?q=%0D%0A` |
 | `http://example.com/a/../b//c` | `/a/../b//c` |
-| 合法 origin-form `/a%2Fb?x=` | 原样保留 |
+| Valid origin-form `/a%2Fb?x=` | Retain exactly |
 
-原始空白、控制字符、反斜线、fragment 和不完整的 `%HH` 转义必须拒绝。合法转义不能解码成分隔符或控制字符。重复斜线、点路径片段和查询参数顺序保持不变。
+Raw whitespace, control characters, backslashes, fragments, and incomplete `%HH` escapes must be rejected. Valid escapes cannot be decoded into delimiters or control characters. Repeated slashes, dot path segments, and query-parameter order remain unchanged.
 
-`OPTIONS http://example.com` 是一个特殊但明确的转发请求：作为到源站前的最后一个 HTTP 代理，空 path 且没有 query 时，出站 target 为 `*`；`OPTIONS http://example.com?` 输出 `/?`。这是向已确定源站转发的 OPTIONS，与入站 `OPTIONS *` 的本地能力请求不同。该区别见 [RFC 9112 §3.2.4](https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2.4)。
+`OPTIONS http://example.com` is a special but explicit forwarding request: as the last HTTP proxy before the origin server, its outbound target is `*` when path is empty and no query exists; `OPTIONS http://example.com?` emits `/?`. This is OPTIONS forwarded to a determined origin server, distinct from an inbound `OPTIONS *` local-capability request. See [RFC 9112 §3.2.4](https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2.4) for this distinction.
 
 出站 Host 从最终 `NetworkAddress` 的规范化 host 与 HTTP authority 中的端口存在性生成：
 
@@ -1146,8 +1146,7 @@ Core 对所有实际命中的候选规则按同一顺序选择：
 - [当前 Decision](../Sources/Model/Decision.swift)
 - [当前 Core 与 Router](../Sources/Core/MagentCore.swift)
 - [当前 Core 测试](../Tests/Core/MagentCoreTests.swift)
-- [既有访问控制设计](MagentAccessControl_Design.md)
 
-旧访问控制文档包含 trim、URL 正则延迟拒绝、重复 CIDR 解析和数值 specificity 等当前行为；本章明确列出的变化是新模型设计目标，不能据此宣称当前源码已经更新。
+本章定义模型的目标功能与约束；源码是否满足这些要求，需要按本章验收场景独立验证。
 
 实现两个模型后，应完成节点/cipher、规则/Core 的定向验收，并按项目规定执行 build、strict-concurrency build、ConnectionTests、全包测试、实际修改 Swift 文件的 strict lint 和 `git diff --check`。应用节点导入、秒到毫秒迁移和规则持久化转换需要独立验证；文档阶段只检查结构、链接、示例不变量和修改范围。

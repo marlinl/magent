@@ -177,4 +177,4 @@ git show 1113e1635db24f751c7c94e992505f160450d4ac:Magent/Package.swift
 
 同一轮中的匹配类型、规则规模、命中率和缓存配置作为结果表的维度；有独立目的和测量入口的其他压力测试，再建立另一份 Markdown。
 
-返回：[架构与文档索引](../ARCHITECTURE.md) · [路由与访问控制设计](../MagentAccessControl_Design.md)。
+返回：[架构与文档索引](../ARCHITECTURE.md) · [路由与访问控制设计](../design/MagentAccessControl_Design.md)。

@@ -6,12 +6,14 @@ baseline: current-working-tree
 
 # Magent 路由与访问控制设计
 
+相关文档：[架构与文档索引](../ARCHITECTURE.md) · [模型目标规格](../MODELS_SPEC.md)。
+
 ## 0. 文档目标
 
-本文以当前 [MagentCore.swift](../Sources/Core/MagentCore.swift)、
-[ProxyRule.swift](../Sources/Model/ProxyRule.swift) 和 [Magent.swift](../Sources/Magent.swift) 为准。
+本文以当前 [MagentCore.swift](../../Sources/Core/MagentCore.swift)、
+[ProxyRule.swift](../../Sources/Model/ProxyRule.swift) 和 [Magent.swift](../../Sources/Magent.swift) 为准。
 文件名沿用旧访问控制文档；当前实现是运行周期独有的 `MagentCore` 和文件内私有 `MagentRouter`。
-旧 matcher 的性能数据已迁入[规则匹配与缓存压力测试](benchmark/MATCH_BENCHMARK.md)，不代表当前代码性能。
+旧 matcher 的性能数据已迁入[规则匹配与缓存压力测试](../benchmark/MATCH_BENCHMARK.md)，不代表当前代码性能。
 
 # 1. Context
 
@@ -156,7 +158,7 @@ UDP 对每个客户端 datagram 独立路由，association 记录真实出站 en
 
 ## 4.2 当前测试与验证入口
 
-现有 [MagentCoreTests](../Tests/Core/MagentCoreTests.swift) 覆盖：
+现有 [MagentCoreTests](../../Tests/Core/MagentCoreTests.swift) 覆盖：
 
 - `testDefaultProxyDecisionHandlesEmptyAndUnmatchedRules`。
 - `testInitThrowsWhenDefaultProxyNodeIsMissing`。
@@ -176,6 +178,6 @@ swift test --filter MagentCoreTests
 
 # 5. Benchmark 记录
 
-历史数据统一保存在[规则匹配与缓存压力测试](benchmark/MATCH_BENCHMARK.md)。
+历史数据统一保存在[规则匹配与缓存压力测试](../benchmark/MATCH_BENCHMARK.md)。
 五种匹配类型是同一测试的参数维度，共用测试入口、设备信息和统计口径；10 条构建/warmup 结果和 20 条 Match 结果集中记录。
 本设计文档只保留入口，不再维护结果表。

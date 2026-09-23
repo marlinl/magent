@@ -2,7 +2,36 @@
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md): public API boundaries, layers, ownership, lifecycle, and the index of detailed design and specification documents.
+### Architecture and specifications
+
+- [Architecture](docs/ARCHITECTURE.md): public API boundaries, layers, ownership, lifecycle, and the index of model, protocol, and cache specifications.
+
+Keep package architecture and normative SPEC documents under `docs/`. `ARCHITECTURE.md` owns package-wide
+boundaries and the documentation index; individual SPECs own their contracts and acceptance criteria.
+Proposed requirements must not be presented as implemented behavior without checking source and tests.
+SPECs must be self-contained descriptions of functionality and constraints. They must not reference or depend
+on repository product-design documents, or contain comparisons with those documents. References flow from
+design to SPEC. SPECs may cite other specifications and primary technical sources; the architecture index may
+link to both document categories.
+
+### Product design
+
+- [MagentCache design](docs/design/MagentCache_Design.md): target cache component design conforming to the cache SPEC, with W-TinyLFU as its internal strategy.
+- [Routing and access control design](docs/design/MagentAccessControl_Design.md): current routing rules, node selection, runtime ownership, and decision caching.
+
+Keep component product-design documents under `docs/design/`. State whether each document describes the
+current implementation or a proposed design, and link to the relevant architecture or SPEC instead of copying
+its requirements. Use the four sections `Context`, `Contract`, `Core Logic`, and `Corners`; preserve these
+English headings without translation. Focus on the component's business purpose, caller contract, workflows,
+integration, and edge cases. A target design must satisfy its referenced SPEC. Keep algorithm explanations,
+data-structure details, and implementation walkthroughs out of product designs; refer to the SPEC for those
+constraints. Keep the component's identity distinct from its internal algorithm. Any necessary migration note
+must describe a caller-visible difference under the relevant section, not create an exception to the SPEC.
+
+Register design documents in `docs/ARCHITECTURE.md`. Benchmark scenarios, commands, measurement methods,
+performance analysis, and results belong in dedicated documents under `docs/benchmark/`, not in product
+designs. When moving documents, update incoming and outgoing relative links in the same change;
+preserve historical commit-qualified paths used to retrieve old evidence.
 
 ## Concurrency design constraint
 
