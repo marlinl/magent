@@ -1,144 +1,54 @@
-//
-//  NetworkAddress.swift
-//  Magent
-//
-//  Created by MarlinL on 2026/6/20.
-//
-import Foundation
 import NIOCore
 
-/// SOCKS 协议端口字段使用 network byte order，即 big-endian。
-extension UInt16 {
-  var bigEndianBytes: Data {
-    var value = self.bigEndian
-    return Data(bytes: &value, count: MemoryLayout<UInt16>.size)
-  }
-}
-
-/// 读取 SOCKS 地址中的 2 字节网络序端口；调用方先完成边界检查。
-extension Data {
-  func readBigEndianUInt16(at offset: Int) -> UInt16 {
-    guard offset >= 0, offset + 2 <= count else { return 0 }
-    return UInt16(self[offset]) << 8 | UInt16(self[offset + 1])
-  }
-}
-
-// MARK: - NetworkAddress
-
-/// 网络地址。
+/// 已校验且规范化的逻辑目标。域名保持未解析状态，IP 使用 NIO 的数值端点。
 ///
-/// 这是 Transport、Core、Wire 共享的地址表示，不属于 HTTP/SOCKS，
-/// 也不属于某个具体节点协议。出站请求和 UDP 入站响应都可以携带它。
-public enum NetworkAddress: Sendable, Equatable, Hashable, Codable {
-  /// IPv4 地址。
-  ///
-  /// `Data` 必须是 4 字节，`port` 通常使用 `1...65535`；绑定时 `0` 表示由系统分配端口。
-  case ipv4(Data, port: Int)
+/// 构造、比较及读取 host/port 均不执行 DNS；显式转换域名端点时才委托 NIO 解析。
+public struct NetworkAddress: Sendable, Hashable {
+  /// Core 和 Wire 可以读取地址种类，但只有文本构造入口能写入模型。
+  internal enum Address: Sendable, Hashable {
+    case domain(String, port: UInt16)
+    case ip(SocketAddress)
+  }
 
-  /// IPv6 地址。
-  ///
-  /// `Data` 必须是 16 字节，`port` 使用普通网络端口范围 `1...65535`。
-  case ipv6(Data, port: Int)
+  internal let address: Address
 
-  /// 域名地址。
-  ///
-  /// 具体节点协议决定是否远端解析域名。
-  case domain(String, port: Int)
-
-  /// IPv4 未指定地址和系统分配端口，用于绑定 `0.0.0.0:0`。
-  public static let unspecifiedIPv4 = Self.ipv4(Data(repeating: 0, count: 4), port: 0)
-
-  /// 可展示或用于建立连接的 host 字符串。
-  public var host: String {
-    switch self {
-    case .ipv4(let data, _):
-      return data.map(String.init).joined(separator: ".")
-
-    case .ipv6(let data, _):
-      guard data.count == 16 else { return "" }
-      return stride(from: 0, to: 16, by: 2)
-        .map { index in
-          let high = UInt16(data[index]) << 8
-          let low = UInt16(data[index + 1])
-          return String(format: "%x", high | low)
+  /// 接受独立的 ASCII 主机名或 IP 文本，保留域名根点；拒绝 URL、方括号和作用域后缀。
+  /// 端口允许 0，是否可作为具体操作的目标由操作入口决定；NIO 解析错误原样传播。
+  public init(host: String, port: UInt16) throws {
+    // 纯数字、点和十六进制分段不能回退成域名；普通标签使 0xfeed.example 仍可作为域名。
+    let isIPv4Candidate =
+      !host.contains(":")
+      && host.lowercased()
+        .split(separator: ".", omittingEmptySubsequences: false)
+        .allSatisfy { part in
+          if part.hasPrefix("0x") {
+            return part.dropFirst(2).utf8.allSatisfy {
+              (48...57).contains($0) || (97...102).contains($0)
+            }
+          }
+          return part.utf8.allSatisfy { (48...57).contains($0) }
         }
-        .joined(separator: ":")
 
-    case .domain(let host, _):
-      return host
-    }
-  }
-
-  /// 网络端口。
-  public var port: Int {
-    switch self {
-    case .ipv4(_, let port),
-      .ipv6(_, let port),
-      .domain(_, let port):
-      return port
-    }
-  }
-
-  /// 纯语法规范化；在目标路由、转发和 IP 比较前使用，不执行 DNS。
-  ///
-  /// mapped IPv6 和严格 dotted-quad 使用同一种 IPv4 表示，避免绕过 CIDR。
-  /// 域名只接受 ASCII 主机名语法并小写化；显式根点保留给转发层。
-  /// 这里只检查 A-label 的 ASCII 外形，完整 IDNA 有效性仍由独立校验负责。
-  internal func normalized() throws -> NetworkAddress {
-    switch self {
-    case .ipv4(let bytes, _):
-      guard bytes.count == 4 else {
-        throw MagentError.invalidAddress("IPv4 address must contain 4 bytes")
+    switch host {
+    case let text where isIPv4Candidate:
+      self.address = .ip(try Self.parseIPv4Text(text, port: port))
+    case let text where text.contains(":"):
+      self.address = .ip(try Self.parseIPv6Text(text, port: port))
+    default:
+      guard !host.isEmpty,
+        host.utf8.allSatisfy({ (33...126).contains($0) }),
+        !host.contains("["), !host.contains("]"), !host.contains("%")
+      else {
+        throw MagentError.invalidAddress(
+          "host must be ASCII text without whitespace, brackets or scope")
       }
-      return self
 
-    case .ipv6(let bytes, let port):
-      guard bytes.count == 16 else {
-        throw MagentError.invalidAddress("IPv6 address must contain 16 bytes")
-      }
-      if bytes.prefix(12) == Data(repeating: 0, count: 10) + Data([0xFF, 0xFF]) {
-        return .ipv4(Data(bytes.suffix(4)), port: port)
-      }
-      return self
-
-    case .domain(let host, let port):
-      guard !host.isEmpty, host.utf8.allSatisfy({ $0 < 128 }) else {
-        throw MagentError.invalidAddress("domain must be an ASCII hostname")
-      }
       let name = host.lowercased()
-      let parts = name.split(separator: ".", omittingEmptySubsequences: false)
-      // Decimal/dotted and inet_aton-style hexadecimal components must never reach
-      // a permissive resolver. A name such as 0xfeed.example remains a hostname.
-      let numeric = parts.allSatisfy { part in
-        if part.hasPrefix("0x") {
-          return part.dropFirst(2).utf8.allSatisfy {
-            (48...57).contains($0) || (97...102).contains($0)
-          }
-        }
-        return part.utf8.allSatisfy { (48...57).contains($0) }
-      }
-      if numeric {
-        guard parts.count == 4 else {
-          throw MagentError.invalidAddress("invalid IPv4 domain expression")
-        }
-        var bytes = Data()
-        for part in parts {
-          guard !part.isEmpty, part.count <= 3,
-            part.count == 1 || part.first != "0",
-            part.utf8.allSatisfy({ (48...57).contains($0) }), let byte = UInt8(part)
-          else {
-            throw MagentError.invalidAddress("invalid IPv4 domain expression")
-          }
-          bytes.append(byte)
-        }
-        return .ipv4(bytes, port: port)
-      }
-
-      let matchName = name.hasSuffix(".") ? String(name.dropLast()) : name
-      guard !matchName.isEmpty, matchName.utf8.count <= 253 else {
+      let withoutRootDot = name.hasSuffix(".") ? name.dropLast() : name[...]
+      guard !withoutRootDot.isEmpty, withoutRootDot.utf8.count <= 253 else {
         throw MagentError.invalidAddress("invalid hostname length")
       }
-      for label in matchName.split(separator: ".", omittingEmptySubsequences: false) {
+      for label in withoutRootDot.split(separator: ".", omittingEmptySubsequences: false) {
         let bytes = label.utf8
         guard !bytes.isEmpty, bytes.count <= 63, bytes.first != 45, bytes.last != 45,
           bytes.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) || $0 == 45 })
@@ -146,48 +56,92 @@ public enum NetworkAddress: Sendable, Equatable, Hashable, Codable {
           throw MagentError.invalidAddress("invalid hostname label")
         }
       }
-      return .domain(name, port: port)
+      self.address = .domain(name, port: port)
     }
   }
 
-  /// 已规范化地址的匹配视图；只去掉域名的单个根点，不裁剪空白或前导点。
-  /// 路由和缓存共享此视图，而 Wire/DNS 继续使用保留显式根点的 `host`。
-  internal var hostForMatching: String {
-    if case .domain(let name, _) = self, name.hasSuffix(".") {
-      return String(name.dropLast())
-    }
-    return host
-  }
-
-  /// 从 NIO `SocketAddress` 构造。
-  ///
-  /// `SocketAddress.IPv4Address.address` 是 `sockaddr_in`，IP 在 `.sin_addr`；IPv6 在
-  /// `sockaddr_in6.sin6_addr`。两者在内存里都是网络序字节，`withUnsafeBytes` 直接取
-  /// 原始字节，不依赖宿主机字节序。端口取 `SocketAddress.port`（`Int?`）。
-  /// unix domain socket 没有 IP 表示，返回 nil。
-  internal init?(_ address: SocketAddress) {
-    let port = address.port ?? 0
+  /// 规范化域名或 NIO 生成的数值 IP 文本，不包含端口、方括号或作用域后缀。
+  public var host: String {
     switch address {
-    case .v4(let ipv4):
-      let bytes = withUnsafeBytes(of: ipv4.address.sin_addr) { Data($0) }
-      self = .ipv4(bytes, port: port)
-
-    case .v6(let ipv6):
-      let bytes = withUnsafeBytes(of: ipv6.address.sin6_addr) { Data($0) }
-      self = .ipv6(bytes, port: port)
-
-    case .unixDomainSocket:
-      return nil
+    case .domain(let name, _):
+      return name
+    case .ip(let socket):
+      guard let host = socket.ipAddress else {
+        preconditionFailure("NetworkAddress only stores numeric IP sockets")
+      }
+      return host
     }
   }
 
-  /// 构造 NIO 可写入的 socket address。
-  internal func socketAddress() throws -> SocketAddress {
-    switch self {
-    case .ipv4, .ipv6:
-      return try SocketAddress(ipAddress: host, port: port)
-    case .domain(let host, let port):
-      return try SocketAddress.makeAddressResolvingHost(host, port: port)
+  /// 从唯一的地址存储读取端口，不以默认值替代缺失或非法端口。
+  public var port: UInt16 {
+    switch address {
+    case .domain(_, let port):
+      return port
+    case .ip(let socket):
+      guard let value = socket.port, let port = UInt16(exactly: value) else {
+        preconditionFailure("NetworkAddress always stores a UInt16 port")
+      }
+      return port
     }
+  }
+
+  /// IP 直接返回已存储的端点；域名通过 NIO 执行系统名称解析，解析错误原样传播。
+  ///
+  /// 域名解析是同步阻塞操作，不得在 NIO EventLoop 上调用。结果不缓存或替换逻辑域名。
+  public var socketAddress: SocketAddress {
+    get throws {
+      switch address {
+      case .ip(let socket):
+        return socket
+      case .domain(let host, let port):
+        return try SocketAddress.makeAddressResolvingHost(host, port: Int(port))
+      }
+    }
+  }
+
+  /// 严格检查十进制 IPv4 文本，阻止数字歧义落入域名分支；地址字节由 NIO 解析。
+  private static func parseIPv4Text(_ text: String, port: UInt16) throws -> SocketAddress {
+    let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+    guard parts.count == 4,
+      parts.allSatisfy({ part in
+        !part.isEmpty && part.count <= 3 && (part.count == 1 || part.first != "0")
+          && part.utf8.allSatisfy({ (48...57).contains($0) }) && UInt8(part) != nil
+      })
+    else {
+      throw MagentError.invalidAddress(
+        "IPv4 must contain four decimal octets without leading zeroes")
+    }
+    return try SocketAddress(ipAddress: text, port: Int(port))
+  }
+
+  /// 交给 NIO 解析 IPv6；仅补充 IPv4 尾段的词法限制并归一映射地址。
+  private static func parseIPv6Text(_ text: String, port: UInt16) throws -> SocketAddress {
+    guard !text.isEmpty,
+      text.utf8.allSatisfy({ (33...126).contains($0) }),
+      !text.contains("["), !text.contains("]"), !text.contains("%")
+    else {
+      throw MagentError.invalidAddress(
+        "host must be ASCII text without whitespace, brackets or scope")
+    }
+
+    let name = text.lowercased()
+    if name.contains("."), let colon = name.lastIndex(of: ":") {
+      _ = try Self.parseIPv4Text(String(name[name.index(after: colon)...]), port: port)
+    }
+
+    let socket = try SocketAddress(ipAddress: name, port: Int(port))
+    if case .v6(let ipv6) = socket {
+      // 只把 ::ffff:0:0/96 归为 IPv4；兼容 IPv6 和 NAT64 地址保持原地址族。
+      return try withUnsafeBytes(of: ipv6.address.sin6_addr) { bytes in
+        guard bytes.prefix(10).allSatisfy({ $0 == 0 }), bytes[10] == 0xff, bytes[11] == 0xff
+        else {
+          return socket
+        }
+        return try SocketAddress(
+          packedIPAddress: ByteBuffer(bytes: bytes.suffix(4)), port: Int(port))
+      }
+    }
+    return socket
   }
 }

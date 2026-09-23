@@ -1,6 +1,6 @@
 ---
 created_at: "2026-09-22T15:14:35+08:00"
-updated_at: "2026-09-22T15:54:44+08:00"
+updated_at: "2026-09-23T10:19:20+08:00"
 status: REVIEW_DOCUMENTED
 reviewed_commit: 31ea88cb864d4468224234f8ed0620da0a1eb190
 fix_commit: null
@@ -18,15 +18,15 @@ fix_commit: null
 
 ## Commit 与状态语义
 
-审查基线为 `31ea88cb864d4468224234f8ed0620da0a1eb190`（`refactor: refine Magent runtime and cache behavior`）。这只标识被审查源码版本，不表示问题在该提交引入，也不是修复提交。测试是该 HEAD 之上的未提交追加，SHA-256：`8af1205566e47bc616e9c2fb8a2ac2ca6e6be9339c5ae538585cfbc227cb8ee8`。
+审查基线为 `31ea88cb864d4468224234f8ed0620da0a1eb190`（`refactor: refine Magent runtime and cache behavior`）。这只标识被审查源码版本，不表示问题在该提交引入，也不是修复提交。首次审查时的测试是该 HEAD 之上的未提交追加，SHA-256：`8af1205566e47bc616e9c2fb8a2ac2ca6e6be9339c5ae538585cfbc227cb8ee8`。
 
-`introduced_commit=unknown`：尚未通过 blame/bisect 确认；`fix_commit=null`：尚无修复提交；`verification_commit=null`：尚未在修复提交验收。后续不能在生成文档时伪造修复 SHA；产生实际提交后再回填。
+`introduced_commit=unknown`：尚未通过 blame/bisect 确认；未修复条目的 `fix_commit=null` 表示尚无修复提交，`verification_commit=null` 表示尚未在修复提交验收。已归档 C09 记录实际的修复及验收 commit；其他条目仍按各自证据更新。
 
 状态流转：
 
 ```text
 OPEN / NOT_IMPLEMENTED / DESIGN_DECISION_REQUIRED
-    → IN_PROGRESS → FIXED → VERIFIED
+    → IN_PROGRESS → FIXED → VERIFIED → ARCHIVED
     ↘ ACCEPTED_DEVIATION（必须记录明确选择和 spec 版本；不等价于完整 spec 通过）
 ```
 
@@ -35,6 +35,7 @@ OPEN / NOT_IMPLEMENTED / DESIGN_DECISION_REQUIRED
 - `DESIGN_DECISION_REQUIRED`：与当前公开模型、架构或 AGENTS 明确约定不同；先选择目标合同。
 - `FIXED`：代码已修改但验收未完成；不能因为测试命令退出 0 就自动转 `VERIFIED`。
 - `VERIFIED`：该 cause 的目标断言普通通过，证据与实际版本齐全。
+- `ARCHIVED`：验收完成并移入 `archive/`；原验收结论记录为 `resolution: VERIFIED`。
 
 证据等级：
 
@@ -60,7 +61,7 @@ OPEN / NOT_IMPLEMENTED / DESIGN_DECISION_REQUIRED
 | [C06](P1-C06-SOCKS5-resource-budgets.md) | 会话、UDP 映射和缓冲缺少共享资源预算 | P1 | 能力未实现 | `SOURCE_CONFIRMED` |
 | [C07](P2-C07-SOCKS5-tcp-remainder-early-data.md) | TCP 解析将当前消息之后的字节当作错误 | P2 | 待设计决策 | `TEST_CONFIRMED` |
 | [C08](P2-C08-SOCKS5-hostname-validation.md) | 域名语法验证仅检查非空 UTF-8 | P2 | 部分修复，仍待完成 | `TEST_CONFIRMED` |
-| [C09](P2-C09-SOCKS5-address-normalization.md) | 目标地址类型与转发形式未统一规范化 | P2 | 已修复并验证（工作树） | `REGRESSION_VERIFIED` |
+| [C09](archive/P2-C09-SOCKS5-address-normalization.md) | 目标地址类型与转发形式未统一规范化 | P2 | 已归档（已修复并验证） | `REGRESSION_VERIFIED` |
 | [C10](P2-C10-SOCKS5-routing-precedence.md) | 路由使用优先级及特异度而不是配置顺序首命中 | P2 | 待设计决策 | `TEST_CONFIRMED` |
 | [C11](P2-C11-SOCKS5-rule-node-reference.md) | 仅默认代理节点在初始化时校验 | P2 | 待设计决策 | `TEST_CONFIRMED` |
 | [C12](P2-C12-SOCKS5-error-mapping.md) | 底层错误丢失与请求阶段分类不足 | P2 | 待修复 | `TEST_PARTIAL` |
@@ -97,13 +98,13 @@ C01–C15 拆解上轮主要问题；C16–C22 展开认证、上游、配置及
 
 未完成：真实 SOCKS5/sslocal 集成、全资源预算验收、30 分钟稳定性运行及缺失生产能力对应的完整矩阵。原始临时日志不作为仓库永久依赖；后续修复需要保存新的可复现命令/结果。
 
-## C09 修复验证
+## C09 修复验证与归档
 
-验收结束：`2026-09-22T15:51:53+08:00`。用户确认修复后，C09 已在未提交工作树完成，记录见 [C09](P2-C09-SOCKS5-address-normalization.md)。原两个规范化预期失败方法已普通通过；增加了 TCP/UDP 路由、转发、DIRECT 数值别名和地址模型边界回归。
+首次验收结束：`2026-09-22T15:51:53+08:00`。C09 当时在未提交工作树完成，历史及当前证据见 [归档 C09](archive/P2-C09-SOCKS5-address-normalization.md)。原两个规范化预期失败方法已普通通过；增加了 TCP/UDP 路由、转发、DIRECT 数值别名和地址模型边界回归。
 
-普通构建、严格并发构建、5 个修改文件的 strict lint 和 diff check 均通过。连接测试 **94 个**、全包测试 **243 个**，均为 **0 意外失败、1 环境跳过**。完整测试仍有其他 cause 的 **18 个方法、46 次严格预期断言失败**，不能称为全 spec 通过。
+首次验收中，普通构建、严格并发构建、5 个修改文件的 strict lint 和 diff check 均通过。连接测试 **94 个**、全包测试 **243 个**，均为 **0 意外失败、1 环境跳过**。完整测试仍有其他 cause 的 **18 个方法、46 次严格预期断言失败**，不能称为全 spec 通过。
 
-C08 的基本主机名语法校验随规范化实现；完整 IDNA、空串/非法 UTF-8 的错误回复及 UDP 单包丢弃仍待完成。C09 的 `fix_commit`、`verification_commit` 保持 null，文件 SHA-256 与工作树指纹已记录；本次未提交或推送 Git。
+C09 的修复和测试已提交于 `ec3cad4`。2026-09-23 在 `3433033` 上重新运行地址模型测试 12 个及 C09 SOCKS5 回归 7 个，全部普通通过；本次全包测试因执行环境禁止 HTTP CONNECT 测试本地 `bind` 而中断，不能计为通过。C08 的基本主机名语法校验随规范化实现；完整 IDNA、空串/非法 UTF-8 的错误回复及 UDP 单包丢弃仍待完成。
 
 ## 设计冲突与执行边界
 

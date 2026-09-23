@@ -1,187 +1,199 @@
-import Foundation
 import NIOCore
 import XCTest
 
 @testable import Magent
 
-/// NetworkAddress 共享地址模型测试。
+/// NetworkAddress 的文本输入、逻辑身份和按需端点转换契约。
 final class NetworkAddressTests: XCTestCase {
 
-  /// IPv4 原始字节应转换为 dotted host，并保留端口。
-  func testIPv4HostAndPort() {
-    let address = NetworkAddress.ipv4(Data([127, 0, 0, 1]), port: 8080)
+  /// 域名保持未解析；数值地址只存储 NIO 端点，视图使用同一个端口。
+  func testValidAddressStorageAndViews() throws {
+    let domain = try NetworkAddress(host: "Example.COM.", port: 443)
+    let ipv4 = try NetworkAddress(host: "192.0.2.1", port: 53)
+    let ipv6 = try NetworkAddress(host: "2001:db8::1", port: 65535)
 
-    XCTAssertEqual(address.host, "127.0.0.1")
-    XCTAssertEqual(address.port, 8080)
+    guard case .domain("example.com.", port: 443) = domain.address else {
+      return XCTFail("域名必须保留规范化名称和端口")
+    }
+    guard case .ip(.v4) = ipv4.address, case .ip(.v6) = ipv6.address else {
+      return XCTFail("数值地址必须存储对应地址族的 NIO 端点")
+    }
+    XCTAssertEqual(domain.host, "example.com.")
+    XCTAssertEqual(domain.port, 443)
+    XCTAssertEqual(ipv4.host, "192.0.2.1")
+    XCTAssertEqual(ipv4.port, 53)
+    XCTAssertEqual(ipv6.port, 65535)
+    XCTAssertEqual(try ipv4.socketAddress, try SocketAddress(ipAddress: "192.0.2.1", port: 53))
+    XCTAssertEqual(try ipv6.socketAddress, try SocketAddress(ipAddress: "2001:db8::1", port: 65535))
   }
 
-  /// IPv6 原始字节应转换为冒号分隔 host，并保留端口。
-  func testIPv6HostAndPort() {
-    let address = NetworkAddress.ipv6(
-      Data([
-        0x20, 0x01,
-        0x0d, 0xb8,
-        0x00, 0x00,
-        0x00, 0x00,
-        0x00, 0x00,
-        0x00, 0x00,
-        0x00, 0x00,
-        0x00, 0x01,
-      ]),
-      port: 443
-    )
-
-    XCTAssertEqual(address.host, "2001:db8:0:0:0:0:0:1")
-    XCTAssertEqual(address.port, 443)
-  }
-
-  /// IPv6 原始字节长度不合法时 host 返回空字符串。
-  func testIPv6HostReturnsEmptyStringForInvalidRawByteCount() {
-    let address = NetworkAddress.ipv6(Data([0x20, 0x01]), port: 443)
-
-    XCTAssertEqual(address.host, "")
-    XCTAssertEqual(address.port, 443)
-  }
-
-  /// 域名地址直接暴露 host 和 port。
-  func testDomainHostAndPort() {
-    let address = NetworkAddress.domain("example.com", port: 8388)
-
-    XCTAssertEqual(address.host, "example.com")
-    XCTAssertEqual(address.port, 8388)
-  }
-
-  /// 地址类型和端口都参与相等性判断。
-  func testEquality() {
-    XCTAssertEqual(
-      NetworkAddress.domain("example.com", port: 443),
-      NetworkAddress.domain("example.com", port: 443)
-    )
-    XCTAssertNotEqual(
-      NetworkAddress.domain("example.com", port: 443),
-      NetworkAddress.domain("example.com", port: 80)
-    )
-    XCTAssertNotEqual(
-      NetworkAddress.ipv4(Data([127, 0, 0, 1]), port: 443),
-      NetworkAddress.domain("127.0.0.1", port: 443)
-    )
-  }
-
-  /// Hashable 行为需要与 Equatable 保持一致。
-  func testHashable() {
-    let values: Set<NetworkAddress> = [
-      .domain("example.com", port: 443),
-      .domain("example.com", port: 443),
-      .domain("example.com", port: 80),
-      .ipv4(Data([127, 0, 0, 1]), port: 443),
+  /// 二进制 IP 经 NIO 转为数值文本后，与 HTTP 文本及映射 IPv6 具有相同身份。
+  func testBinaryTextAndMappedIPv6HaveOneIdentity() throws {
+    let binarySocket = try SocketAddress(
+      packedIPAddress: ByteBuffer(bytes: [192, 0, 2, 1]), port: 443)
+    let binaryText = try XCTUnwrap(binarySocket.ipAddress)
+    let values = try [
+      NetworkAddress(host: "192.0.2.1", port: 443),
+      NetworkAddress(host: binaryText, port: 443),
+      NetworkAddress(host: "::ffff:192.0.2.1", port: 443),
+      NetworkAddress(host: "::ffff:c000:201", port: 443),
     ]
 
-    XCTAssertEqual(values.count, 3)
-  }
-
-  /// 三种地址 case 都应支持 Codable 往返。
-  func testCodableRoundTripForEveryCase() throws {
-    let values: [NetworkAddress] = [
-      .ipv4(Data([10, 0, 0, 1]), port: 80),
-      .ipv6(
-        Data([
-          0x20, 0x01,
-          0x0d, 0xb8,
-          0x00, 0x00,
-          0x00, 0x00,
-          0x00, 0x00,
-          0x00, 0x00,
-          0x00, 0x00,
-          0x00, 0x01,
-        ]),
-        port: 443
-      ),
-      .domain("example.com", port: 8388),
-    ]
-
-    let encoder = JSONEncoder()
-    let decoder = JSONDecoder()
-
+    XCTAssertEqual(binaryText, "192.0.2.1")
+    XCTAssertEqual(Set(values).count, 1)
     for value in values {
-      let data = try encoder.encode(value)
-      let decoded = try decoder.decode(NetworkAddress.self, from: data)
-
-      XCTAssertEqual(decoded, value)
-      XCTAssertEqual(decoded.host, value.host)
-      XCTAssertEqual(decoded.port, value.port)
-    }
-  }
-
-  /// UDP envelope 写入需要能把本地域名解析成 SocketAddress。
-  func testDomainSocketAddressResolvesLocalhost() throws {
-    let socketAddress = try NetworkAddress.domain("localhost", port: 5353).socketAddress()
-
-    XCTAssertEqual(socketAddress.port, 5353)
-  }
-
-  /// 规范化必须幂等，保留端口和转发根点，并给匹配提供不含根点的视图。
-  func testNormalizationPreservesForwardingNameAndMatchingView() throws {
-    for name in ["API.Example.COM", "API.Example.COM."] {
-      let normalized = try NetworkAddress.domain(name, port: 443).normalized()
-      XCTAssertEqual(
-        normalized, .domain(name.hasSuffix(".") ? "api.example.com." : "api.example.com", port: 443)
-      )
-      XCTAssertEqual(normalized.hostForMatching, "api.example.com")
-      XCTAssertEqual(try normalized.normalized(), normalized)
-    }
-    XCTAssertEqual(
-      try NetworkAddress.domain("0xfeed.Example", port: 53).normalized(),
-      .domain("0xfeed.example", port: 53))
-    XCTAssertEqual(
-      try NetworkAddress.domain("XN--BCHER-KVA.Example.", port: 53).normalized(),
-      .domain("xn--bcher-kva.example.", port: 53))
-  }
-
-  /// 相同的端点在原始 IPv4、Domain 文本和 mapped IPv6 中应有相同身份。
-  func testNormalizationUnifiesNumericEndpointsWithoutChangingNativeIPv6() throws {
-    for port in [0, 53, 65535] {
-      let expected = NetworkAddress.ipv4(Data([192, 0, 2, 1]), port: port)
-      let mapped = try XCTUnwrap(
-        NetworkAddress(SocketAddress(ipAddress: "::ffff:192.0.2.1", port: port)))
-      let ipv4 = try XCTUnwrap(NetworkAddress(SocketAddress(ipAddress: "192.0.2.1", port: port)))
-      for address in [mapped, ipv4, .domain("192.0.2.1", port: port)] {
-        XCTAssertEqual(try address.normalized(), expected)
-        XCTAssertEqual(try address.normalized().normalized(), expected)
+      XCTAssertEqual(value.host, "192.0.2.1")
+      XCTAssertEqual(try value.socketAddress, try SocketAddress(ipAddress: "192.0.2.1", port: 443))
+      guard case .ip(.v4) = value.address else {
+        return XCTFail("映射 IPv6 应以 IPv4 存储")
       }
     }
-    for literal in ["::", "::1", "::192.0.2.1", "64:ff9b::192.0.2.1", "2001:db8::1"] {
-      let address = try XCTUnwrap(NetworkAddress(SocketAddress(ipAddress: literal, port: 443)))
-      XCTAssertEqual(try address.normalized(), address)
-    }
-    XCTAssertThrowsError(try NetworkAddress.ipv4(Data([1]), port: 53).normalized())
-    XCTAssertThrowsError(
-      try NetworkAddress.ipv6(Data(repeating: 0, count: 17), port: 53).normalized())
   }
 
-  /// 数字歧义与非法根点不能通过裁剪后变成合法域名或进入宽松解析器。
-  func testNormalizationRejectsAmbiguousAddressesAndMalformedNames() {
-    for name in [
-      "", "2130706433", "0x7f000001", "0X7F.0.0.1", "127.1", "127.000.0.1",
-      "256.0.0.1", "1.2.3.4.5", "192.0.2.1.", "192..2.1", "::1", "[::1]", "fe80::1%en0",
-      ".example.com", "example.com..", " example.com", "example.com ", "a..b", "你好.example",
+  /// IPv6 兼容地址和 NAT64 地址不能被映射地址规则误转成 IPv4。
+  func testOtherIPv6FormsKeepTheirAddressFamily() throws {
+    for text in ["2001:db8::1", "::192.0.2.1", "64:ff9b::192.0.2.1"] {
+      let value = try NetworkAddress(host: text, port: 443)
+      guard case .v6 = try value.socketAddress else {
+        return XCTFail("\(text) 必须保持 IPv6")
+      }
+    }
+    XCTAssertEqual(
+      try NetworkAddress(host: "2001:0DB8:0:0:0:0:0:1", port: 443),
+      try NetworkAddress(host: "2001:db8::1", port: 443))
+
+    let binarySocket = try SocketAddress(
+      packedIPAddress: ByteBuffer(bytes: [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+      ]), port: 443)
+    let binaryText = try XCTUnwrap(binarySocket.ipAddress)
+    XCTAssertEqual(
+      try NetworkAddress(host: binaryText, port: 443),
+      try NetworkAddress(host: "2001:db8::1", port: 443))
+  }
+
+  /// 数字歧义必须在对应的 IP 分支失败，不能回退成域名。
+  func testRejectsAmbiguousAndMalformedNumericText() throws {
+    for host in [
+      "127.1", "2130706433", "127.000.0.1", "0177.0.0.1", "0x7f000001",
+      "0X7F.0.0.1", "0x", "256.0.0.1", "1.2.3.4.5", "192..2.1",
+      "192.0.2.1.", "::ffff:192.000.2.1",
     ] {
-      XCTAssertThrowsError(try NetworkAddress.domain(name, port: 443).normalized(), name) { error in
+      XCTAssertThrowsError(try NetworkAddress(host: host, port: 443), host) { error in
         guard case MagentError.invalidAddress = error else {
-          return XCTFail("Expected invalidAddress for \(name), got \(error)")
+          return XCTFail("\(host) 应由模型策略拒绝，得到 \(error)")
+        }
+      }
+    }
+    let ordinaryDomain = try NetworkAddress(host: "0xfeed.Example", port: 443)
+    XCTAssertEqual(ordinaryDomain.host, "0xfeed.example")
+    guard case .domain = ordinaryDomain.address else {
+      return XCTFail("普通标签不能被当作数值地址")
+    }
+  }
+
+  /// IPv6 的非法外层语法由模型拒绝；NIO 解析失败保持原始错误类型。
+  func testIPv6PolicyAndNIOErrorsStayDistinct() {
+    for host in ["[::1]", "fe80::1%en0", "::1\u{0}", "::1 "] {
+      XCTAssertThrowsError(try NetworkAddress(host: host, port: 443), host) { error in
+        guard case MagentError.invalidAddress = error else {
+          return XCTFail("\(host) 应由模型策略拒绝，得到 \(error)")
+        }
+      }
+    }
+    XCTAssertThrowsError(try NetworkAddress(host: "2001:::1", port: 443)) { error in
+      XCTAssertEqual(error as? SocketAddressError, .failedToParseIPString("2001:::1"))
+    }
+  }
+
+  /// 域名大小写和根点在构造时确定；空标签和多余根点不能被裁剪接受。
+  func testDomainCanonicalizationAndRootDot() throws {
+    let name = try NetworkAddress(host: "API.Example.COM", port: 443)
+    let rootName = try NetworkAddress(host: "API.Example.COM.", port: 443)
+    XCTAssertEqual(name.host, "api.example.com")
+    XCTAssertEqual(rootName.host, "api.example.com.")
+    XCTAssertNotEqual(name, rootName)
+    XCTAssertEqual(
+      try NetworkAddress(host: "XN--BCHER-KVA.Example.", port: 53).host,
+      "xn--bcher-kva.example.")
+
+    for host in [".example.com", "a..b", "example.com..", "-a.example", "a-.example"] {
+      XCTAssertThrowsError(try NetworkAddress(host: host, port: 443), host)
+    }
+  }
+
+  /// 长度按 ASCII 字节计算，一个合法根点不占 253 字节的名称预算。
+  func testDomainLengthBoundaries() throws {
+    let maxName = [63, 63, 63, 61].map { String(repeating: "a", count: $0) }
+      .joined(separator: ".")
+    XCTAssertEqual(maxName.utf8.count, 253)
+    XCTAssertEqual(try NetworkAddress(host: "a", port: 1).host, "a")
+    XCTAssertEqual(try NetworkAddress(host: String(repeating: "a", count: 63), port: 1).port, 1)
+    XCTAssertEqual(try NetworkAddress(host: maxName, port: 1).host, maxName)
+    XCTAssertEqual(try NetworkAddress(host: maxName + ".", port: 1).host, maxName + ".")
+    for host in [String(repeating: "a", count: 64), maxName + "a", maxName + "a."] {
+      XCTAssertThrowsError(try NetworkAddress(host: host, port: 1), host)
+    }
+  }
+
+  /// 非 ASCII、空白、控制字符和非法分隔符不能经小写或截断变成合法域名。
+  func testRejectsInvalidDomainCharacters() {
+    for host in [
+      "", " example.com", "example.com ", "a\tb", "a\nb", "a\u{0}b", "你好.example",
+      "K.example", "a_b", "a/b", "a\\b", "a@b", "a[b", "a]b", "a%b",
+    ] {
+      XCTAssertThrowsError(try NetworkAddress(host: host, port: 443), host) { error in
+        guard case MagentError.invalidAddress = error else {
+          return XCTFail("\(host) 应由模型策略拒绝，得到 \(error)")
         }
       }
     }
   }
 
-  /// 一个根点不占匹配名称的 253 字节预算；不截断过长标签或名称。
-  func testNormalizationPreservesHostnameLengthBoundaries() throws {
-    let name = [63, 63, 63, 61].map { String(repeating: "a", count: $0) }.joined(separator: ".")
-    for host in ["A", name, name + "."] {
-      XCTAssertEqual(
-        try NetworkAddress.domain(host, port: 1).normalized(), .domain(host.lowercased(), port: 1))
+  /// 端口、名称大小写和根点都按契约参与逻辑身份及 Set 去重。
+  func testPortBoundsEqualityAndHashableIdentity() throws {
+    for port in [UInt16(0), 1, 65535] {
+      XCTAssertEqual(try NetworkAddress(host: "example.com", port: port).port, port)
+      XCTAssertEqual(try NetworkAddress(host: "192.0.2.1", port: port).port, port)
     }
-    for host in [String(repeating: "a", count: 64), name + "a", name + "a."] {
-      XCTAssertThrowsError(try NetworkAddress.domain(host, port: 1).normalized())
-    }
+    let values = try [
+      NetworkAddress(host: "API.Example.COM", port: 443),
+      NetworkAddress(host: "api.example.com", port: 443),
+      NetworkAddress(host: "api.example.com.", port: 443),
+      NetworkAddress(host: "api.example.com", port: 80),
+      NetworkAddress(host: "192.0.2.1", port: 443),
+    ]
+    XCTAssertEqual(values[0], values[1])
+    XCTAssertNotEqual(values[0], values[2])
+    XCTAssertNotEqual(values[0], values[3])
+    XCTAssertNotEqual(values[0], values[4])
+    XCTAssertEqual(Set(values).count, 4)
+  }
+
+  /// 读取 IP 端点不会改变模型；调用方修改结果副本也不会修改存储值。
+  func testRepeatedIPConversionAndCopyIsolation() throws {
+    let value = try NetworkAddress(host: "192.0.2.1", port: 443)
+    let expected = try SocketAddress(ipAddress: "192.0.2.1", port: 443)
+    XCTAssertEqual(try value.socketAddress, expected)
+    var copy = try value.socketAddress
+    copy = try SocketAddress(ipAddress: "198.51.100.1", port: 80)
+    XCTAssertNotEqual(copy, expected)
+    XCTAssertEqual(try value.socketAddress, expected)
+    XCTAssertEqual(value.host, "192.0.2.1")
+    XCTAssertEqual(value.port, 443)
+  }
+
+  /// 域名只在显式转换时通过 NIO 解析，转换结果不替换逻辑域名身份。
+  func testDomainSocketAddressResolvesWithoutChangingIdentity() throws {
+    let value = try NetworkAddress(host: "LOCALHOST", port: 5353)
+    let expected = try NetworkAddress(host: "localhost", port: 5353)
+    XCTAssertEqual(value, expected)
+    let resolved = try value.socketAddress
+    XCTAssertEqual(resolved.port, 5353)
+    XCTAssertNotNil(resolved.ipAddress)
+    XCTAssertEqual(value.host, "localhost")
+    XCTAssertNotEqual(value, try NetworkAddress(host: "127.0.0.1", port: 5353))
+    XCTAssertEqual(value, expected)
+    XCTAssertEqual(Set([value, expected]).count, 1)
   }
 }

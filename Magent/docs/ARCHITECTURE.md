@@ -23,10 +23,8 @@ proxy implementations remain implementation details of the package.
 
 ### Product designs and supporting evidence
 
-- [MagentCache design](design/MagentCache_Design.md): target cache business scope,
-  caller contract, Core integration, and edge cases, governed by the cache specification.
-- [Routing and access control design](design/MagentAccessControl_Design.md):
-  current routing rules, node selection, runtime ownership, and decision caching.
+- [Product design](design/DESIGN.md): overall guidance, writing rules, and the
+  component design index with each document's status and scope.
 - [Match benchmark](benchmark/MATCH_BENCHMARK.md): routing match/cache workload,
   test entry points, device metadata, and results across matching types.
 - [Cache benchmark](benchmark/MAGENT_CACHE_BENCHMARK.md): target measurement scope
@@ -39,11 +37,6 @@ protocol SPECs own detailed message formats, product profiles, and acceptance
 matrices. Do not maintain a separate per-protocol implementation design document
 that duplicates these responsibilities.
 
-Component product designs live under `docs/design/` and use `Context`, `Contract`,
-`Core Logic`, and `Corners` to describe business scope, caller behavior, workflows,
-and edge cases. Each design must identify its status and reference the relevant
-architecture or specification for shared contracts. Algorithm constraints belong
-in SPECs; benchmark methods, analysis, and results belong under `docs/benchmark/`.
 SPECs define standalone functionality and constraints without references to
 product designs. Designs reference and implement SPECs; comparisons and migration
 details belong in the design, while this index may link to both.
@@ -52,6 +45,59 @@ The SPECs include proposed capabilities and product choices that differ from the
 current package. Check source and tests before treating a requirement as
 implemented. The [protocol integration constraints](#protocol-integration-constraints)
 below record the current boundaries and distinguish them from future targets.
+
+## SPEC 文档格式
+
+`docs/` 下所有 SPEC 都必须采用同一种文件头格式：文件第一行是 `---`，中间是 YAML 元信息，
+以独立一行 `---` 结束；空一行后写一级标题，再写正文。不要把元信息放进引用块、加粗行、
+普通段落或标题副标题，也不要在各章节重复维护另一份文档版本、日期或状态。
+
+```markdown
+---
+desc: "一句话说明本规范的对象、范围和主要契约。"
+version: "0.1.0"
+updated_at: "2026-09-23"
+status: "草案"
+---
+
+# 规范标题
+
+正文从这里开始。
+```
+
+### 字段与顺序
+
+以下四个字段必填，顺序固定。字段名使用这里规定的英文键，描述和状态值使用中文，所有值用双引号包围。
+
+| 字段 | 含义与写法 |
+|---|---|
+| `desc` | 一句话说明规范对象、功能范围和主要契约；不写实现完成声明、编辑过程或交付包装说明。 |
+| `version` | 本规范的版本，统一为 `主版本.次版本.修订号`，例如 `"1.0.0"`；不附加 `draft` 等状态文本。 |
+| `updated_at` | 最近一次规范内容修订日期，格式为 `YYYY-MM-DD`；仅整理排版或迁移元信息时保留原日期，不伪造历史时间。 |
+| `status` | 只使用 `草案`、`已确认`、`已废弃`；分别表示仍可调整的提议、已经确认的规范契约、不再采用的规范。 |
+
+需要补充元信息时，只使用以下可选字段，按表中顺序接在 `status` 后；不适用时省略，不填空值：
+
+| 字段 | 含义与写法 |
+|---|---|
+| `notes` | 影响文档阅读的补充说明，例如某个模型的候选方案仍待决定；不代替正文中的功能约束和待决定事项。 |
+| `references_checked_at` | 最近一次实际核对外部资料的日期，格式为 `YYYY-MM-DD`；与文档内容修订日期分别维护，不能因整理文档而刷新。 |
+
+不要另起 `description`、`date`、`Version`、`Status` 或中文键等同义字段。标题保留在正文的一级标题中，
+不再添加 `title` 重复保存。需要新字段时，先在本节定义用途和顺序，再统一使用。
+
+### 维护与验证
+
+- `status` 只描述规范是否确认，不表示功能已经实现或测试通过。实现状态和验收结论需要独立证据；
+  不得因本次整理、实现部分功能或版本号为 `1.0.0` 就把草案改为已确认。
+- 仅统一格式不提升规范版本。现有 `1.0` 可补齐为 `1.0.0`，`1.0 draft` 拆为 `version: "1.0.0"`
+  与 `status: "草案"`；这不代表新增功能或完成验收。功能契约变更时再调整版本及内容修订日期。
+- 文档版本与协议版本、配置 `schema_version`、实现配置 `profile` 是不同概念。后几项属于正文契约和示例，
+  不挪到文档 `version` 中，也不随元信息整理修改。
+- 文件头只保存元信息。正文保留功能范围、约束、错误语义、示例、验收标准和必要的方案决策说明；
+  不增加章节级 YAML 文件头。正文中原有分隔线可保留，它们不构成元信息区块。
+- 修改后验证 YAML 可解析、字段及顺序符合要求、标题紧随文件头，并检查章节锚点、链接、协议示例和验收编号。
+  文档格式整理只做文档验证，不作为编译、运行或协议验收通过的证据。
 
 ## Source Layout
 

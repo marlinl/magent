@@ -1,10 +1,11 @@
+---
+desc: "按条目数限制容量的线程安全 W-TinyLFU 缓存，定义功能、算法不变量、资源边界及验收标准。"
+version: "1.0.0"
+updated_at: "2026-09-22"
+status: "草案"
+---
+
 # W-TinyLFU Cache Specification
-
-Version: 1.0 draft
-
-Date: 2026-09-22
-
-Status: specification draft
 
 ## 1. Scope and normative level
 
