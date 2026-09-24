@@ -15,46 +15,14 @@ public struct NetworkAddress: Sendable, Hashable {
   /// 接受独立的 ASCII 主机名或 IP 文本，保留域名根点；拒绝 URL、方括号和作用域后缀。
   /// 端口允许 0，是否可作为具体操作的目标由操作入口决定；NIO 解析错误原样传播。
   public init(host: String, port: UInt16) throws {
-    // 纯数字、点和十六进制分段不能回退成域名；普通标签使 0xfeed.example 仍可作为域名。
-    let isIPv4Candidate =
-      !host.contains(":")
-      && host.lowercased()
-        .split(separator: ".", omittingEmptySubsequences: false)
-        .allSatisfy { part in
-          if part.hasPrefix("0x") {
-            return part.dropFirst(2).utf8.allSatisfy {
-              (48...57).contains($0) || (97...102).contains($0)
-            }
-          }
-          return part.utf8.allSatisfy { (48...57).contains($0) }
-        }
-
     switch host {
-    case let text where isIPv4Candidate:
+    case let text where Self.isIPv4Candidate(text):
       self.address = .ip(try Self.parseIPv4Text(text, port: port))
     case let text where text.contains(":"):
       self.address = .ip(try Self.parseIPv6Text(text, port: port))
     default:
-      guard !host.isEmpty,
-        host.utf8.allSatisfy({ (33...126).contains($0) }),
-        !host.contains("["), !host.contains("]"), !host.contains("%")
-      else {
-        throw MagentError.invalidAddress(
-          "host must be ASCII text without whitespace, brackets or scope")
-      }
-
-      let name = host.lowercased()
-      let withoutRootDot = name.hasSuffix(".") ? name.dropLast() : name[...]
-      guard !withoutRootDot.isEmpty, withoutRootDot.utf8.count <= 253 else {
-        throw MagentError.invalidAddress("invalid hostname length")
-      }
-      for label in withoutRootDot.split(separator: ".", omittingEmptySubsequences: false) {
-        let bytes = label.utf8
-        guard !bytes.isEmpty, bytes.count <= 63, bytes.first != 45, bytes.last != 45,
-          bytes.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) || $0 == 45 })
-        else {
-          throw MagentError.invalidAddress("invalid hostname label")
-        }
+      guard let name = Self.normalizedDomainName(host) else {
+        throw MagentError.invalidAddress("invalid hostname syntax or length")
       }
       self.address = .domain(name, port: port)
     }
@@ -100,14 +68,54 @@ public struct NetworkAddress: Sendable, Hashable {
     }
   }
 
-  /// 严格检查十进制 IPv4 文本，阻止数字歧义落入域名分支；地址字节由 NIO 解析。
-  private static func parseIPv4Text(_ text: String, port: UInt16) throws -> SocketAddress {
+  /// 地址与规则共用纯语法检查，调用方在各自的输入边界产生错误；不创建端点或解析 DNS。
+  internal static func normalizedDomainName(_ text: String) -> String? {
+    guard isValidHostText(text) else { return nil }
+    let name = text.lowercased()
+    let withoutRootDot = name.hasSuffix(".") ? name.dropLast() : name[...]
+    guard !withoutRootDot.isEmpty, withoutRootDot.utf8.count <= 253 else { return nil }
+    for label in withoutRootDot.split(separator: ".", omittingEmptySubsequences: false) {
+      let bytes = label.utf8
+      guard !bytes.isEmpty, bytes.count <= 63, bytes.first != 45, bytes.last != 45,
+        bytes.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) || $0 == 45 })
+      else { return nil }
+    }
+    return name
+  }
+
+  /// 纯数字、点和十六进制分段不能回退成域名；普通标签使 0xfeed.example 仍是域名。
+  internal static func isIPv4Candidate(_ text: String) -> Bool {
+    !text.contains(":")
+      && text.lowercased().split(separator: ".", omittingEmptySubsequences: false)
+        .allSatisfy { part in
+          if part.hasPrefix("0x") {
+            return part.dropFirst(2).utf8.allSatisfy {
+              (48...57).contains($0) || (97...102).contains($0)
+            }
+          }
+          return part.utf8.allSatisfy { (48...57).contains($0) }
+        }
+  }
+
+  /// IP 与域名均禁止空白、非 ASCII、方括号和作用域文本，且不修剪输入。
+  internal static func isValidHostText(_ text: String) -> Bool {
+    !text.isEmpty && text.utf8.allSatisfy({ (33...126).contains($0) })
+      && !text.contains("[") && !text.contains("]") && !text.contains("%")
+  }
+
+  /// IPv4 及 IPv6 的点分尾段共用严格十进制语法，拒绝缩写、前导零与溢出。
+  internal static func isValidIPv4Text(_ text: String) -> Bool {
     let parts = text.split(separator: ".", omittingEmptySubsequences: false)
-    guard parts.count == 4,
-      parts.allSatisfy({ part in
+    return parts.count == 4
+      && parts.allSatisfy { part in
         !part.isEmpty && part.count <= 3 && (part.count == 1 || part.first != "0")
           && part.utf8.allSatisfy({ (48...57).contains($0) }) && UInt8(part) != nil
-      })
+      }
+  }
+
+  /// 严格检查十进制 IPv4 文本，阻止数字歧义落入域名分支；地址字节由 NIO 解析。
+  private static func parseIPv4Text(_ text: String, port: UInt16) throws -> SocketAddress {
+    guard Self.isValidIPv4Text(text)
     else {
       throw MagentError.invalidAddress(
         "IPv4 must contain four decimal octets without leading zeroes")
@@ -117,9 +125,7 @@ public struct NetworkAddress: Sendable, Hashable {
 
   /// 交给 NIO 解析 IPv6；仅补充 IPv4 尾段的词法限制并归一映射地址。
   private static func parseIPv6Text(_ text: String, port: UInt16) throws -> SocketAddress {
-    guard !text.isEmpty,
-      text.utf8.allSatisfy({ (33...126).contains($0) }),
-      !text.contains("["), !text.contains("]"), !text.contains("%")
+    guard Self.isValidHostText(text)
     else {
       throw MagentError.invalidAddress(
         "host must be ASCII text without whitespace, brackets or scope")

@@ -369,7 +369,7 @@ final class Socks5ConnectionTests: XCTestCase {
 
   /// §8.3/R06: same-priority specificity and duplicate replacement must not beat array order.
   func testSpecRoutingUsesFirstConfiguredMatch() throws {
-    let node = ProxyNode(
+    let node = try ProxyNode(
       address: try SocketAddress(ipAddress: "127.0.0.1", port: 11080),
       cipher: .aes256Gcm, password: "spec-test")
     let cases: [[ProxyRule]] = [
@@ -406,7 +406,7 @@ final class Socks5ConnectionTests: XCTestCase {
   }
 
   func testSpecDomainSuffixBoundaryAndNumericTargetsDoNotGuessDomains() throws {
-    let node = ProxyNode(
+    let node = try ProxyNode(
       address: try SocketAddress(ipAddress: "127.0.0.1", port: 11080),
       cipher: .aes256Gcm, password: "spec-test")
     let core = try MagentCore(
@@ -431,7 +431,7 @@ final class Socks5ConnectionTests: XCTestCase {
   }
 
   func testSpecMappedIPv6CannotBypassIPv4Rule() throws {
-    let node = ProxyNode(
+    let node = try ProxyNode(
       address: try SocketAddress(ipAddress: "127.0.0.1", port: 11080),
       cipher: .aes256Gcm, password: "spec-test")
     let core = try MagentCore(
@@ -599,7 +599,7 @@ final class Socks5ConnectionTests: XCTestCase {
       .wait()
     channels.append(shadowsocksServer)
 
-    let defaultNode = ProxyNode(
+    let defaultNode = try ProxyNode(
       address: try XCTUnwrap(shadowsocksServer.localAddress),
       cipher: cipher,
       password: "test"
@@ -1599,7 +1599,7 @@ final class Socks5ConnectionTests: XCTestCase {
       guard let address = context.channel.localAddress else {
         throw MagentError.invalidAddress("test Shadowsocks UDP server has no local address")
       }
-      let node = ProxyNode(address: address, cipher: cipher, password: password)
+      let node = try ProxyNode(address: address, cipher: cipher, password: password)
       let wire = try ShadowsocksUDPWire(proxyNode: node)
       let decoded = try wire.decodeInbound(Data(envelope.data.readableBytesView))
       proxyTargetPromise.succeed(decoded.address)
@@ -1612,7 +1612,7 @@ final class Socks5ConnectionTests: XCTestCase {
     }
     channels.append(shadowsocksServer)
     let nodeAddress = try XCTUnwrap(shadowsocksServer.localAddress)
-    let proxyNode = ProxyNode(address: nodeAddress, cipher: cipher, password: password)
+    let proxyNode = try ProxyNode(address: nodeAddress, cipher: cipher, password: password)
     let core = try makeUDPTestCore(decision: .proxy(proxyNode.id), nodes: [proxyNode])
     let association = try establishSOCKS5UDPAssociation(
       group: group,
@@ -1649,7 +1649,7 @@ final class Socks5ConnectionTests: XCTestCase {
     let plaintext = SpecInbox<Data>(eventLoop: harness.group.next())
     defer { try? plaintext.finish().wait() }
     let proxy = try bindTestDatagram(group: harness.group) { context, envelope in
-      let node = ProxyNode(
+      let node = try ProxyNode(
         address: try XCTUnwrap(context.channel.localAddress), cipher: .aes256Gcm,
         password: "spec-test")
       let wire = try ShadowsocksUDPWire(proxyNode: node)
@@ -1657,7 +1657,7 @@ final class Socks5ConnectionTests: XCTestCase {
       plaintext.append(try decoded.address.shadowsocksAddressBytes() + decoded.data)
     }
     harness.channels.append(proxy)
-    let node = ProxyNode(
+    let node = try ProxyNode(
       address: try XCTUnwrap(proxy.localAddress), cipher: .aes256Gcm, password: "spec-test")
     let core = try MagentCore(
       defaultDecision: .direct, proxyNodes: [node], defaultTimeout: 1000,
@@ -1723,7 +1723,7 @@ final class Socks5ConnectionTests: XCTestCase {
     let proxyTargets = SpecInbox<NetworkAddress>(eventLoop: harness.group.next())
     defer { try? proxyTargets.finish().wait() }
     let proxy = try bindTestDatagram(group: harness.group) { context, envelope in
-      let node = ProxyNode(
+      let node = try ProxyNode(
         address: try XCTUnwrap(context.channel.localAddress), cipher: .aes256Gcm,
         password: "spec-test")
       let wire = try ShadowsocksUDPWire(proxyNode: node)
@@ -1735,7 +1735,7 @@ final class Socks5ConnectionTests: XCTestCase {
         AddressedEnvelope(remoteAddress: envelope.remoteAddress, data: buffer), through: context)
     }
     harness.channels.append(proxy)
-    let node = ProxyNode(
+    let node = try ProxyNode(
       address: try XCTUnwrap(proxy.localAddress), cipher: .aes256Gcm, password: "spec-test")
     let core = try MagentCore(
       defaultDecision: .direct, proxyNodes: [node], defaultTimeout: 1000,
@@ -2176,7 +2176,7 @@ private final class SOCKS5SpecHarness {
     let plaintext = proxyPlaintext
     let server = try ServerBootstrap(group: group).childChannelInitializer { channel in
       do {
-        let node = ProxyNode(
+        let node = try ProxyNode(
           address: try XCTUnwrap(channel.localAddress), cipher: .aes256Gcm, password: "spec-test")
         let decoder = try ShadowsocksTCPWire(proxyNode: node)
         _ = try decoder.start(handshake: .domain("unused.test", port: 1))
@@ -2184,7 +2184,7 @@ private final class SOCKS5SpecHarness {
       } catch { return channel.eventLoop.makeFailedFuture(error) }
     }.bind(host: "127.0.0.1", port: 0).wait()
     channels.append(server)
-    let node = ProxyNode(
+    let node = try ProxyNode(
       address: try XCTUnwrap(server.localAddress), cipher: .aes256Gcm, password: "spec-test")
     return try MagentCore(
       defaultDecision: .proxy(node.id), proxyNodes: [node], defaultTimeout: 1000, rules: rules)

@@ -456,7 +456,7 @@ final class HttpProtocolTests: XCTestCase {
     XCTAssertEqual(Socks5Connection.addressBytes(of: httpTarget), literal)
     XCTAssertEqual(try httpTarget.shadowsocksAddressBytes(), literal)
     XCTAssertEqual(try wireTarget.shadowsocksAddressBytes(), literal)
-    let node = ProxyNode(
+    let node = try ProxyNode(
       address: try SocketAddress(ipAddress: "192.0.2.254", port: 8388), cipher: .aes256Gcm,
       password: "test-placeholder")
     let core = try MagentCore(
@@ -972,7 +972,7 @@ final class HttpProtocolTests: XCTestCase {
       .childChannelInitializer { channel in
         proxyNodeAcceptedPromise.succeed(channel)
         do {
-          let peerNode = ProxyNode(
+          let peerNode = try ProxyNode(
             address: try XCTUnwrap(channel.localAddress), cipher: cipher, password: "test")
           let peer = try ShadowsocksTCPWire(proxyNode: peerNode)
           _ = try peer.start(handshake: NetworkAddress(host: "example.com", port: 80))
@@ -990,7 +990,7 @@ final class HttpProtocolTests: XCTestCase {
       .wait()
     channels.append(shadowsocksServer)
 
-    let defaultNode = ProxyNode(
+    let defaultNode = try ProxyNode(
       address: try XCTUnwrap(shadowsocksServer.localAddress),
       cipher: cipher,
       password: "test"
@@ -1128,7 +1128,7 @@ final class HttpProtocolTests: XCTestCase {
           TestDataCollector(expectedByteCount: 73, promise: encrypted))
       }.bind(host: "127.0.0.1", port: 0).wait()
       channels.append(server)
-      let node = ProxyNode(
+      let node = try ProxyNode(
         address: try XCTUnwrap(server.localAddress), cipher: .aes256Gcm,
         password: "test-placeholder")
       let core = try MagentCore(

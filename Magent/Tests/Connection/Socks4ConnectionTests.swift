@@ -619,7 +619,7 @@ final class Socks4ConnectionTests: XCTestCase {
       .wait()
     channels.append(shadowsocksServer)
 
-    let defaultNode = ProxyNode(
+    let defaultNode = try ProxyNode(
       address: try XCTUnwrap(shadowsocksServer.localAddress),
       cipher: cipher,
       password: "test"

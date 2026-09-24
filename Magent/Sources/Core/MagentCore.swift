@@ -25,7 +25,7 @@ internal final class MagentCore: @unchecked Sendable {
   ) throws {
     self.defaultDecision = defaultDecision
     self.routeCache = MagentCache(capacity: rules.isEmpty ? 0 : 4096)
-    self.router = try MagentRouter(rules)
+    self.router = MagentRouter(rules)
     self.defaultTimeout = defaultTimeout
     self.nodes = [:]
     self.addressNodes = [:]
@@ -71,9 +71,8 @@ internal final class MagentCore: @unchecked Sendable {
     }
   }
 
-  /// 所有调用方共享地址规范化与缓存语义；规则为空或未命中时使用默认决策。
-  private func routeDecision(_ address: NetworkAddress) throws -> Decision {
-    let address = try address.normalized()
+  /// 地址已在模型边界规范化；规则为空或未命中时使用默认决策。
+  private func routeDecision(_ address: NetworkAddress) -> Decision {
     let key = Self.routeCacheKey(address)
     if let decision = routeCache.get(key) {
       return decision
@@ -90,7 +89,7 @@ internal final class MagentCore: @unchecked Sendable {
   /// 当前规则不匹配端口，因此 cache key 不包含端口。
   /// 规则为空或没有规则命中时，使用初始化时传入的默认决策。
   internal func routeTCPWire(_ address: NetworkAddress) throws -> Wire? {
-    let decision = try routeDecision(address)
+    let decision = routeDecision(address)
     switch decision {
     case .direct:
       return nil
@@ -107,7 +106,7 @@ internal final class MagentCore: @unchecked Sendable {
   ///
   /// `.direct` 返回 `nil`；`.proxy` 引用不存在的节点时抛出错误，禁止将代理配置错误降级为直连。
   internal func routeUDPWire(_ address: NetworkAddress) throws -> Wire? {
-    let decision = try routeDecision(address)
+    let decision = routeDecision(address)
     switch decision {
     case .direct:
       return nil
@@ -122,15 +121,15 @@ internal final class MagentCore: @unchecked Sendable {
 
   /// 为路由决策缓存构造稳定 key，并区分域名、IPv4 和 IPv6 地址。
   private static func routeCacheKey(_ address: NetworkAddress) -> String {
-    switch address {
-    case .domain:
-      return "domain:\(address.hostForMatching)"
-
-    case .ipv4(let bytes, _):
-      return "ipv4:\(bytes.base64EncodedString())"
-
-    case .ipv6(let bytes, _):
-      return "ipv6:\(bytes.base64EncodedString())"
+    switch address.address {
+    case .domain(let host, _):
+      return "domain:\(host.hasSuffix(".") ? String(host.dropLast()) : host)"
+    case .ip(.v4):
+      return "ipv4:\(address.host)"
+    case .ip(.v6):
+      return "ipv6:\(address.host)"
+    case .ip(.unixDomainSocket):
+      preconditionFailure("NetworkAddress only stores numeric IP sockets")
     }
   }
 
@@ -161,15 +160,12 @@ internal final class MagentCore: @unchecked Sendable {
         channel.pipeline.addHandler(handler)
       }
     let connection: EventLoopFuture<Channel>
-    switch address {
-    case .ipv4, .ipv6:
-      // Numeric business targets bypass the hostname resolver entirely, including
-      // addresses normalized from a SOCKS domain or mapped IPv6 representation.
-      connection = group.next().makeCompletedFuture {
-        try bootstrap.connect(to: address.socketAddress())
-      }.flatMap { $0 }
-    case .domain:
-      connection = bootstrap.connect(host: address.host, port: address.port)
+    switch address.address {
+    case .ip(let socket):
+      // 数值目标直接使用已存储端点，禁止重新进入主机名解析。
+      connection = bootstrap.connect(to: socket)
+    case .domain(let host, let port):
+      connection = bootstrap.connect(host: host, port: Int(port))
     }
     return connection.flatMapErrorThrowing { error in
       if let channelError = error as? ChannelError, case .connectTimeout = channelError {
@@ -238,304 +234,118 @@ internal final class MagentCore: @unchecked Sendable {
 
 // MARK: - MagentRouter
 
-/// 初始化时构建的不可变路由表。
-///
-/// 这里故意不再定义“编译规则”或“匹配目标”等中间类型。
-/// 规则本体、原始顺序、特异度和各类索引使用相同的数组下标关联，
-/// 既保持数据结构直接，也让路由状态在初始化后保持不可变。
+/// 当前 Core 生命周期内不可变的路由表；直接索引模型的解析结果，不重复验证规则。
 private struct MagentRouter: Sendable {
-  /// 经过规范化和去重的规则。
+  /// 按最后出现的位置保留规则，数组顺序就是相同优先级和具体性时的决胜顺序。
   private let rules: [ProxyRule]
-
-  /// 规则在初始化参数中的位置，用作所有显式优先级相同时的稳定决胜条件。
-  private let sequences: [Int]
-
-  /// 同一 `order` 下的匹配特异度：精确域名高于后缀，后缀高于关键字；
-  /// CIDR 使用前缀长度。
-  private let specificities: [Int]
-
-  /// 规范化完整域名到规则下标的索引。
   private let exactDomains: [String: Int]
-
-  /// 规范化域名后缀到规则下标的索引。
   private let domainSuffixes: [String: Int]
-
-  /// 小写关键字到规则下标的索引。
-  /// 关键字需要执行包含判断，因此匹配时仍需线性扫描。
   private let domainKeywords: [String: Int]
+  private let ipRanges: [Int]
 
-  /// 已规范化 CIDR 到规则下标的索引。
-  /// 当前规模下线性扫描清晰且足够，后续可独立替换为前缀树。
-  private let ipRanges: [NetworkCIDR: Int]
-
-  /// 去重并索引已经由 `ProxyRule` 规范化的完整规则集合。
-  ///
-  /// 相同类型和相同规范化匹配值被视为同一条逻辑规则。
-  /// 重复出现时最后一条生效，这使配置文件后面的规则可以明确覆盖前面的同值规则，
-  /// 同时仍由该规则自己的 `order` 参与全局优先级比较。
-  fileprivate init(_ sourceRules: [ProxyRule]) throws {
-    var compiledRules: [ProxyRule] = []
-    var compiledSequences: [Int] = []
-    var compiledSpecificities: [Int] = []
-    var compiledCIDRs: [NetworkCIDR?] = []
-    var identityIndexes: [String: Int] = [:]
-
-    for (sequence, rule) in sourceRules.enumerated() {
-      let identity: String
-      let specificity: Int
-      let cidr: NetworkCIDR?
-
-      switch rule.matchType {
-      case .exactDomain:
-        identity = "exactDomain|\(rule.matchValue)"
-        specificity = 4_000 + rule.matchValue.utf8.count
-        cidr = nil
-
-      case .domainSuffix:
-        identity = "domainSuffix|\(rule.matchValue)"
-        specificity = 3_000 + rule.matchValue.split(separator: ".").count
-        cidr = nil
-
-      case .domainKeyword:
-        identity = "domainKeyword|\(rule.matchValue)"
-        specificity = 1_000 + rule.matchValue.utf8.count
-        cidr = nil
-
-      case .ipCIDR:
-        let parsedCIDR = try NetworkCIDR(rule.matchValue)
-        identity = "ipCIDR|\(rule.matchValue)"
-        specificity = 2_000 + parsedCIDR.prefixLength
-        cidr = parsedCIDR
-
-      case .urlRegex:
-        throw MagentError.invalidPolicy("urlRegex is not supported by MagentRouter")
-      }
-
-      if let existingIndex = identityIndexes[identity] {
-        compiledRules[existingIndex] = rule
-        compiledSequences[existingIndex] = sequence
-        compiledSpecificities[existingIndex] = specificity
-        compiledCIDRs[existingIndex] = cidr
-      } else {
-        identityIndexes[identity] = compiledRules.count
-        compiledRules.append(rule)
-        compiledSequences.append(sequence)
-        compiledSpecificities.append(specificity)
-        compiledCIDRs.append(cidr)
+  /// 覆盖身份只包含 Match；最后一条的动作、优先级和输入位置一起生效。
+  fileprivate init(_ sourceRules: [ProxyRule]) {
+    var lastPositions: [ProxyRule.Match: Int] = [:]
+    for (position, rule) in sourceRules.enumerated() {
+      lastPositions[rule.match] = position
+    }
+    let retainedRules = sourceRules.enumerated()
+      .filter { lastPositions[$0.element.match] == $0.offset }
+      .map(\.element)
+    var exactDomains: [String: Int] = [:]
+    var domainSuffixes: [String: Int] = [:]
+    var domainKeywords: [String: Int] = [:]
+    var ipRanges: [Int] = []
+    for (index, rule) in retainedRules.enumerated() {
+      switch rule.match {
+      case .exactDomain(let name): exactDomains[name] = index
+      case .domainSuffix(let name): domainSuffixes[name] = index
+      case .domainKeyword(let keyword): domainKeywords[keyword] = index
+      case .ipCIDR: ipRanges.append(index)
       }
     }
-
-    var exactDomainIndex: [String: Int] = [:]
-    var domainSuffixIndex: [String: Int] = [:]
-    var domainKeywordIndex: [String: Int] = [:]
-    var ipRangeIndex: [NetworkCIDR: Int] = [:]
-
-    for index in compiledRules.indices {
-      let rule = compiledRules[index]
-
-      switch rule.matchType {
-      case .exactDomain:
-        exactDomainIndex[rule.matchValue] = index
-
-      case .domainSuffix:
-        domainSuffixIndex[rule.matchValue] = index
-
-      case .domainKeyword:
-        domainKeywordIndex[rule.matchValue] = index
-
-      case .ipCIDR:
-        guard let cidr = compiledCIDRs[index] else {
-          throw MagentError.invalidPolicy("missing compiled CIDR: \(rule.matchValue)")
-        }
-        ipRangeIndex[cidr] = index
-
-      case .urlRegex:
-        throw MagentError.invalidPolicy("urlRegex is not supported by MagentRouter")
-      }
-    }
-
-    rules = compiledRules
-    sequences = compiledSequences
-    specificities = compiledSpecificities
-    exactDomains = exactDomainIndex
-    domainSuffixes = domainSuffixIndex
-    domainKeywords = domainKeywordIndex
-    ipRanges = ipRangeIndex
+    self.rules = retainedRules
+    self.exactDomains = exactDomains
+    self.domainSuffixes = domainSuffixes
+    self.domainKeywords = domainKeywords
+    self.ipRanges = ipRanges
   }
 
-  /// 匹配目标地址并返回最高优先级规则的决策。
-  ///
-  /// 优先级依次为：更小的 `order`、更高的特异度、更早的初始化参数位置。
-  /// 最后一项只负责保证结果稳定，不会覆盖调用方显式设置的 `order`。
-  ///
-  /// 热点地址通常由外层缓存以均摊 O(1) 返回。缓存未命中时，
-  /// 精确域名平均 O(1)，后缀 O(标签数)，关键字 O(关键字数量 × 域名长度)，
-  /// CIDR O(CIDR 数量 × 16 字节)。
+  /// 所有命中候选统一比较 order、具体性和保留位置；精确索引命中不能提前返回。
+  /// 域名只取匹配视图，保留原目标根点供后续解析和 Wire 使用；IP 不执行 DNS。
   fileprivate func match(_ address: NetworkAddress) -> Decision? {
     var bestIndex: Int?
-
-    func consider(_ candidateIndex: Int?) {
-      guard let candidateIndex else { return }
-      guard let currentIndex = bestIndex else {
-        bestIndex = candidateIndex
-        return
-      }
-
-      let candidateRule = rules[candidateIndex]
-      let currentRule = rules[currentIndex]
-
-      if candidateRule.order != currentRule.order {
-        if candidateRule.order < currentRule.order {
-          bestIndex = candidateIndex
-        }
-        return
-      }
-
-      if specificities[candidateIndex] != specificities[currentIndex] {
-        if specificities[candidateIndex] > specificities[currentIndex] {
-          bestIndex = candidateIndex
-        }
-        return
-      }
-
-      if sequences[candidateIndex] < sequences[currentIndex] {
-        bestIndex = candidateIndex
-      }
+    func consider(_ candidate: Int?) {
+      guard let candidate else { return }
+      if let current = bestIndex, !isPreferred(candidate, over: current) { return }
+      bestIndex = candidate
     }
 
-    switch address {
-    case .domain:
-      let normalizedHost = address.hostForMatching
-
-      consider(exactDomains[normalizedHost])
-
-      var suffixCandidate = normalizedHost[...]
+    switch address.address {
+    case .domain(let host, _):
+      let name = host.hasSuffix(".") ? String(host.dropLast()) : host
+      consider(exactDomains[name])
+      var suffix = name[...]
       while true {
-        consider(domainSuffixes[String(suffixCandidate)])
-        guard let dotIndex = suffixCandidate.firstIndex(of: ".") else { break }
-        suffixCandidate = suffixCandidate[suffixCandidate.index(after: dotIndex)...]
+        consider(domainSuffixes[String(suffix)])
+        guard let dot = suffix.firstIndex(of: ".") else { break }
+        suffix = suffix[suffix.index(after: dot)...]
+      }
+      for (keyword, index) in domainKeywords where name.contains(keyword) {
+        consider(index)
       }
 
-      for (keyword, ruleIndex) in domainKeywords where normalizedHost.contains(keyword) {
-        consider(ruleIndex)
+    case .ip(let socket):
+      let bytes: [UInt8]
+      switch socket {
+      case .v4(let ipv4):
+        bytes = withUnsafeBytes(of: ipv4.address.sin_addr) { Array($0) }
+      case .v6(let ipv6):
+        bytes = withUnsafeBytes(of: ipv6.address.sin6_addr) { Array($0) }
+      case .unixDomainSocket:
+        preconditionFailure("NetworkAddress only stores numeric IP sockets")
       }
-
-    case .ipv4, .ipv6:
-      for (cidr, ruleIndex) in ipRanges where cidr.contains(address) {
-        consider(ruleIndex)
+      for index in ipRanges {
+        guard case .ipCIDR(let network, let prefixLength) = rules[index].match,
+          network.count == bytes.count
+        else { continue }
+        let fullBytes = Int(prefixLength) / 8
+        guard bytes.prefix(fullBytes).elementsEqual(network.prefix(fullBytes)) else { continue }
+        let remainingBits = prefixLength % 8
+        if remainingBits > 0 {
+          let mask = UInt8.max << (8 - remainingBits)
+          guard bytes[fullBytes] & mask == network[fullBytes] else { continue }
+        }
+        consider(index)
       }
     }
-
-    guard let bestIndex else { return nil }
-    return rules[bestIndex].decision
-  }
-}
-
-// MARK: - NetworkCIDR
-
-/// 一段规范化后的 IPv4 或 IPv6 CIDR 网络。
-///
-/// 初始化时会清零主机位，所以 `192.168.1.25/24` 与 `192.168.1.0/24` 是同一个值。
-/// 这个性质同时保证了重复规则去重和 `Hashable` 比较使用网络语义，
-/// 而不是依赖用户输入的文本形式。
-private struct NetworkCIDR: Hashable, Sendable {
-  /// 已清零主机位的 4 字节 IPv4 或 16 字节 IPv6 网络地址。
-  private let network: Data
-
-  /// 网络前缀长度；IPv4 为 `0...32`，IPv6 为 `0...128`。
-  fileprivate let prefixLength: Int
-
-  /// 解析一个 IPv4 或 IPv6 CIDR。省略前缀时按单主机网络处理，即 IPv4 `/32`、IPv6 `/128`。
-  fileprivate init(_ value: String) throws {
-    let parts = value.split(separator: "/", omittingEmptySubsequences: false)
-    guard (1...2).contains(parts.count), let address = Self.addressBytes(String(parts[0])) else {
-      throw MagentError.invalidPolicy("invalid CIDR: \(value)")
-    }
-
-    let prefix: Int
-    if parts.count == 2 {
-      guard let parsedPrefix = Int(parts[1]) else {
-        throw MagentError.invalidPolicy("invalid CIDR prefix: \(value)")
-      }
-      prefix = parsedPrefix
-    } else {
-      prefix = address.count * 8
-    }
-
-    guard (0...(address.count * 8)).contains(prefix) else {
-      throw MagentError.invalidPolicy("invalid CIDR prefix: \(value)")
-    }
-
-    network = Self.masked(address, prefixLength: prefix)
-    prefixLength = prefix
+    return bestIndex.map { rules[$0].decision }
   }
 
-  /// 判断目标地址是否属于当前网络。
-  /// IPv4 与 IPv6 严格隔离，域名不会在这里触发 DNS 解析。
-  fileprivate func contains(_ address: NetworkAddress) -> Bool {
-    let addressBytes: Data
-
-    switch address {
-    case .ipv4(let data, _):
-      guard network.count == 4 else { return false }
-      addressBytes = data
-
-    case .ipv6(let data, _):
-      guard network.count == 16 else { return false }
-      addressBytes = data
-
-    case .domain:
+  /// 具体性以明确类型关系及各类型自己的长度比较，不以相减或跨类型分数排序。
+  private func isPreferred(_ candidate: Int, over current: Int) -> Bool {
+    let lhs = rules[candidate]
+    let rhs = rules[current]
+    if lhs.order != rhs.order { return lhs.order < rhs.order }
+    switch (lhs.match, rhs.match) {
+    case (.domainSuffix(let left), .domainSuffix(let right)):
+      let leftDepth = left.split(separator: ".").count
+      let rightDepth = right.split(separator: ".").count
+      if leftDepth != rightDepth { return leftDepth > rightDepth }
+    case (.domainKeyword(let left), .domainKeyword(let right)):
+      if left.utf8.count != right.utf8.count { return left.utf8.count > right.utf8.count }
+    case (.ipCIDR(_, let left), .ipCIDR(_, let right)):
+      if left != right { return left > right }
+    case (.exactDomain, .domainSuffix), (.exactDomain, .domainKeyword),
+      (.domainSuffix, .domainKeyword):
+      return true
+    case (.domainSuffix, .exactDomain), (.domainKeyword, .exactDomain),
+      (.domainKeyword, .domainSuffix):
       return false
+    default:
+      // 精确同值已去重；域名与 IP 以及不同 IP 族不会成为同一目标的候选。
+      break
     }
-
-    guard addressBytes.count == network.count else { return false }
-
-    let fullByteCount = prefixLength / 8
-    guard addressBytes.prefix(fullByteCount) == network.prefix(fullByteCount) else { return false }
-
-    let remainingBitCount = prefixLength % 8
-    guard remainingBitCount > 0 else { return true }
-
-    let mask = UInt8.max << UInt8(8 - remainingBitCount)
-    return addressBytes[fullByteCount] & mask == network[fullByteCount] & mask
-  }
-
-  /// 使用 NIO 的字面量解析，避免自行实现 IPv6 压缩格式和字节序处理。
-  private static func addressBytes(_ value: String) -> Data? {
-    guard let address = try? SocketAddress(ipAddress: value, port: 0) else { return nil }
-
-    switch address {
-    case .v4(let ipv4):
-      return withUnsafeBytes(of: ipv4.address.sin_addr) { Data($0) }
-
-    case .v6(let ipv6):
-      return withUnsafeBytes(of: ipv6.address.sin6_addr) { Data($0) }
-
-    case .unixDomainSocket:
-      return nil
-    }
-  }
-
-  /// 清零前缀之后的所有位，使等价 CIDR 具有完全相同的存储值。
-  private static func masked(_ address: Data, prefixLength: Int) -> Data {
-    var result = address
-
-    for index in result.indices {
-      let byteStartBit = index * 8
-      if byteStartBit + 8 <= prefixLength {
-        continue
-      }
-
-      if byteStartBit >= prefixLength {
-        result[index] = 0
-        continue
-      }
-
-      let retainedBitCount = prefixLength - byteStartBit
-      let mask = UInt8.max << UInt8(8 - retainedBitCount)
-      result[index] &= mask
-    }
-
-    return result
+    return candidate < current
   }
 }

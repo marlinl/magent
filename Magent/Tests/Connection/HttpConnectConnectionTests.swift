@@ -449,7 +449,7 @@ final class HttpConnectConnectionTests: XCTestCase {
       .wait()
     channels.append(shadowsocksServer)
 
-    let defaultNode = ProxyNode(
+    let defaultNode = try ProxyNode(
       address: try XCTUnwrap(shadowsocksServer.localAddress),
       cipher: cipher,
       password: "test"
@@ -591,7 +591,7 @@ final class HttpConnectConnectionTests: XCTestCase {
 
   /// HTTP CONNECT 数值地址保留 IP 类型并参与 CIDR 规则匹配。
   func testHTTPConnectNumericAddressesPreserveIPTypeAndMatchCIDR() throws {
-    let proxyNode = ProxyNode(
+    let proxyNode = try ProxyNode(
       address: try SocketAddress(ipAddress: "192.0.2.252", port: 8388),
       cipher: .aes256Gcm,
       password: "test"

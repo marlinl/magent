@@ -1,22 +1,48 @@
 ---
 desc: "NetworkAddress、HttpProtocol、ProxyNode、ProxyRule 及关联枚举的模型契约与验收标准。"
-version: "0.4.1"
-updated_at: "2026-09-23"
+version: "0.4.2"
+updated_at: "2026-09-24"
 status: "草案"
-notes: "NetworkAddress 采用 NIO IP 存储与按需系统域名解析；调用方迁移和连接层 DNS 策略单独处理。"
 ---
 
 # Magent 模型规范
 
-关联枚举在所属模型章节中说明。模型 API 及其实际使用的序列化格式可以变更；不保留绕过校验的历史构造路径。
+本规范统一定义 Magent 的四类模型及其关联枚举。全文的共同约束、各模型契约、调用方迁移要求和最终验收条件共同生效；各模型章节只补充所属模型的具体规则。
 
-## NetworkAddress
+阅读顺序：[范围与共同约束](#范围与共同约束) → [模型契约](#模型契约) → [实现与调用方迁移](#实现与调用方迁移) → [源码与测试索引](#源码与测试索引) → [验收与验证](#验收与验证)。
 
-本章规定以未解析域名和 NIO `SocketAddress` 表示逻辑地址，并通过 `socketAddress` 按需取得实际端点。模型重写与调用方迁移分开进行；连接层的异步解析和配置 DNS 策略不因模型重写而自动改变。
+## 范围与共同约束
 
-### 1. 定位与职责
+### 模型范围与协作关系
 
-模型接口以现有生产调用需求为依据，不为假设场景增加方法或协议符合性。
+| 模型 | 职责 | 与其他模型及消费方的关系 | 验收编号 |
+|---|---|---|---|
+| [NetworkAddress](#networkaddress) | 经过校验的逻辑主机与端口、地址身份和按需端点转换 | HTTP / SOCKS 解析器构造业务目标；Core 匹配、Wire 编码共同消费同一个逻辑地址 | NA-01～NA-21 |
+| [HttpProtocol](#httpprotocol) | 已校验的 HTTP 请求头语义、请求目标、出站请求头及请求体定界 | 使用 NetworkAddress 表示目标；HTTP 连接负责请求体、路由、响应和生命周期 | HP-01～HP-24 |
+| [ProxyNode](#proxynode) | 出站代理节点的实际端点、协议、凭据和连接超时 | Core 按 UUID 查找节点，Wire 消费连接配置；实际端点使用 SocketAddress | PN-01～PN-13 |
+| [ProxyRule](#proxyrule) | 规范化匹配条件、动作和优先级 | Core 使用 NetworkAddress 匹配规则，以 Decision.proxy(UUID) 引用 ProxyNode | PR-01～PR-18 |
+
+`ProxyNodeType`、`ProxyCipher` 在 ProxyNode 中说明；`MatchType`、`Decision` 和内部 `Match` 在 ProxyRule 中说明。文档归属不要求把顶层类型改成嵌套公共 API，也不要求合并或新增源码文件。
+
+### 共同实现原则
+
+模型的字段、方法、协议符合性和验收项必须对应明确的实际业务使用场景。没有实际调用需求的能力不预先定义；现有实现中的协议符合性也不自动成为规范要求。模型本体、任意位置的扩展以及调用方均须遵守本规范，不能为局部使用绕过职责和构造边界。
+
+模型 API 及其实际使用的序列化格式可以变更；不保留绕过校验的历史构造路径、兼容入口或测试专用路径。构造校验归模型，协议字段和消息边界归解析器，路由与节点集合归 Core，连接及加密状态归所属 Connection / Wire。具体约束以各模型契约为准。
+
+下文 Swift 片段用于表达接口和关键不变量，省略部分实现，不是可直接编译的完整源文件。验收表定义必须满足的结果，不表示对应实现或测试已经通过。
+
+### 与其他规范的关系
+
+本规范负责模型契约；[SOCKS4 / SOCKS4a](SOCKS4_PROXY_SPEC.md)、[SOCKS5](SOCKS5_PROXY_SPEC.md) 和 [HTTP](HTTP_PROXY_SPEC.md) 规范负责各协议的完整服务要求。模型支持某种地址或字段表示，不等于协议入口自动接受该形式，也不放宽协议特有的字段和 IDNA 约束。
+
+HttpProtocol 与完整 HTTP 代理目标之间的具体差异及采用范围，统一由其[支持范围](#支持范围与-http-规范的关系)说明。完整协议能力必须按对应规范独立验收；API、监听和其他实现行为的说明在对应迁移完成并验证后更新。
+
+## 模型契约
+
+### NetworkAddress
+
+#### 定位与职责
 
 `NetworkAddress` 是不可变的逻辑目标地址：**未解析的主机名与端口，或数值 IP 端点**。它用于代理请求目标、路由和协议地址字段。实际的 UDP 发送方、接收方或代理节点端点使用 `SocketAddress` 表示。
 
@@ -26,13 +52,11 @@ notes: "NetworkAddress 采用 NIO IP 存储与按需系统域名解析；调用�
 
 协议解析器负责消息边界、ATYP、字段长度和命令语义。Core 负责规则匹配和路由选择。连接流程负责异步解析、套接字选择、超时和 Channel 生命周期。端口 `0` 是否可用，由具体操作入口决定。
 
-### 2. 类型、构造入口与地址输出
+#### 类型、构造入口与地址输出
 
 公开类型继续使用 `struct`。调用方统一通过 `init(host:port:)` 输入文本主机名或 IP；需要 IP 端点时，读取非可选、可抛错的 `socketAddress`。内部枚举命名为 `Address`，字段命名为 `address`，只有域名及其端口、已包含端口的 IP `SocketAddress` 两个分支。不得在套接字地址之外重复保存端口或并行维护一份 IP 字节数组。
 
 本草图保留 `struct`，以保证调用方经过文本构造入口校验。公开枚举的分支也会公开，调用方能够绕过初始化器直接构造；若把 `NetworkAddress` 改为公开枚举，必须同时重新确定输入校验、规范化及相等性的保证，不能继续宣称所有值都已通过受控构造。`self` 表示当前的 `NetworkAddress` 值，不是另一个存储字段。
-
-以下是接口草图，不是可直接编译的完整实现：
 
 ```swift
 public struct NetworkAddress: Sendable, Hashable {
@@ -62,7 +86,7 @@ public struct NetworkAddress: Sendable, Hashable {
         case let text where text.contains(":"):
             self.address = .ip(try Self.parseIPv6Text(text, port: port))
         default:
-            // 直接在此按第 5 节校验域名；不另设域名校验方法。
+            // 直接在此按主机名契约校验域名；不另设域名校验方法。
             // 校验失败在此抛错；成功后转为小写并保留合法根点。
             self.address = .domain(host.lowercased(), port: port)
         }
@@ -117,21 +141,21 @@ public struct NetworkAddress: Sendable, Hashable {
 
 SOCKS 的 IP 输入并非天然就是字符串。采用单一文本构造入口后，协议层只把字段中可读的 4 或 16 字节交给 `SocketAddress(packedIPAddress:port:)`，读取其数值 `ipAddress` 文本，再构造逻辑地址。此路径包含一次二进制到文本转换和模型内的文本解析；本契约明确接受这一转换，不以尚未验证的性能收益预留第二套构造接口。转换不执行 DNS，也不保留这个临时套接字作为模型的另一份状态。
 
-### 3. 存储不变量与文本视图
+#### 存储不变量与文本视图
 
 | 存储 | 不变量 |
 |---|---|
-| `domain` | 符合第 5 节的合法 ASCII 主机名，转为小写并保留一个合法的显式根点；端口为 `UInt16` |
+| `domain` | 符合[主机名契约](#主机名契约)的合法 ASCII 主机名，转为小写并保留一个合法的显式根点；端口为 `UInt16` |
 | `ip` | IPv4 或 IPv6 `SocketAddress`，端口在 `0...65535` 内；IPv4 映射 IPv6 地址存为 IPv4 |
 | 逻辑 IPv6 | 由无作用域的数值文本构造，作用域和流信息均为零 |
 
-逻辑 IP 身份由地址族、IP 字节和端口组成。模型不导入实际传输套接字，因此不承担实际套接字的作用域校验、流信息清理或主机名元数据转换。输入文本中的作用域后缀按第 4 节拒绝；实际传输端点及其元数据继续由连接层保留。
+逻辑 IP 身份由地址族、IP 字节和端口组成。模型不导入实际传输套接字，因此不承担实际套接字的作用域校验、流信息清理或主机名元数据转换。输入文本中的作用域后缀按[数值输入策略与规范化](#数值输入策略与规范化)拒绝；实际传输端点及其元数据继续由连接层保留。
 
 `host` 返回规范化域名或 NIO 的数值 `ipAddress` 文本。不得使用用于诊断的 `SocketAddress.description`。结果不包含端口、方括号或作用域后缀，也不使用空字符串兜底错误。等价 IPv6 的文本拼写不作为身份键；本契约不保证不同依赖版本生成完全相同的 IPv6 文本，也不为此添加自定义格式化器。
 
 公开 `port` 视图精确读取已验证的端口，不能用 `0` 替代缺失的套接字端口。IP 的 `socketAddress`、`host` 和 `port` 来自同一份 `address` 存储；返回的值副本被调用方修改时，不影响模型。协议层转换 IP 字节时不能假设 `Data` 切片的 `startIndex` 为零，应使用字段的实际切片或 `ByteBuffer` 可读视图。
 
-### 4. 数值输入策略与规范化
+#### 数值输入策略与规范化
 
 `init` 只按文本特征选择 IPv4、IPv6 或域名分支。IPv4、IPv6 的完整识别、校验、解析和报错分别放在 `parseIPv4Text` 和 `parseIPv6Text` 两个私有静态方法中，使 `init` 能在 `address` 赋值前调用。两个方法均返回非可选 `SocketAddress`，复用 SwiftNIO 完成实际 IP 语法解析和端点构造，不手写 IP 字节解析或格式化算法。
 
@@ -139,9 +163,9 @@ SOCKS 的 IP 输入并非天然就是字符串。采用单一文本构造入口�
 |---|---|
 | 不含冒号，且符合本节数字、点和十六进制分段特征 | 调用 `parseIPv4Text`；方法内拒绝禁止输入、校验严格 IPv4 词法规则并通过 NIO 构造 IPv4 端点，失败直接抛错。 |
 | 含冒号 | 调用 `parseIPv6Text`；方法内拒绝禁止输入、检查内嵌 IPv4 尾段的词法限制并通过 NIO 构造 IPv6 端点，失败直接抛错；成功后只将 IPv4 映射 IPv6 规范化为 IPv4。 |
-| 其他文本 | 进入 `default`，在 `init` 内直接按第 5 节校验域名，成功后保存 `.domain`，失败在该分支抛错。 |
+| 其他文本 | 进入 `default`，在 `init` 内直接按[主机名契约](#主机名契约)校验域名，成功后保存 `.domain`，失败在该分支抛错。 |
 
-候选分支不代表 IP 已经合法。`init` 不重复 IP 校验、不依次试调用两个解析方法，也不捕获解析错误后回退为域名。解析方法不以 `nil` 表示失败。例如 `256.0.0.1` 在 IPv4 方法中失败，`2001:::1` 在 IPv6 方法中失败；`0xfeed.example` 直接进入 `default` 的域名校验。模型策略错误和 NIO 解析错误按第 10 节传播。
+候选分支不代表 IP 已经合法。`init` 不重复 IP 校验、不依次试调用两个解析方法，也不捕获解析错误后回退为域名。解析方法不以 `nil` 表示失败。例如 `256.0.0.1` 在 IPv4 方法中失败，`2001:::1` 在 IPv6 方法中失败；`0xfeed.example` 直接进入 `default` 的域名校验。模型策略错误和 NIO 解析错误按[错误与校验边界](#错误与校验边界)传播。
 
 IPv4 文本必须恰好包含四个十进制分段，每段为 `0...255`；除单个 `0` 外，不允许前导零。IPv6 内嵌的 IPv4 尾部遵循相同词法限制。文本传入数值解析前，拒绝空白、控制字符、NUL、方括号和作用域后缀。
 
@@ -162,7 +186,7 @@ IPv4 文本必须恰好包含四个十进制分段，每段为 `0...255`；除�
 
 映射规范化只适用于前 80 位为零、随后 16 位为 `0xffff` 的地址，在存储前执行一次。路由、相等性和 Wire 消费同一个逻辑结果。原始 `SocketAddress` 本身不会建立这种逻辑等价关系。
 
-### 5. 主机名契约
+#### 主机名契约
 
 未进入 IP 候选分支的文本，由 `init(host:port:)` 的 `default` 分支直接执行本节的域名校验并在失败时抛错；不新增 `parseDomain`、`validateDomain` 或通用主机名分发方法。模型接受 ASCII 主机名。需要 Unicode 转换和完整 IDNA 校验时，由导入层或协议层负责，使用版本明确且有测试向量的实现。
 
@@ -175,14 +199,14 @@ IPv4 文本必须恰好包含四个十进制分段，每段为 `0...255`；除�
 | 总长度 | 去掉一个合法的末尾根点后为 `1...253` 字节 |
 | 连字符 | 不能位于标签开头或结尾 |
 | 根点 | 允许并保留一个末尾根点 |
-| 单标签 | 允许 `localhost` 等普通合法名称；数值歧义仍按第 4 节处理 |
+| 单标签 | 允许 `localhost` 等普通合法名称；数值歧义仍按[数值输入策略与规范化](#数值输入策略与规范化)处理 |
 | 空白、控制字符、NUL、原始 Unicode | 拒绝，不去除首尾空白或截断 |
 | 空标签、前导点、连续点、多个根点 | 拒绝 |
 | `_`、`/`、`\`、`@`、`:`、`[`、`]`、`%` | 拒绝 |
 
 含根点的合法名称可以达到 254 字节。协议中的地址长度字段不能代替这些主机名限制。字母、数字、连字符（LDH）检查及 `xn--` 前缀不证明 A-label 完整合法；通过本模型校验，不代表已经满足 SOCKS5 规范中更严格的有效 A-label 要求。
 
-### 6. 端口与操作语义
+#### 端口与操作语义
 
 模型公开的端口使用 `UInt16`。从配置整数或协议字段转换时，必须精确转换。负数、溢出和非整数输入必须失败，不允许回绕、截断或替换为默认值。
 
@@ -196,7 +220,7 @@ IPv4 文本必须恰好包含四个十进制分段，每段为 `0...255`；除�
 
 模型允许 `0` 不会隐式改变监听器的产品策略。协议解析得到的端口在构造 NIO 套接字前必须精确转换；模型不能依赖其他 API 内部的窄整数转换来完成端口校验。
 
-### 7. 相等性与哈希
+#### 相等性与哈希
 
 相等性和哈希使用同一个规范化身份。域名身份是存储的名称和端口。IP 身份是规范化套接字的地址族、IP 字节和端口；模型仅通过文本构造，不引入实际传输端点的作用域、流信息或主机名元数据。
 
@@ -212,7 +236,7 @@ IPv4 文本必须恰好包含四个十进制分段，每段为 `0...255`；除�
 
 存储中的规范化套接字可以复用 NIO 的相等性和哈希。不得把未经规范化的传输套接字当作已经满足模型契约的值来比较或哈希。不能为了方便路由缓存而从模型身份中删除端口或根点信息。`hashValue` 不是持久化标识。
 
-### 8. 路由、缓存与转发
+#### 路由、缓存与转发
 
 处理顺序如下：
 
@@ -236,7 +260,7 @@ Core 负责匹配视图和路由缓存键。匹配名称可以去掉一个根点
 
 Wire 保留域名的显式根点，接收与路由使用的相同逻辑目标。模型不提供 `normalized()` 或 `hostForMatching`；消费方不再修补地址。TCP 启动后的负载不重复解析目标。每个 UDP 数据报仍携带目标，需要逐个进行路由和协议地址处理。
 
-### 9. SocketAddress、UDP 与 DNS 的职责归属
+#### SocketAddress、UDP 与 DNS 的职责归属
 
 `SocketAddress` 表示实际端点，可以从数值文本或二进制 IP 构造，无需解析域名。`socketAddress` 对域名委托其 `makeAddressResolvingHost` 辅助方法执行同步系统名称解析。NIO 负责实际解析和端点选择，模型不实现 DNS 查询或管理解析缓存。每次显式转换均委托 NIO，系统解析器是否使用缓存由系统决定。
 
@@ -259,7 +283,7 @@ Wire 保留域名的显式根点，接收与路由使用的相同逻辑目标。
 
 UDP 来源比较及本地回复编码直接处理实际端点，不通过构造 `NetworkAddress` 复用逻辑目标规则。若来源判断需要比较 IPv4 与其映射 IPv6 形式，连接层明确处理该比较语义，同时保存原始端点用于回包；不能假设 NIO 的原始套接字相等性已经完成映射归一。
 
-### 10. 错误与校验边界
+#### 错误与校验边界
 
 违反模型策略时抛出 `MagentError.invalidAddress`，包括主机名语法、数值歧义和文本中的禁止作用域。合法域名访问 `socketAddress` 时执行解析，不因地址种类而报错；解析失败时传播 NIO 原始错误。端口类型或范围错误在调用方精确转换为 `UInt16` 时失败。模型内的 NIO 数值文本构造错误和协议层的 NIO 二进制 IP 构造错误也按原始类型传播；辅助方法不得仅为包装或改名而捕获这些错误。
 
@@ -276,17 +300,7 @@ UDP 来源比较及本地回复编码直接处理实际端点，不通过构造 
 
 文本构造器支持 IPv6，不代表每种协议的 Domain 字段都允许 IPv6 文本。协议特有的限制仍由该字段的解析器执行。SOCKS 端口辅助方法属于协议代码，不属于地址模型；读取失败不能返回看似合法的端口 `0`。
 
-### 11. 采用决定与实现边界
-
-模型采用本章的存储和按需转换契约。调用方、测试引用及应用集成单独迁移；模型实现不代表连接层已经改用系统解析或完成全部验收。
-
-在现有 `Sources/Model/NetworkAddress.swift` 中替换地址表示。移除手写 IP 字节解析器和格式化器、历史构造路径、补救式规范化及模型持有的 DNS 客户端或缓存。私有辅助方法仅保留 `parseIPv4Text`、`parseIPv6Text`，域名校验直接写在 `init` 中。域名显式转换直接委托 NIO 系统解析。不保留兼容路径，也不增加独立校验器、规范化器、工厂、转发包装或测试专用层。
-
-调用方迁移统一采用文本构造入口：HTTP 直接传入拆分的主机名和端口，二进制协议字段由所属解析器借助 NIO 转成数值文本。IP 直连读取 `try target.socketAddress`，域名直连由连接流程异步解析；代理路径保留逻辑目标。移除旧的套接字到逻辑地址包装调用，实际端点比较和回复编码回到连接及协议层，并在所属边界处理 NIO 地址错误。监听配置和示例在各自变更中验证。
-
-### 12. 验收标准
-
-以下验收项覆盖模型及后续调用方迁移，不代表已经全部实现或验证。
+#### 验收场景
 
 | 编号 | 场景 | 必须验证的结果 |
 |---|---|---|
@@ -295,12 +309,12 @@ UDP 来源比较及本地回复编码直接处理实际端点，不通过构造 
 | NA-03 | 协议层处理二进制 IP、非零起始的 `Data` 切片或非零读取索引的 `ByteBuffer` | 只读取正确的 4 或 16 字节；经 NIO 数值文本进入唯一构造入口；截断或长度错误在协议边界失败 |
 | NA-04 | HTTP IP 文本、协议字段转换后的 IP 文本和映射 IPv6 | 值相等，输出套接字一致；Set 中只保留一个身份 |
 | NA-05 | 原生、IPv4 兼容和 NAT64 IPv6 | 保持 IPv6 |
-| NA-06 | 第 4 节的拒绝向量及 `0xfeed.example` | 数值歧义被拒绝；普通域名可以构造 |
+| NA-06 | [数值输入策略与规范化](#数值输入策略与规范化)的拒绝向量及 `0xfeed.example` | 数值歧义被拒绝；普通域名可以构造 |
 | NA-07 | 域名大小写和根点 | 转为小写，保留一个根点，拒绝多个根点 |
 | NA-08 | 标签长度 63/64；名称长度 253/254 | 边界精确；254 字节要求包含合法根点 |
 | NA-09 | 空值、空白、控制字符、NUL、Unicode、非法分隔符 | 拒绝，不去除首尾空白或截断 |
 | NA-10 | 端口 0、1、65535；非法配置端口 | 合法范围精确；具体操作的零端口策略单独处理 |
-| NA-11 | 大小写、不同端口和显式根点 | 相等性与哈希符合第 7 节 |
+| NA-11 | 大小写、不同端口和显式根点 | 相等性与哈希符合[相等性与哈希](#相等性与哈希) |
 | NA-12 | 等价 HTTP、SOCKS4a、SOCKS5 TCP/UDP 目标 | 路由、数值目标和 Wire 编码一致 |
 | NA-13 | 带根点域名的匹配和转发 | 匹配时可以去点；转发时保留 |
 | NA-14 | 构造、比较、哈希、读取主机名及重复读取 IP 的 `socketAddress` | 不执行 DNS，不创建 Channel、线程或 Task；套接字读取不重新解析文本 |
@@ -312,39 +326,15 @@ UDP 来源比较及本地回复编码直接处理实际端点，不通过构造 
 | NA-20 | 数值 UDP 目标及本地客户端回复 | 使用实际套接字，不执行 DNS；回复保留原始客户端端点 |
 | NA-21 | NIO 地址错误和模型策略错误 | 到达所属错误处理入口前保持原始错误类型 |
 
-使用固定输入和字面量期望值。相等性测试验证值及集合行为，不验证不稳定的数值 `hashValue`。解析器测试必须区分经代理转发的域名和直连域名，并证明是否调用了解析。
+相等性测试验证值及集合行为，不验证不稳定的数值 `hashValue`。解析器测试必须区分经代理转发的域名和直连域名，并证明是否调用了解析。
 
-模型实现需要运行定向测试。迁移涉及连接、缓冲、并发或清理时，还必须执行：
+### HttpProtocol
 
-```bash
-swift build
-swift build -Xswiftc -strict-concurrency=complete
-swift test --filter NetworkAddressTests
-swift test --filter ConnectionTests
-swift test
-git diff --check
-```
-
-对修改的 Swift 文件运行严格格式检查。应用编译和真实网络行为需要各自的验证证据。仅修改文档时，检查结构、链接、契约一致性和差异。
-
-### 13. 相关文件与规范边界
-
-- [当前 NetworkAddress 实现](../Sources/Model/NetworkAddress.swift)
-- [当前模型测试](../Tests/Model/NetworkAddressTests.swift)
-- [架构](ARCHITECTURE.md)
-- [SOCKS4 / SOCKS4a 规范](SOCKS4_PROXY_SPEC.md)
-- [SOCKS5 规范](SOCKS5_PROXY_SPEC.md)
-- [HTTP 规范](HTTP_PROXY_SPEC.md)
-
-本候选方案不把其他协议要求标记为已实现，也不放宽其中更严格的字段和 IDNA 契约。已实现 API 和监听行为的说明，在对应实现真正迁移时更新。
-
-## HttpProtocol
-
-### 1. 定位与设计目标
+#### 定位与职责
 
 `HttpProtocol` 表示**一个 HTTP 请求头经过完整校验后所表达的代理请求语义**。它从 NIO 的 `HTTPRequestHead` 构造，确定业务目标、CONNECT 或普通转发分支，以及普通转发使用的出站请求头和请求体定界方式。
 
-构造成功表示请求头语义满足本章契约，可以继续对应的连接流程；不代表请求体已经完整、上游连接已经成功或响应已经发出。
+构造成功表示请求头语义满足本模型契约，可以继续对应的连接流程；不代表请求体已经完整、上游连接已经成功或响应已经发出。
 
 职责分为三层：
 
@@ -356,11 +346,11 @@ git diff --check
 
 `HttpProtocol` 不持有原始接收缓冲、请求体、Channel、Wire、Core、Future 或 Task；不解析响应，也不执行 DNS。不再把 `checkConnect()`、可变请求字段和静态 HTTP 响应字节混放在同一对象中。
 
-### 2. 首版范围与其他 HTTP 规范的关系
+#### 支持范围与 HTTP 规范的关系
 
-本章先为现有两个 HTTP 连接建立明确且共用的模型契约。首版选择有限的 HTTP/1 请求处理范围；这些是本模型的产品约束，不是所有 HTTP 实现都必须采用的限制。
+`HttpProtocol` 为 HTTP CONNECT 和普通转发定义共用的请求模型契约。当前采用有限的 HTTP/1 请求处理范围；这些是本模型的能力约束，不是所有 HTTP 实现都必须采用的限制。
 
-| 项目 | 本章首版设计 |
+| 项目 | 本模型首版设计 |
 |---|---|
 | 版本 | HTTP/1.0 和 HTTP/1.1；保留类型化版本 |
 | CONNECT | 主机与端口形式，必须显式提供非零端口，无请求体 |
@@ -373,15 +363,13 @@ git diff --check
 | 其他方法 | 保留合法且区分大小写的方法标记；不只为常见方法建立模型白名单 |
 | 连接复用 | 首版连接层保持单请求流程，普通出站请求使用 `Connection: close` |
 
-[HTTP_PROXY_SPEC.md](HTTP_PROXY_SPEC.md) 描述了更广的目标范围，包括仅支持 HTTP/1.1、拒绝入站源站形式、分块传输、完整的 OPTIONS/Max-Forwards、Expect、Upgrade 和连接复用。本章不代表已经实现完整代理规范。
+[HTTP_PROXY_SPEC.md](HTTP_PROXY_SPEC.md) 描述了更广的目标范围，包括仅支持 HTTP/1.1、拒绝入站源站形式、分块传输、完整的 OPTIONS/Max-Forwards、Expect、Upgrade 和连接复用。本模型不代表已经实现完整代理规范。
 
-两份文档明确不一致时，模型首版实现以本章范围为准；实现完整 HTTP 代理目标时，必须一起升级模型、连接层契约和验收，不能仅预留一个没有执行路径的枚举分支。原 HTTP 规范继续作为后续完整能力的设计参考。
+两份文档明确不一致时，当前模型实现以此处规定的范围为准；实现完整 HTTP 代理目标时，必须一起升级模型、连接层契约和验收，不能仅预留一个没有执行路径的枚举分支。完整 HTTP 规范继续作为后续能力的设计参考。
 
-### 3. 类型形态与唯一入口
+#### 类型形态与唯一入口
 
 保留 `HttpProtocol` 名称，采用包内不可变 `struct`。使用关联值枚举表示两种请求，避免 `isConnect`、可选目标、可选出站头和可选请求体字段的任意组合。
-
-以下是接口草图，省略构造实现，不是可直接编译的完整源文件：
 
 ```swift
 import NIOHTTP1
@@ -431,7 +419,7 @@ internal struct HttpProtocol: Sendable {
 
 本模型不作为缓存键或持久化记录；首版不增加 `Hashable`、`Codable` 或保留完整请求的日志接口。验收直接检查分支、地址、NIO 字段和定界结果。
 
-### 4. 构造阶段与校验归属
+#### 构造阶段与校验归属
 
 构造必须先校验入站含义，再删除或重建字段：
 
@@ -457,7 +445,7 @@ NIO 解码器负责原始请求行、CRLF、字段语法和增量消息边界。
 
 如果底层解码器在生成 `.head` 前拒绝输入，错误直接交给连接层；如果解码器合并了判断所需的信息，应在 NIO 解码接入点解决，不能让模型猜测缺失的原始字段。网络报文测试和直接构造请求头的测试都必须覆盖这些边界。
 
-### 5. 请求类型与唯一目标来源
+#### 请求类型与唯一目标来源
 
 | 方法 / 请求目标 | 分支与业务目标 |
 |---|---|
@@ -476,9 +464,9 @@ URI 方案名按 ASCII 大小写不敏感方式识别；请求目标使用 ASCII
 
 代理节点地址只用于 Core 选择传输端点。模型的 `target` 始终是业务目标，出站 Host 不能替换为代理节点或 DNS 返回的数值 IP。
 
-主机与端口形式与绝对形式的基本区别，以及绝对形式下根据 URI 主机与端口部分重建 Host 的依据，见 [RFC 9112 §3.2](https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2)。本章另行定义源站形式是否接受及 CONNECT Host 一致性的产品策略。
+主机与端口形式与绝对形式的基本区别，以及绝对形式下根据 URI 主机与端口部分重建 Host 的依据，见 [RFC 9112 §3.2](https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2)。本模型另行定义源站形式是否接受及 CONNECT Host 一致性的产品策略。
 
-### 6. HTTP 地址与 NetworkAddress 的衔接
+#### HTTP 地址与 NetworkAddress 的衔接
 
 HTTP 层只拆分主机名、端口和 IPv6 方括号，再调用受控的 [NetworkAddress](#networkaddress) 构造入口。不另写一套 ASCII 主机名规则、数值地址歧义规则或映射 IPv6 规范化逻辑。
 
@@ -497,7 +485,7 @@ HTTP 地址的主机与端口部分中的 IPv6 必须带完整方括号，括号
 
 主机与端口部分的词法拆分可以共用现有 `HttpProtocol.swift` 中的一个私有方法，返回主机名、可选显式端口和表示信息。CONNECT 是否必须有端口，由调用位置决定；不使用 `isConnect`、`allowMissingPort` 等布尔开关链。复用拆分规则时，不能抹平各字段之间的语义差异。
 
-### 7. Host 字段契约
+#### Host 字段契约
 
 | 场景 | Host 要求 |
 |---|---|
@@ -510,13 +498,13 @@ HTTP 地址的主机与端口部分中的 IPv6 必须带完整方括号，括号
 
 - 绝对形式：URI 主机与端口部分决定业务目标。合法但不一致的 Host 不改变路由，出站 Host 根据 URI 主机与端口部分重建。
 - 源站形式：Host 是唯一目标来源，没有其他 URI 主机与端口部分可以兜底。
-- CONNECT：存在 Host 时，按第 6 节端口规则构造比较值，并与请求目标的 `NetworkAddress` 比较；不一致则拒绝。
+- CONNECT：存在 Host 时，按[HTTP 地址与 NetworkAddress 的衔接](#http-地址与-networkaddress-的衔接)端口规则构造比较值，并与请求目标的 `NetworkAddress` 比较；不一致则拒绝。
 
 CONNECT 一致性比较采用地址值身份：统一域名大小写，映射 IPv6 等于 IPv4，保留显式根点差异。不能用去掉根点后的路由匹配键证明 Host 一致，也不能执行 DNS 来比较两个域名是否指向同一服务器。
 
-严格检查 CONNECT 一致性是本章的产品决策；[HTTP_PROXY_SPEC.md](HTTP_PROXY_SPEC.md) 对 CONNECT Host 使用更宽松的目标优先规则，首版实现不能混用两种分支。绝对形式接受合法但冲突的 Host，也不代表接受缺失、重复或语法非法的 HTTP/1.1 Host；字段数量和语法仍然先行校验。
+严格检查 CONNECT 一致性是本模型的产品决策；[HTTP_PROXY_SPEC.md](HTTP_PROXY_SPEC.md) 对 CONNECT Host 使用更宽松的目标优先规则，首版实现不能混用两种分支。绝对形式接受合法但冲突的 Host，也不代表接受缺失、重复或语法非法的 HTTP/1.1 Host；字段数量和语法仍然先行校验。
 
-### 8. 路径、查询与出站地址
+#### 路径、查询与出站地址
 
 普通绝对形式只提取结构边界，不先解码再重新编码路径或查询。不得依赖会自动修复非法输入或改变转义文本的 URL 处理方式；复用 URL 解析能力时，必须用下列字面量向量验证其保留行为。
 
@@ -545,7 +533,7 @@ CONNECT 一致性比较采用地址值身份：统一域名大小写，映射 IP
 
 显式默认端口是 HTTP 表示信息，不属于 `NetworkAddress` 的身份；构造 HttpProtocol 时用局部解析结果保留并生成出站头，不为此扩展通用地址模型。普通 IPv6 根据规范化后的实际类型补方括号，域名根点保留。
 
-### 9. 请求体定界
+#### 请求体定界
 
 模型保存请求体的定界规则，不保存请求体字节，也不维护已经收到多少字节的计数器。
 
@@ -563,13 +551,13 @@ CONNECT 一致性比较采用地址值身份：统一域名大小写，映射 IP
 | CONNECT 非零 CL 或任何 TE | 非法请求 |
 | 请求声明 Trailer | 首版不接受 |
 
-CL 允许字段外侧合法 OWS 和十进制前导零；检查后以一个十进制整数重建出站 CL。不得先删除 TE、合并 CL 或移除 Connection 指名字段，再推断请求长度。相关消息定界原则见 [RFC 9112 §6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3)，重复 CL 全部拒绝属于本章的严格输入策略。
+CL 允许字段外侧合法 OWS 和十进制前导零；检查后以一个十进制整数重建出站 CL。不得先删除 TE、合并 CL 或移除 Connection 指名字段，再推断请求长度。相关消息定界原则见 [RFC 9112 §6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3)，重复 CL 全部拒绝属于本模型的严格输入策略。
 
 `UInt64` 只用于安全表达声明长度，不是允许分配同等内存的承诺。连接层在分配、接收或拨号之前按实际资源限额拒绝过大请求；转换为 `Int` 或累计长度时必须检查溢出。不得在模型内固定一个测试方便的最大请求体大小。
 
 连接层负责校验 `.body` / `.end` 的时序、累计长度、提前 EOF 和实际尾部字段。模型构造只看请求头，因此不能声称构造成功已经验证了后续请求体。
 
-### 10. 出站头重建
+#### 出站头重建
 
 使用 `HTTPHeaders` 保留允许转发的字段及重复项，不改变任意业务字段的值。重建顺序如下：
 
@@ -587,7 +575,7 @@ Expect、Upgrade 字段或 Connection 的 `upgrade` 标记、请求 Trailer 按�
 
 运行时需要添加 Via 或执行认证时，由连接层使用明确的运行配置完成。认证读取过滤前的原始请求头，不能从已经删除代理凭据的出站头推断身份。Via 的配置和回环策略不进入无上下文模型；添加运行时转发字段不得修改已经确定的方法、目标、Host 或请求体定界。
 
-### 11. 连接层消费契约
+#### 连接层消费契约
 
 连接层收到 `.head` 时构造模型并保存结果；不能在 `.end` 时再次从原始字符串重新计算业务目标。不同事件的职责如下：
 
@@ -606,7 +594,7 @@ CONNECT 必须等到请求结束、解码器余量检查完成、业务连接及
 
 普通请求通过 NIO 编码能力得到请求字节，再进入直连通道或相同 Wire 的隧道载荷路径。不得继续由模型或 `buildPayload` 拼接一份完整 `Data` 请求；具体编码器与 Wire 的处理管线接法须在连接迁移中验证，不能因改用类型化请求头丢掉已有手动读取、写入完成和关闭顺序约束。
 
-### 12. 本地响应与错误路径
+#### 本地响应与错误路径
 
 `HttpProtocol` 不再定义 `established`、`badRequest`、`badGateway`、`gatewayTimeout` 等静态 `Data`。HTTP 连接层使用 `HTTPResponseHead` / 编码器生成本地响应，并持有“一次响应”的状态约束。
 
@@ -627,7 +615,7 @@ CONNECT 成功响应不含 Content-Length、Transfer-Encoding 或 HTTP 响应体
 
 两个连接类型需要共用响应编码时，先在现有 HTTP 连接类型中评估共享方法；不把重复字节常量移成另一个没有独立职责的文件，也不放回请求语义模型。
 
-### 13. 具体输入与输出
+#### 具体输入与输出
 
 以下示例描述构造的语义结果，不代表已运行新实现。
 
@@ -667,21 +655,7 @@ Connection: close
 
 四个请求体字节 `data` 由连接层单独保管和发送，不存入模型。代理认证如果启用，在连接层中使用原始代理凭据；示例不是认证成功的声明。运行时的 Via 等字段由连接层按配置追加。
 
-### 14. 迁移范围
-
-1. 在现有 `Sources/Model/HttpProtocol.swift` 实现唯一的 NIO 请求头构造入口、关联值请求枚举和必要的私有解析方法。
-2. `HttpConnectConnection` 移除版本字符串转换、手工元组形式的请求头字段、`checkConnect()` 和独立的主机与端口部分校验链。
-3. `HttpForwardConnection` 的目标提取、Host/CL 校验和请求头改写合并到本模型；请求体缓冲与状态机留在连接中。
-4. 去掉整包 `buildRequest(head:body:)` / `buildPayload` 式模型入口，改为消费类型化请求头和独立请求体。
-5. 响应常量迁出模型，按连接状态使用编码器发送本地响应。
-6. 核对 `ProxyProbe` 与模型范围一致；探测只选择协议，不能替代模型对方法和目标形式的完整检查。
-7. 更新原有模型断言与连接回归；CONNECT CL=0、Host 省略端口、错误状态码和 OPTIONS 限制等行为变化必须写成明确用例。
-
-`HttpProtocol` 继续为包内 API，不因重构而公开给应用。嵌套类型及小型私有方法留在原文件，不引入上下文隔离类型、路由器、泛型请求框架或测试专用解析器。
-
-### 15. 验收标准
-
-模型纯逻辑验收和真实连接流程验收分开记录。以下均为新设计的待实现项：
+#### 验收场景
 
 | 编号 | 场景 | 必须验证的结果 |
 |---|---|---|
@@ -692,7 +666,7 @@ Connection: close
 | HP-05 | CONNECT Host 省略端口、大小写、IPv4 映射 IPv6、不同端口或根点 | 相等情况通过；端口和根点身份不一致拒绝 |
 | HP-06 | 方括号 IPv6、IPv4 映射 IPv6、括号内域名/IPv4、作用域 | IPv6 字面量先验证，映射地址转为 IPv4 后仍接受，其余非法向量拒绝 |
 | HP-07 | CONNECT 缺端口、空端口、0、65536、符号；普通 URI 默认/显式 80 | 端口语义精确，显式默认端口在出站 Host 保留 |
-| HP-08 | 空路径、空查询、转义大小写、重复斜线、点路径 | 第 8 节所有字面期望保持；不解码重编码 |
+| HP-08 | 空路径、空查询、转义大小写、重复斜线、点路径 | [路径、查询与出站地址](#路径查询与出站地址)所有字面期望保持；不解码重编码 |
 | HP-09 | URI 片段、反斜线、空白、非法转义、用户信息 | 拒绝；合法 `%0D%0A` 仍是原字面转义 |
 | HP-10 | 无 CL、CL=0、CL=0004 | 分别为 none、fixedLength(0)、fixedLength(4)，出站长度规范化 |
 | HP-11 | 重复 CL、逗号 CL、CL 溢出、TE+CL | 在出站前失败，网络报文与直接请求头入口均覆盖 |
@@ -714,22 +688,9 @@ Connection: close
 
 字节级解析和防注入向量必须经过真实 NIO 解码器，不能只使用手工构造的请求头代替。模型用例也要覆盖手工请求头，证明构造入口自身的契约。连接测试继续覆盖背压、半关闭、超时、清理和真实编码顺序。
 
-实现后至少执行项目规定的构建、启用完整严格并发检查的构建、ConnectionTests、全包测试及修改文件的严格格式检查和 `git diff --check`；增加对应的模型定向测试。文档单独变更只做结构、链接与不变量检查，不宣称上述实现验收已经完成。
+### ProxyNode
 
-### 16. 相关文件与证据
-
-- [当前 HttpProtocol 实现](../Sources/Model/HttpProtocol.swift)
-- [当前 HTTP CONNECT 连接](../Sources/Connection/HttpConnectConnection.swift)
-- [当前 HTTP 普通转发连接](../Sources/Connection/HttpForwardConnection.swift)
-- [当前 CONNECT 测试](../Tests/Connection/HttpConnectConnectionTests.swift)
-- [当前普通转发测试](../Tests/Connection/HttpForwardConnectionTests.swift)
-- [HTTP 完整代理目标规范](HTTP_PROXY_SPEC.md)
-
-当前源码和测试是迁移调用链的依据，不能证明新模型已经实现。构造、头部字段、分帧和语义分支应按本章重新验收；完整 HTTP 产品能力仍需逐项对照原 HTTP 规范。
-
-## ProxyNode
-
-### 1. 定位与职责
+#### 定位与职责
 
 `ProxyNode` 是一个不可变的、已经通过本地配置校验的出站代理节点值。它描述如何连接代理服务器及采用哪个节点协议，不表示业务目标，也不保存已经建立的连接。
 
@@ -737,22 +698,22 @@ Connection: close
 
 构造成功表示配置在本地可执行，不保证服务器可达、密码正确或远端实现支持选定算法。构造不访问 DNS，不建立 Channel，不生成连接盐值，也不预先创建 Wire。
 
-本章的关联枚举为 `ProxyNodeType` 和 `ProxyCipher`，均在本章节内定义契约。文档归属不要求把现有枚举源码文件自动合并，也不因重设计而增加新的配置包装文件。
+#### 类型与构造入口
 
-### 2. 类型与构造入口
-
-首版继续表达当前有实际 Wire 支持的 Shadowsocks 节点。字段全部只读，初始化改为抛错，超时改为具有明确单位的整数毫秒。
-
-以下是接口草图，方法实现省略：
+`ProxyNode` 表达当前有实际 Wire 支持的 Shadowsocks 节点。字段全部只读，初始化器可抛错，超时使用具有明确单位的整数毫秒。
 
 ```swift
-public struct ProxyNode: Identifiable, Sendable, Hashable {
+public struct ProxyNode: Identifiable, Sendable, CustomStringConvertible {
     public let id: UUID
     public let type: ProxyNodeType
     public let address: SocketAddress
     public let cipher: ProxyCipher
     public let password: String
     public let timeoutMilliseconds: Int64
+
+    public var description: String {
+        // 仅输出节点 UUID，避免默认模型描述包含密码。
+    }
 
     public init(
         id: UUID = UUID(),
@@ -764,14 +725,6 @@ public struct ProxyNode: Identifiable, Sendable, Hashable {
     ) throws {
         // 在保存字段之前校验端点、密码和超时。
     }
-
-    public static func == (lhs: Self, rhs: Self) -> Bool {
-        // 按第 6 节比较全部配置；密码采用 UTF-8 字节语义。
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        // 使用与相等性完全相同的字段和字节语义。
-    }
 }
 ```
 
@@ -779,7 +732,7 @@ public struct ProxyNode: Identifiable, Sendable, Hashable {
 
 首版只有一种节点协议，`cipher`、`password` 都是该协议的必需字段，不引入可空字段。以后增加不使用这些字段的协议时，应设计带关联配置的协议枚举，再一起迁移构造入口；不能先添加协议名、再依靠大量默认值凑出不完整节点。
 
-### 3. ProxyNodeType
+#### ProxyNodeType
 
 `ProxyNodeType` 是节点协议标识，不是 Wire 实例、网络能力探测结果或默认路由决策。
 
@@ -793,7 +746,7 @@ public enum ProxyNodeType: String, Codable, Sendable, Hashable, CaseIterable {
 
 原始值是明确的导入标识，大小写和拼写精确匹配。未知协议必须报错，不能自动替换为 Shadowsocks。`allCases` 不构成当前网络环境一定能够使用这些协议的证明。
 
-### 4. ProxyCipher
+#### ProxyCipher
 
 `ProxyCipher` 标识 Shadowsocks Wire 支持的加密算法及其固定参数；密码不是主密钥，`keySize` 也不是密码字符数或 UTF-8 字节数限制。
 
@@ -819,7 +772,7 @@ public enum ProxyCipher: String, Codable, Sendable, Hashable, CaseIterable {
 
 枚举不执行密码派生、不生成随机数、不维护一次性数值。实际密钥长度、一次性数值长度和加密帧检查仍属于加密实现 / Wire 边界，不能因节点构造成功而删除。
 
-### 5. 端点、密码和超时不变量
+#### 端点、密码和超时不变量
 
 | 字段 | 构造成功后的契约 |
 |---|---|
@@ -831,19 +784,17 @@ public enum ProxyCipher: String, Codable, Sendable, Hashable, CaseIterable {
 
 节点地址必须继续保存实际地址族和 IPv6 作用域。不得为了复用业务地址规范化而转成 `NetworkAddress` 后覆盖真实节点端点，也不能去掉作用域。IP 是否可达、是否自回环及是否被运行时访问策略允许，由应用和 Core 的对应策略判断，不通过一次模型构造来宣称已经验证。
 
-密码不去除首尾空白、不做 Unicode 规范化、不按 cipher 的 keySize 截断或补齐；仅包含空格的非空密码也按原字节处理。空密码在本章作为配置错误拒绝，这是本产品的输入策略。错误消息和模型描述不包含密码或派生密钥；真实配置不写入文档或测试。
+密码不去除首尾空白、不做 Unicode 规范化、不按 cipher 的 keySize 截断或补齐；仅包含空格的非空密码也按原字节处理。本规范将空密码作为节点配置错误拒绝。错误消息和模型描述不包含密码或派生密钥；真实配置不写入文档或测试。
 
 超时上限来自 `Int64.max / 1_000_000`。当前 NIO `TimeAmount.milliseconds` 对超范围转换采用饱和值，本模型选择提前拒绝，避免保存的超时与实际传入的时长不一致。TCP / UDP Wire 直接消费已验证的毫秒值，不再分别执行浮点秒乘 1000、取整和范围判断。
 
 该超时表示连接节点时使用的期限参数，不是 DNS 超时、HTTP 请求总期限、隧道空闲超时或 UDP 响应期限的统称。UDP Wire 暴露同一配置值，也不代表无连接 UDP 具备与 TCP 相同的握手计时行为。
 
-### 6. 标识、相等性与集合约束
+#### 标识与集合约束
 
-`Identifiable.id` 表示节点身份；整个 `ProxyNode` 的 `==` 表示配置是否完全相同。两个值使用同一个 UUID 但地址、算法、密码或超时不同，应当不相等。
+`id` 表示节点身份。Core 使用 `[UUID: ProxyNode]` 按 UUID 查找和替换配置，使用 `[SocketAddress: UUID]` 检查重复端点；这两条业务路径只要求 UUID 和 SocketAddress 可哈希。
 
-`Hashable` 与相等性共同覆盖 UUID、协议、NIO SocketAddress 的端点语义、算法、密码 UTF-8 字节和超时。密码必须按字节比较和哈希，不能直接依赖 Swift String 的规范等价比较：`"\u{00E9}"` 与 `"e\u{0301}"` 的 String 可以相等，但密码派生所用 UTF-8 字节不同。
-
-不使用 `hashValue` 作为持久化节点 ID、秘密的摘要或稳定配置指纹。
+当前没有把整个节点作为集合键或比较完整配置的业务调用，因此 `ProxyNode` 不要求 `Hashable` 或 `Equatable`，也不定义自定义 `==`、`hash(into:)` 或密码比较方法。密码原字节保留仍按[端点、密码和超时不变量](#端点密码和超时不变量)执行，供 Wire 派生密钥。
 
 节点集合约束仍由 Core 管理，不能放进不持有全表的单个节点构造器：
 
@@ -853,30 +804,21 @@ public enum ProxyCipher: String, Codable, Sendable, Hashable, CaseIterable {
 - 比较实际节点端点沿用 SocketAddress 身份，不用业务请求的 IPv4 映射 IPv6 归一结果作为原始套接字的替代物。
 - 批量加载按顺序处理，不因模型重构而宣称增加事务回滚、端点互换重排或公共热更新能力。
 
-### 7. 生命周期、引用与持久化
+#### 生命周期、引用与持久化
 
 `ProxyNode` 不持有 TCP 加密流状态。每条代理 TCP 连接由 Core 创建独立 Wire，盐值 / 一次性数值 / 启动状态不能因节点 UUID 相同而复用；UDP 仍遵循 Wire 自己的独立数据报加密规则。
 
 默认 `.proxy(UUID)` 在完整节点表装载之后校验；缺失则 Core 初始化失败。规则中的节点引用继续在实际选中该规则时检查，缺失抛出原始 `proxyNodeNotFound`，不回退 DIRECT。这些是配置集合和路由边界的契约，不是节点模型自身的存在性校验。
 
-`restart` 为下一运行周期创建新的 Core；本章不引入跨运行周期共享 Wire、节点单例或额外配置快照。
+`restart` 为下一运行周期创建新的 Core；本模型不引入跨运行周期共享 Wire、节点单例或额外配置快照。
 
 首版不为整个 `ProxyNode` 增加自动 Codable。协议/算法的原始值可以独立编码；应用存储负责 UUID、原始节点主机名、端口、凭据及超时字段，并在构造运行配置前解析出 `SocketAddress`。不能把含作用域的实际端点仅序列化为普通 IP 字节而丢失作用域。
 
-### 8. 错误与迁移
+#### 错误语义
 
 本地节点配置违反上述不变量时，构造入口抛出 `MagentError.invalidPolicy`。错误说明可以标明字段或原因，不能包含密码。DNS、密码派生和加密实现 / Wire 的原始错误分别在其实际执行边界传播，不在节点辅助方法内包装成另一种错误。
 
-本次设计相对于当前实现的变化是：
-
-1. `ProxyNode.init` 改为抛错，提前验证端点、非空密码和超时。
-2. `timeout: TimeInterval` 改为 `timeoutMilliseconds: Int64`，默认值从 30 秒明确为 30_000 毫秒。
-3. TCP / UDP Wire 删除重复的秒到毫秒转换，继续保留真正的加密初始化和运行错误处理。
-4. 对包含密码的配置相等性和哈希实施字节语义。
-
-历史秒值转换由应用迁移负责：拒绝非有限数及非正数；乘以 1000 后向上取整，再检查第 5 节上限并精确转为 Int64。这样延续当前 Wire 的毫秒取整规则，不能把原来的 `30` 直接解释为 30 毫秒。应用中的节点导入和存储转换必须显式处理构造失败，不能继续以 `compactMap` 静默丢掉坏配置后宣称完整加载成功。
-
-### 9. 验收标准
+#### 验收场景
 
 | 编号 | 场景 | 必须验证的结果 |
 |---|---|---|
@@ -886,42 +828,25 @@ public enum ProxyCipher: String, Codable, Sendable, Hashable, CaseIterable {
 | PN-04 | 超时 0、负数、1、30_000、上限及上限加 1 | 边界精确，无饱和或截断 |
 | PN-05 | 旧配置 30 秒、正的小数秒、NaN、无穷大 | 正常转换与向上取整明确，非有限或溢出值拒绝 |
 | PN-06 | 空密码、空格密码、Unicode 密码 | 空密码拒绝；其余原 UTF-8 字节不变 |
-| PN-07 | 同 UUID 不同字段、规范等价但字节不同的密码 | 配置不相等；Set 不错误合并 |
-| PN-08 | 四个 ProxyCipher | 每个尺寸均断言第 4 节的字面量，原始值精确往返 |
-| PN-09 | 未知协议和算法原始值 | 导入失败，无默认回退 |
-| PN-10 | 重复 UUID、不同 UUID 重复端点、同 UUID 换端点 | Core 集合行为和反向映射正确 |
-| PN-11 | 默认节点缺失与规则节点缺失 | 前者在全表装载后失败，后者在命中时失败；均不降级 DIRECT |
-| PN-12 | 两条 TCP 连接及多个 UDP 数据报 | Wire 状态按真实生命周期隔离 |
-| PN-13 | 仅构造或比较节点 | 不执行 DNS、密码派生、加密初始化或网络 I/O |
-| PN-14 | 非法配置错误及诊断 | 包含可定位字段，绝不包含密码或派生密钥 |
+| PN-07 | 四个 ProxyCipher | 每个尺寸均断言[ProxyCipher](#proxycipher)的字面量，原始值精确往返 |
+| PN-08 | 未知协议和算法原始值 | 导入失败，无默认回退 |
+| PN-09 | 重复 UUID、不同 UUID 重复端点、同 UUID 换端点 | Core 集合行为和反向映射正确 |
+| PN-10 | 默认节点缺失与规则节点缺失 | 前者在全表装载后失败，后者在命中时失败；均不降级 DIRECT |
+| PN-11 | 两条 TCP 连接及多个 UDP 数据报 | Wire 状态按真实生命周期隔离 |
+| PN-12 | 仅构造节点 | 不执行 DNS、密码派生、加密初始化或网络 I/O |
+| PN-13 | 非法配置错误及诊断 | 包含可定位字段，绝不包含密码或派生密钥 |
 
-这些为待实现验收项。现有 `ProxyNodeTests` 主要证明加密算法参数，不代表新增的节点构造和集合契约已经全部验收。
+### ProxyRule
 
-### 10. 相关文件
-
-- [当前 ProxyNode / ProxyNodeType](../Sources/Model/ProxyNode.swift)
-- [当前 ProxyCipher](../Sources/Model/ProxyCipher.swift)
-- [当前节点及加密算法测试](../Tests/Model/ProxyNodeTests.swift)
-- [当前 Core 与节点集合](../Sources/Core/MagentCore.swift)
-- [当前 Core 测试](../Tests/Core/MagentCoreTests.swift)
-- [当前 TCP Wire](../Sources/Wire/Shadowsocks/ShadowsocksTCPWire.swift)
-- [当前 UDP Wire](../Sources/Wire/Shadowsocks/ShadowsocksUDPWire.swift)
-
-## ProxyRule
-
-### 1. 定位与职责
+#### 定位与职责
 
 `ProxyRule` 是一个不可变的、已经校验并规范化的单条路由规则，表达 **匹配条件、命中动作和显式优先级**。它不持有节点表，不执行路由遍历，不创建 Wire，也不解析 DNS。
 
 模型负责把输入文本转换成可直接使用的匹配值，尤其是已经清零主机位的 CIDR 字节和前缀。Core 负责规则集合的去重、索引、优先级比较、默认决策和节点查找。
 
-本章的关联枚举为 `MatchType`、`Decision`，以及模型内部保存有效结果的 `ProxyRule.Match`。它们放在本模型描述内，不作为独立模型章节。
-
-### 2. 类型与构造入口
+#### 类型与构造入口
 
 保留方便配置导入的 `matchType` / `matchValue` 构造参数；内部只保存一个经过校验的关联值枚举。公开的类型和文本视图由这个存储计算，不同时维护可以不一致的两份数据。
-
-以下是接口草图，方法实现省略：
 
 ```swift
 public struct ProxyRule: Sendable, Hashable {
@@ -959,9 +884,9 @@ public struct ProxyRule: Sendable, Hashable {
 
 不提供接受任意 `Match` 的直接构造入口。Core 消费已经解析的匹配值，不再把 `matchValue` 重新解析成另一份 NetworkCIDR。
 
-### 3. MatchType
+#### MatchType
 
-`MatchType` 表示配置中的匹配类别。新设计只暴露当前地址路由实际支持的四种类别：
+`MatchType` 表示配置中的匹配类别，只暴露当前地址路由实际支持的四种类别：
 
 ```swift
 public enum MatchType: String, Codable, Sendable, Hashable, CaseIterable {
@@ -978,7 +903,7 @@ public enum MatchType: String, Codable, Sendable, Hashable, CaseIterable {
 
 以后若支持 URL、端口或来源匹配，必须先明确输入和协议可见性，再扩展规则与缓存键。不能仅添加枚举名称就宣称路由已支持。
 
-### 4. Decision
+#### Decision
 
 `Decision` 是路由结果值，既用于 `ProxyRule.decision`，也用于 `MagentConfig.defaultDecision`。因此仍为包的顶层公共枚举；写在本模型章节不意味着改成只能通过 ProxyRule 引用的嵌套类型。
 
@@ -997,7 +922,7 @@ public enum Decision: Sendable, Hashable {
 
 `Hashable` 使用枚举分支和 UUID，不能把节点当前配置或 Wire 实例放入决策值。首版不为关联值枚举增加自动 Codable；应用持久化若使用 `direct` / `proxy` 文本和节点关联，必须显式组合并校验，不能依赖 Swift 自动合成的序列化布局。
 
-### 5. 域名精确规则与后缀规则
+#### 域名精确规则与后缀规则
 
 这两种规则使用与 NetworkAddress 相同的 ASCII 标签结构约束：小写、每标签 `1...63` 字节、非空标签、总长上限 253 字节，允许输入单个末尾根点，保存时去掉该根点。
 
@@ -1018,7 +943,7 @@ exactDomain 若是 NetworkAddress 会识别为 IP 或拒绝的纯数值歧义表
 
 目标域名的匹配视图由 Core 去掉一个根点，目标自身仍保留根点供解析和 Wire 转发；规则构造不能修改目标对象。
 
-### 6. 域名关键字规则
+#### 域名关键字规则
 
 `domainKeyword` 是对规范化域名匹配名称的 ASCII 字面子串匹配，不是完整主机名、通配模式或正则表达式。
 
@@ -1030,7 +955,7 @@ exactDomain 若是 NetworkAddress 会识别为 IP 或拒绝的纯数值歧义表
 
 例如关键字 `api` 可以匹配 `api.example.com` 和 `myapiv2.example.com`；关键字 `api.` 可以匹配前者而不匹配后者。此匹配不具有 domainSuffix 的标签边界保证，应用需要标签边界时应选择后缀规则。
 
-### 7. CIDR 规则
+#### CIDR 规则
 
 CIDR 构造仅接受严格数值 IP 和可选的一个 `/prefix`，不访问 DNS。省略前缀时 IPv4 使用 `/32`，IPv6 使用 `/128`；显式前缀只接受非空十进制数字，禁止符号、内部空白、额外斜线和越界值。前缀的十进制前导零可接受，输出时去掉。
 
@@ -1047,13 +972,13 @@ CIDR 构造仅接受严格数值 IP 和可选的一个 `/prefix`，不访问 DNS
 | `::ffff:192.0.2.129/96` | `0.0.0.0/0` |
 | `::ffff:192.0.2.129` | `192.0.2.129/32` |
 
-原地址是 IPv4 映射 IPv6 时，仅接受 `/96.../128`，转换为 IPv4 后将前缀减 96。对映射地址字面量指定小于 96 的前缀会跨出映射区间，本章明确拒绝，不能简单减法、截断或悄悄把整个范围当作 IPv4。
+原地址是 IPv4 映射 IPv6 时，仅接受 `/96.../128`，转换为 IPv4 后将前缀减 96。对映射地址字面量指定小于 96 的前缀会跨出映射区间，本模型明确拒绝，不能简单减法、截断或悄悄把整个范围当作 IPv4。
 
 原生 IPv6 范围保留 IPv6。规则匹配按规范化后的地址族区分：IPv4 目标只匹配 IPv4 CIDR，原生 IPv6 目标只匹配 IPv6 CIDR；`::/0` 不因为包含某些映射字节表示就匹配已经归为 IPv4 的目标。
 
 网络存储在构造时清零所有主机位，保存 `[UInt8]` 与前缀。Core 做集合索引和包含判断时直接读取这些值，不重复解析文本、重复清零主机位或建立另一份等价的 NetworkCIDR 包装。
 
-### 8. order、匹配身份与相等性
+#### order、匹配身份与相等性
 
 `order` 是显式优先级，数值越小越优先。允许完整 Int 范围，包括负数；比较时使用关系运算，不以相减方式判断先后，避免 Int.min / Int.max 溢出。
 
@@ -1066,7 +991,7 @@ CIDR 构造仅接受严格数值 IP 和可选的一个 `/prefix`，不访问 DNS
 
 应用自己的数据库主键、策略关联和 UI 行标识继续由应用管理，不进入包内路由规则。
 
-### 9. Core 的选择顺序
+#### Core 的选择顺序
 
 Core 对所有实际命中的候选规则按同一顺序选择：
 
@@ -1089,32 +1014,21 @@ Core 对所有实际命中的候选规则按同一顺序选择：
 
 规则不读取端口，因此首版路由缓存键可以忽略端口。未来增加端口或其他匹配维度时，必须同步升级键，不能只修改规则枚举。缓存保存 Decision，不保存某条 TCP Wire 的加密状态。
 
-### 10. 错误、导入和迁移
+#### 错误与导入
 
-规则结构或匹配文本不符合本章时，由规则构造入口抛出 `MagentError.invalidPolicy`。不要先捕获地址辅助方法的错误再重命名；共享纯语法检查应提供合适的内部解析结果，由实际拥有规则输入的边界产生自己的错误。
+规则结构或匹配文本不符合上述契约时，由规则构造入口抛出 `MagentError.invalidPolicy`。不要先捕获地址辅助方法的错误再重命名；共享纯语法检查应提供合适的内部解析结果，由实际拥有规则输入的边界产生自己的错误。
 
 构造时不检查节点存在性，不执行 DNS，不创建正则对象或 Wire。关联的 ProxyNode、实际目标、运行时路由错误在对应职责边界原样传播。
 
-首版不为整个 ProxyRule 增加自动 Codable。应用导入显式解析 MatchType、Decision、order 和匹配文本，再调用唯一构造入口；无效原始值、PROXY 动作缺少必填 UUID 和不支持的 URL-REGEX 必须报告，不能静默忽略。合法 UUID 对应的节点是否存在，仍按第 4 节在 Core 的对应边界检查。若将来需要模型 Codable，解码必须回到同一验证入口，不依赖自动合成内部 Match 的格式。
+首版不为整个 ProxyRule 增加自动 Codable。应用导入显式解析 MatchType、Decision、order 和匹配文本，再调用唯一构造入口；无效原始值、PROXY 动作缺少必填 UUID 和不支持的 URL-REGEX 必须报告，不能静默忽略。合法 UUID 对应的节点是否存在，仍按[Decision](#decision)在 Core 的对应边界检查。若将来需要模型 Codable，解码必须回到同一验证入口，不依赖自动合成内部 Match 的格式。
 
-相对于当前实现，迁移包括：
-
-1. 将字符串匹配字段改为规范化 Match 存储，保留只读的 matchType / matchValue 视图。
-2. 将 CIDR 的解析、主机位清零和规范化身份收归规则模型；Core 保留匹配和索引。
-3. 移除 MatchType.urlRegex 及 Core 对该“已构造但不可执行规则”的延迟拒绝路径。
-4. 统一域名规则的严格输入策略，不再通过去除首尾空白或任意首尾点修复非法值。
-5. Core 用明确的具体性比较代替跨类别魔法分数，并保留既定的 order、覆盖和稳定决胜顺序。
-6. 更新应用导入、持久化转换和测试；旧规则的失效不能通过少装几条规则掩盖。
-
-先前的 NetworkAddress / HttpProtocol 章节继续适用。本章不要求把关联枚举改成嵌套公共 API，也不默认合并其现有文件。
-
-### 11. 验收标准
+#### 验收场景
 
 | 编号 | 场景 | 必须验证的结果 |
 |---|---|---|
 | PR-01 | 四个 MatchType 与原始值 | 精确导入和往返，未知类型及 URL-REGEX 明确失败 |
 | PR-02 | 域名大小写、单根点、空白、前导点和多根点 | 大小写/单根点规范化；非法修复式输入拒绝 |
-| PR-03 | 精确匹配与后缀匹配的边界 | 第 5 节匹配/不匹配向量精确成立 |
+| PR-03 | 精确匹配与后缀匹配的边界 | [域名精确规则与后缀规则](#域名精确规则与后缀规则)匹配/不匹配向量精确成立 |
 | PR-04 | 精确匹配数值文本、后缀匹配数字标签、数值目标 | 精确匹配伪 IP 规则拒绝，合法标签后缀可用，IP 不走域名分支 |
 | PR-05 | 关键字 api、api.、空值、非法字符及 253/254 长度 | 子串语义明确，不套用完整域名标签检查 |
 | PR-06 | IPv4 / IPv6 /0、主机前缀和缺省前缀 | 精确清零主机位，格式和存储一致 |
@@ -1123,7 +1037,7 @@ Core 对所有实际命中的候选规则按同一顺序选择：
 | PR-09 | 等价 CIDR、域名变体、不同 Decision / order | 覆盖键与完整规则相等性各自正确 |
 | PR-10 | 重复规则的最后配置与输入位置 | 使用最后值及其位置，不能保留第一次的决胜位置 |
 | PR-11 | 不同 order 的精确匹配、后缀匹配、关键字匹配 | order 优先，不能按索引命中顺序提前返回 |
-| PR-12 | 同 order 的类型、后缀深度、关键字长度、CIDR 长度 | 精确执行第 9 节比较，不依赖字典顺序 |
+| PR-12 | 同 order 的类型、后缀深度、关键字长度、CIDR 长度 | 精确执行[Core 的选择顺序](#core-的选择顺序)比较，不依赖字典顺序 |
 | PR-13 | Int.min / Int.max 以及同优先级同具体性 | 无比较溢出，稳定采用较早保留位置 |
 | PR-14 | 无规则、无匹配、命中缺失节点 | 前两者使用默认决策；后者失败，不回退直连 |
 | PR-15 | 相同主机名不同端口、域名根点、映射数值目标 | 与 NetworkAddress 及路由缓存语义一致 |
@@ -1131,16 +1045,106 @@ Core 对所有实际命中的候选规则按同一顺序选择：
 | PR-17 | Core 消费规则 | 直接使用解析结果，不再次解析 CIDR 或丢弃模型验证结果 |
 | PR-18 | 单纯规则构造、导入和比较 | 无 DNS、节点查找、网络 I/O、Wire 创建或正则编译 |
 
-单个模型验收使用字面量期望的字符串、网络字节、前缀、动作和优先级；集合用例必须通过 Core 的真实选择路径验证。手工检查排序不变量不能代替未来的 Core 回归测试。
+集合用例必须通过 Core 的真实选择路径验证。手工检查排序不变量不能代替 Core 回归测试。
 
-### 12. 相关文件与验证边界
+## 实现与调用方迁移
 
-- [当前 ProxyRule](../Sources/Model/ProxyRule.swift)
-- [当前 MatchType](../Sources/Model/MatchType.swift)
-- [当前 Decision](../Sources/Model/Decision.swift)
-- [当前 Core 与路由器](../Sources/Core/MagentCore.swift)
-- [当前 Core 测试](../Tests/Core/MagentCoreTests.swift)
+模型、消费方和测试按同一契约迁移。模型重写可以独立进行，但不代表协议解析、DNS 策略、监听配置或应用集成已经完成；不得恢复旧模型 API 来掩盖尚未迁移的调用。以下要求共同组成迁移范围，验证方式统一见[验收与验证](#验收与验证)。
 
-本章定义模型的目标功能与约束；源码是否满足这些要求，需要按本章验收场景独立验证。
+### 地址表示与协议边界
 
-实现两个模型后，应完成节点与加密算法、规则与 Core 的定向验收，并按项目规定执行构建、启用完整严格并发检查的构建、ConnectionTests、全包测试及实际修改 Swift 文件的严格格式检查和 `git diff --check`。应用节点导入、秒到毫秒迁移和规则持久化转换需要独立验证；文档阶段只检查结构、链接、示例不变量和修改范围。
+在现有 `Sources/Model/NetworkAddress.swift` 中替换地址表示。移除手写 IP 字节解析器和格式化器、历史构造路径、补救式规范化及模型持有的 DNS 客户端或缓存。私有辅助方法仅保留 `parseIPv4Text`、`parseIPv6Text`，域名校验直接写在 `init` 中。域名显式转换直接委托 NIO 系统解析。不保留兼容路径，也不增加独立校验器、规范化器、工厂、转发包装或测试专用层。
+
+调用方迁移统一采用文本构造入口：HTTP 直接传入拆分的主机名和端口，二进制协议字段由所属解析器借助 NIO 转成数值文本。IP 直连读取 `try target.socketAddress`，域名直连由连接流程异步解析；代理路径保留逻辑目标。移除旧的套接字到逻辑地址包装调用，实际端点比较和回复编码回到连接及协议层，并在所属边界处理 NIO 地址错误。监听配置和示例在各自变更中验证。
+
+### HTTP 请求与连接
+
+1. 在现有 `Sources/Model/HttpProtocol.swift` 实现唯一的 NIO 请求头构造入口、关联值请求枚举和必要的私有解析方法。
+2. `HttpConnectConnection` 移除版本字符串转换、手工元组形式的请求头字段、`checkConnect()` 和独立的主机与端口部分校验链。
+3. `HttpForwardConnection` 的目标提取、Host/CL 校验和请求头改写合并到 `HttpProtocol`；请求体缓冲与状态机留在连接中。
+4. 去掉整包 `buildRequest(head:body:)` / `buildPayload` 式模型入口，改为消费类型化请求头和独立请求体。
+5. 响应常量迁出模型，按连接状态使用编码器发送本地响应。
+6. 核对 `ProxyProbe` 与模型范围一致；探测只选择协议，不能替代模型对方法和目标形式的完整检查。
+7. 更新原有模型断言与连接回归；CONNECT CL=0、Host 省略端口、错误状态码和 OPTIONS 限制等行为变化必须写成明确用例。
+
+`HttpProtocol` 继续为包内 API，不因重构而公开给应用。嵌套类型及小型私有方法留在原文件，不引入上下文隔离类型、路由器、泛型请求框架或测试专用解析器。
+
+### 节点配置与超时单位
+
+1. `ProxyNode.init` 改为抛错，提前验证端点、非空密码和超时。
+2. `timeout: TimeInterval` 改为 `timeoutMilliseconds: Int64`，默认值从 30 秒明确为 30_000 毫秒。
+3. TCP / UDP Wire 删除重复的秒到毫秒转换，继续保留真正的加密初始化和运行错误处理。
+4. 移除 `ProxyNode` 没有业务用途的 `Hashable` 符合性，不新增整值比较或哈希实现。
+
+历史秒值转换由应用迁移负责：拒绝非有限数及非正数；乘以 1000 后向上取整，再检查[端点、密码和超时不变量](#端点密码和超时不变量)上限并精确转为 Int64。这样延续当前 Wire 的毫秒取整规则，不能把原来的 `30` 直接解释为 30 毫秒。应用中的节点导入和存储转换必须显式处理构造失败，不能继续以 `compactMap` 静默丢掉坏配置后宣称完整加载成功。
+
+### 规则存储与 Core 消费
+
+1. 将字符串匹配字段改为规范化 Match 存储，保留只读的 matchType / matchValue 视图。
+2. 将 CIDR 的解析、主机位清零和规范化身份收归规则模型；Core 保留匹配和索引。
+3. 移除 MatchType.urlRegex 及 Core 对该“已构造但不可执行规则”的延迟拒绝路径。
+4. 统一域名规则的严格输入策略，不再通过去除首尾空白或任意首尾点修复非法值。
+5. Core 用明确的具体性比较代替跨类别魔法分数，并保留既定的 order、覆盖和稳定决胜顺序。
+6. 更新应用导入、持久化转换和测试；旧规则的失效不能通过少装几条规则掩盖。
+
+## 源码与测试索引
+
+下表统一定位实现和验收入口。源码与已有用例用于核对调用链，不构成符合本规范的证明；各路径仍须按对应验收场景检查。
+
+| 范围 | 生产源码 | 验收入口 |
+|---|---|---|
+| 地址模型 | [NetworkAddress](../Sources/Model/NetworkAddress.swift) | [NetworkAddressTests](../Tests/Model/NetworkAddressTests.swift) |
+| HTTP 请求模型 | [HttpProtocol](../Sources/Model/HttpProtocol.swift) | [HttpProtocolTests](../Tests/Model/HttpProtocolTests.swift) |
+| 节点及关联枚举 | [ProxyNode / ProxyNodeType](../Sources/Model/ProxyNode.swift)、[ProxyCipher](../Sources/Model/ProxyCipher.swift) | [ProxyNodeTests](../Tests/Model/ProxyNodeTests.swift) |
+| 规则及关联枚举 | [ProxyRule](../Sources/Model/ProxyRule.swift)、[MatchType](../Sources/Model/MatchType.swift)、[Decision](../Sources/Model/Decision.swift) | [ProxyRuleTests](../Tests/Model/ProxyRuleTests.swift) |
+| 节点集合与规则消费 | [MagentCore](../Sources/Core/MagentCore.swift) | [MagentCoreTests](../Tests/Core/MagentCoreTests.swift) |
+| HTTP 连接消费 | [HttpConnectConnection](../Sources/Connection/HttpConnectConnection.swift)、[HttpForwardConnection](../Sources/Connection/HttpForwardConnection.swift) | [HttpConnectConnectionTests](../Tests/Connection/HttpConnectConnectionTests.swift)、[HttpForwardConnectionTests](../Tests/Connection/HttpForwardConnectionTests.swift) |
+| 节点配置与加密状态消费 | [ShadowsocksTCPWire](../Sources/Wire/Shadowsocks/ShadowsocksTCPWire.swift)、[ShadowsocksUDPWire](../Sources/Wire/Shadowsocks/ShadowsocksUDPWire.swift) | [WireTests](../Tests/Wire/WireTests.swift)、[ShadowsocksTCPWireTests](../Tests/Wire/Shadowsocks/ShadowsocksTCPWireTests.swift)、[ShadowsocksUDPWireTests](../Tests/Wire/Shadowsocks/ShadowsocksUDPWireTests.swift) |
+
+## 验收与验证
+
+本节是全文统一的最终约束，适用于所有模型及其调用方迁移。各模型的 NA、HP、PN、PR 验收场景与本节共同构成完成条件；任何模型章节都不单独维护另一套构建或验收流程。
+
+### 验收层次与断言
+
+模型测试使用固定输入和字面量期望值，精确检查字符串、地址、网络字节、端口、枚举、前缀、动作和优先级；各模型验收场景中的特殊断言要求同时生效。规则集合、节点替换和协议行为通过真实 Core、Connection、Wire 消费路径验证，不能只检查模型字段或手工模拟选择结果。
+
+| 层次 | 必须证明的内容 | 证据边界 |
+|---|---|---|
+| 模型契约 | 构造、规范化、错误、字段输出及明确要求的相等性 / 哈希语义 | 定向测试只证明已执行的模型场景 |
+| 模型协作与协议消费 | HTTP / SOCKS 目标一致性、规则与节点引用、Wire 超时与状态隔离、DNS 执行边界 | 真实消费路径通过后才能认定相应集成要求满足 |
+| 应用边界 | 节点导入、秒到毫秒转换、规则持久化、URL-REGEX 不支持输入及应用编译 | PN-05 等应用迁移要求独立验证，包内测试不能替代 |
+| 文档一致性 | 元信息、结构、链接、交叉引用、接口草图和验收场景一致 | 文档检查不证明代码已经实现或运行通过 |
+
+### 定向测试
+
+从 `Magent/` 包目录运行与本次修改及受影响路径对应的定向测试。它们用于定位问题，不能替代后续包级验收。
+
+| 对象 | 命令 |
+|---|---|
+| NetworkAddress | `swift test --filter NetworkAddressTests` |
+| HttpProtocol | `swift test --filter HttpProtocolTests` |
+| ProxyNode / ProxyNodeType / ProxyCipher | `swift test --filter ProxyNodeTests` |
+| ProxyRule / MatchType / Decision | `swift test --filter ProxyRuleTests` |
+| 节点集合、规则匹配与路由 | `swift test --filter MagentCoreTests` |
+| TCP / UDP Wire | `swift test --filter WireTests` |
+
+### 包级验收
+
+完成模型实现和受影响调用方迁移后，从 `Magent/` 统一执行：
+
+```bash
+swift build
+swift build -Xswiftc -strict-concurrency=complete
+swift test --filter ConnectionTests
+swift test
+git diff --check
+```
+
+对本次修改的 Swift 文件运行 `xcrun swift-format lint --strict`，显式传入文件列表。涉及连接、缓冲、并发或资源清理的变更必须执行上述完整流程。应用编译与真实网络行为按其边界另行验证；依赖外部 Shadowsocks 服务的测试保持环境变量保护，并明确报告跳过原因。
+
+### 验收结论与证据
+
+验收记录分别列出模型定向测试、Core / Connection / Wire 回归、包级构建和测试、应用验证，以及未执行或受阻的项目，并说明原因。隔离模型测试、静态检查、已有用例、预期失败和环境跳过都不能代替尚未完成的集成验收；运行记录不作为模型功能契约写回各章节。
+
+仅修改本文结构或措辞时，检查元信息、章节层级、链接与锚点、契约和示例一致性、验收编号及 `git diff --check`。没有执行的构建或测试不得标记为通过。

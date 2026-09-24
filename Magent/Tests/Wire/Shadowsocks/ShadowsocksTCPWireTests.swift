@@ -7,17 +7,16 @@ import XCTest
 /// Shadowsocks TCP Wire 启动与流式编解码契约测试。
 final class ShadowsocksTCPWireTests: XCTestCase {
 
-  private func makeNode(timeout: TimeInterval = 30) -> ProxyNode {
-    ProxyNode(
-      address: try! SocketAddress(ipAddress: "192.0.2.30", port: 8388),
+  private func makeNode() throws -> ProxyNode {
+    try ProxyNode(
+      address: try SocketAddress(ipAddress: "192.0.2.30", port: 8388),
       cipher: .aes256Gcm,
-      password: "test-password",
-      timeout: timeout
+      password: "test-password"
     )
   }
 
   func testTCPWireStartIsIdempotentAndEncodingRequiresStart() throws {
-    let node = makeNode()
+    let node = try makeNode()
     let wire = try ShadowsocksTCPWire(proxyNode: node)
 
     do {
@@ -43,7 +42,7 @@ final class ShadowsocksTCPWireTests: XCTestCase {
   }
 
   func testTCPWireDecodesPartialAndMultipleInboundPayloads() throws {
-    let node = makeNode()
+    let node = try makeNode()
     let server = try ShadowsocksTCPWire(proxyNode: node)
     let client = try ShadowsocksTCPWire(proxyNode: node)
 
@@ -75,7 +74,7 @@ final class ShadowsocksTCPWireTests: XCTestCase {
   }
 
   func testTCPWireRejectsTamperedInboundFrame() throws {
-    let node = makeNode()
+    let node = try makeNode()
     let server = try ShadowsocksTCPWire(proxyNode: node)
     let client = try ShadowsocksTCPWire(proxyNode: node)
     let destination = NetworkAddress.domain("example.com", port: 443)

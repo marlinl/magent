@@ -9,7 +9,7 @@ proxy implementations remain implementation details of the package.
 
 ### Architecture-related specifications
 
-- [Model specifications](MODELS_SPEC.md): proposed NetworkAddress, HttpProtocol,
+- [Model specifications](MODELS_SPEC.md): normative NetworkAddress, HttpProtocol,
   ProxyNode, and ProxyRule contracts, associated enums, ownership boundaries, and
   acceptance criteria.
 - [SOCKS4 specification](SOCKS4_PROXY_SPEC.md): protocol design, packet vectors,
@@ -31,7 +31,7 @@ proxy implementations remain implementation details of the package.
   and archived results from the previous implementation; target results are pending.
 
 This document owns package boundaries, resource ownership, lifecycle, and
-protocol integration constraints. The model SPEC owns proposed model contracts;
+protocol integration constraints. The model SPEC owns mandatory model contracts;
 the cache SPEC owns proposed cache semantics and algorithm invariants; the
 protocol SPECs own detailed message formats, product profiles, and acceptance
 matrices. Do not maintain a separate per-protocol implementation design document
@@ -45,6 +45,31 @@ The SPECs include proposed capabilities and product choices that differ from the
 current package. Check source and tests before treating a requirement as
 implemented. The [protocol integration constraints](#protocol-integration-constraints)
 below record the current boundaries and distinguish them from future targets.
+
+## 模型与 SPEC 的强制契约
+
+所有模型及关联类型必须严格遵循对应 SPEC。`NetworkAddress`、`HttpProtocol`、`ProxyNode`、
+`ProxyRule` 及其关联枚举以 [模型规范](MODELS_SPEC.md) 为契约依据；其他模型同样必须有所属 SPEC
+明确其职责和使用边界。SPEC 中尚未实现的要求属于实现缺口，不构成消费方自行扩展模型的授权。
+
+- **约束随类型生效。** 字段、存储不变量、构造入口、访问级别、供调用方使用的方法、协议符合性、
+  校验和错误语义均须符合 SPEC。该约束覆盖公开和内部模型，也覆盖定义在任意目录、任意文件中的
+  `extension`；不能借助 `internal`、`private` 或改变文件位置绕过模型边界。
+- **调用方适配契约。** Connection、Core、Wire、应用和测试只能按 SPEC 消费模型，不得为了某个
+  使用位置方便，添加未定义的构造器、转换方法、可写状态、协议符合性、默认值或兼容入口。
+  也不得绕过已规定的构造与校验入口直接拼装内部状态。
+- **协议行为留在协议所有者。** HTTP、SOCKS、Shadowsocks 的消息边界、ATYP、二进制地址字段和
+  协议编解码由对应 Connection / Wire 负责。不得通过 `extension NetworkAddress` 给通用地址模型
+  增加 `shadowsocksAddressBytes()`、`decodeShadowsocksAddress(from:)` 等协议专用能力。
+  共享实现先放入已有的职责所有者；新增 Swift 文件仍须遵循 `AGENTS.md` 的明确授权要求。
+- **先确定契约，再实现需求。** SPEC 未定义的模型能力不能直接加入实现。确有实际业务需求时，
+  先提出并确认 SPEC 的职责、接口和验收标准变更，再修改代码；不得先扩展代码，再倒改 SPEC
+  为该实现提供依据。没有实际使用场景的能力不预先设计。
+- **迁移遵循目标模型。** 旧调用、旧扩展或测试与 SPEC 冲突时，修正对应的调用方和职责归属，
+  不向模型恢复旧 API，不添加测试专用路径，也不以现有代码已经存在为由保留越界能力。
+- **验收必须包含消费路径。** 模型修改须核对类型本体、全部扩展和实际调用，并按 SPEC 验证模型
+  不变量及相关集成路径。模型定向测试通过不等于整包或协议验收通过；未迁移的调用、构建失败和
+  尚未执行的验收必须明确记录，不能据此宣称实现已完整遵循 SPEC。
 
 ## SPEC 文档格式
 
@@ -142,7 +167,9 @@ lifecycle operations.
 
 Small parsing helpers that also live under `Model/`, such as `HttpProtocol`,
 remain internal. Source location alone does not make a type public; Swift
-access control is the authoritative boundary.
+access control is the authoritative visibility boundary. Model responsibilities
+and permitted APIs remain governed by the mandatory SPEC contract above,
+including extensions located outside `Model/`.
 
 Everything under `Connection/`, `Core/`, and `Wire/` is an implementation
 detail. Some cache types use `package` access so the package's benchmark target
@@ -316,11 +343,13 @@ package has native Shadowsocks Wires, direct/proxy decisions, rule ordering by
 that close the old connections. Those differences require explicit design
 changes, not new wrappers or features inferred from an example configuration.
 
-`MODELS_SPEC.md` is also a proposed contract, not a description of today's model
-implementation. For example, its pure `HttpProtocol` model and revised OPTIONS
-handling must not be reported as implemented merely because the architecture
-links to that SPEC. Existing [SOCKS5 review findings](review/README.md) retain
-their own status and verification requirements.
+`MODELS_SPEC.md` is the mandatory contract for model implementation and use;
+it is not evidence that today's code satisfies that contract. Existing gaps
+must be fixed within the specified ownership boundaries, not by adding model
+APIs for individual consumers. Its pure `HttpProtocol` model and revised OPTIONS
+handling must not be reported as implemented merely because this document links
+to that SPEC. Existing [SOCKS5 review findings](review/README.md) retain their
+own status and verification requirements.
 
 ### Shared TCP Lifecycle
 

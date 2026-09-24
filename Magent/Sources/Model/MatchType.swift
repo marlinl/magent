@@ -6,7 +6,7 @@
 //
 
 /// 代理规则的匹配方式。
-public enum MatchType: String, Codable, Sendable, Equatable, Hashable, CaseIterable {
+public enum MatchType: String, Codable, Sendable, Hashable, CaseIterable {
   /// 完整域名精确匹配。
   case exactDomain = "EXACT-DOMAIN"
 
@@ -19,6 +19,4 @@ public enum MatchType: String, Codable, Sendable, Equatable, Hashable, CaseItera
   /// IP CIDR 匹配。
   case ipCIDR = "IP-CIDR"
 
-  /// URL 正则匹配。
-  case urlRegex = "URL-REGEX"
 }

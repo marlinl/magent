@@ -1,162 +1,139 @@
-//
-//  ProxyRule.swift
-//  Magent
-//
-//  Created by MarlinL on 2026/6/20.
-//
 import Foundation
 import NIOCore
 
-// MARK: - ProxyRule
+/// 已校验且规范化的路由规则；构造只解析匹配条件，不查询节点、DNS 或创建 Wire。
+public struct ProxyRule: Sendable, Hashable {
+  /// 唯一的匹配存储，同时作为 Core 的覆盖键；CIDR 在构造时清零主机位。
+  internal enum Match: Sendable, Hashable {
+    case exactDomain(String)
+    case domainSuffix(String)
+    case domainKeyword(String)
+    case ipCIDR(network: [UInt8], prefixLength: UInt8)
+  }
 
-/// 一条访问控制匹配规则。
-public struct ProxyRule: Sendable {
-  /// 匹配方式。
-  public let matchType: MatchType
+  internal let match: Match
 
-  /// 已根据 `matchType` 校验和规范化的匹配值。
-  public let matchValue: String
-
-  /// 规则命中后的动作。
+  /// 命中后的动作；代理节点是否存在由 Core 在实际路由时检查。
   public let decision: Decision
 
-  /// 规则顺序，数值越小优先级越高。
+  /// 数值越小越优先，允许完整 Int 范围。
   public let order: Int
 
-  /// 创建访问控制匹配规则。
-  ///
-  /// - Parameters:
-  ///   - matchType: 匹配方式。
-  ///   - matchValue: 原始匹配值；构造成功后会保存为规范化形式。
-  ///   - decision: 规则命中后的动作。
-  ///   - order: 规则顺序。
-  /// - Throws: `MagentError.invalidPolicy`，表示匹配值不符合对应类型的格式要求。
-  public init(
-    matchType: MatchType,
-    matchValue: String,
-    decision: Decision,
-    order: Int
-  ) throws {
-    let normalizedValue: String
+  /// 从已校验的匹配存储读取配置类型。
+  public var matchType: MatchType {
+    switch match {
+    case .exactDomain: return .exactDomain
+    case .domainSuffix: return .domainSuffix
+    case .domainKeyword: return .domainKeyword
+    case .ipCIDR: return .ipCIDR
+    }
+  }
 
+  /// 规范化配置文本；CIDR 由网络字节生成，不保留另一份文本状态。
+  public var matchValue: String {
+    switch match {
+    case .exactDomain(let value), .domainSuffix(let value), .domainKeyword(let value):
+      return value
+    case .ipCIDR(let network, let prefixLength):
+      // 唯一构造入口保证网络恰好为 4 或 16 字节，NIO 只负责数值格式化。
+      guard let socket = try? SocketAddress(packedIPAddress: ByteBuffer(bytes: network), port: 0),
+        let host = socket.ipAddress
+      else { preconditionFailure("ProxyRule stores only validated IP networks") }
+      return "\(host)/\(prefixLength)"
+    }
+  }
+
+  /// 解析严格的匹配文本；不修剪空白、前导点或多余根点。
+  ///
+  /// - Throws: `MagentError.invalidPolicy`，匹配文本不满足对应类型的语法或范围约束。
+  public init(matchType: MatchType, matchValue: String, decision: Decision, order: Int) throws {
     switch matchType {
     case .exactDomain, .domainSuffix:
-      normalizedValue = try Self.normalizedDomain(matchValue)
+      if matchType == .exactDomain,
+        NetworkAddress.isIPv4Candidate(matchValue) || matchValue.contains(":")
+      {
+        throw MagentError.invalidPolicy("numeric exact domain must use IP-CIDR: \(matchValue)")
+      }
+      guard let domain = NetworkAddress.normalizedDomainName(matchValue) else {
+        throw MagentError.invalidPolicy("invalid domain: \(matchValue)")
+      }
+      let name = domain.hasSuffix(".") ? String(domain.dropLast()) : domain
+      match = matchType == .exactDomain ? .exactDomain(name) : .domainSuffix(name)
 
     case .domainKeyword:
-      normalizedValue = matchValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-      guard normalizedValue.isEmpty == false else {
-        throw MagentError.invalidPolicy("domain keyword must not be empty")
+      guard (1...253).contains(matchValue.utf8.count),
+        matchValue.utf8.allSatisfy({
+          (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0)
+            || $0 == 45 || $0 == 46
+        })
+      else {
+        throw MagentError.invalidPolicy("invalid domain keyword: \(matchValue)")
       }
+      match = .domainKeyword(matchValue.lowercased())
 
     case .ipCIDR:
-      normalizedValue = try Self.normalizedCIDR(matchValue)
-
-    case .urlRegex:
-      normalizedValue = matchValue.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard normalizedValue.isEmpty == false else {
-        throw MagentError.invalidPolicy("URL regular expression must not be empty")
-      }
-      guard (try? NSRegularExpression(pattern: normalizedValue)) != nil else {
-        throw MagentError.invalidPolicy("invalid URL regular expression: \(matchValue)")
-      }
+      match = try Self.parseCIDR(matchValue)
     }
-
-    self.matchType = matchType
-    self.matchValue = normalizedValue
     self.decision = decision
     self.order = order
   }
 
-  /// 规范化 DNS 域名，并校验总长度、标签长度和允许字符。
-  private static func normalizedDomain(_ value: String) throws -> String {
-    let domain = value.trimmingCharacters(in: .whitespacesAndNewlines)
-      .lowercased()
-      .trimmingCharacters(in: CharacterSet(charactersIn: "."))
-    let labels = domain.split(separator: ".", omittingEmptySubsequences: false)
-
-    guard domain.isEmpty == false, domain.utf8.count <= 253 else {
-      throw MagentError.invalidPolicy("invalid domain: \(value)")
-    }
-
-    for label in labels {
-      let bytes = label.utf8
-      let hasValidLength = bytes.isEmpty == false && bytes.count <= 63
-      let hasValidEdges = bytes.first != 45 && bytes.last != 45
-      let hasValidCharacters = bytes.allSatisfy { byte in
-        (48...57).contains(byte) || (97...122).contains(byte) || byte == 45
-      }
-
-      guard hasValidLength, hasValidEdges, hasValidCharacters else {
-        throw MagentError.invalidPolicy("invalid domain: \(value)")
-      }
-    }
-
-    return domain
-  }
-
-  /// 规范化 CIDR 文本，并清零网络前缀之外的主机位。
-  private static func normalizedCIDR(_ value: String) throws -> String {
-    let cidr = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    let parts = cidr.split(separator: "/", omittingEmptySubsequences: false)
-
+  /// 保留输入 IP 的位宽校验前缀，随后把映射 IPv6 归入 IPv4 并清零主机位。
+  /// 这里的 NIO 解析只接受数值字面量，失败由拥有规则输入的边界报告为 invalidPolicy。
+  private static func parseCIDR(_ value: String) throws -> Match {
+    let parts = value.split(separator: "/", omittingEmptySubsequences: false)
     guard (1...2).contains(parts.count) else {
       throw MagentError.invalidPolicy("invalid CIDR: \(value)")
     }
-
-    let ipLiteral = String(parts[0])
-    guard ipLiteral.contains("%") == false,
-      let socketAddress = try? SocketAddress(ipAddress: ipLiteral, port: 0)
-    else {
+    let host = String(parts[0])
+    guard NetworkAddress.isValidHostText(host) else {
       throw MagentError.invalidPolicy("invalid CIDR address: \(value)")
     }
-
-    let addressBytes: Data
-    switch socketAddress {
+    if host.contains(":") {
+      if host.contains("."), let colon = host.lastIndex(of: ":"),
+        !NetworkAddress.isValidIPv4Text(String(host[host.index(after: colon)...]))
+      {
+        throw MagentError.invalidPolicy("invalid CIDR address: \(value)")
+      }
+    } else if !NetworkAddress.isValidIPv4Text(host) {
+      throw MagentError.invalidPolicy("invalid CIDR address: \(value)")
+    }
+    guard let socket = try? SocketAddress(ipAddress: host, port: 0) else {
+      throw MagentError.invalidPolicy("invalid CIDR address: \(value)")
+    }
+    var network: [UInt8]
+    switch socket {
     case .v4(let ipv4):
-      addressBytes = withUnsafeBytes(of: ipv4.address.sin_addr) { Data($0) }
-
+      network = withUnsafeBytes(of: ipv4.address.sin_addr) { Array($0) }
     case .v6(let ipv6):
-      addressBytes = withUnsafeBytes(of: ipv6.address.sin6_addr) { Data($0) }
-
+      network = withUnsafeBytes(of: ipv6.address.sin6_addr) { Array($0) }
     case .unixDomainSocket:
-      throw MagentError.invalidPolicy("invalid CIDR address: \(value)")
+      preconditionFailure("numeric IP parser cannot produce a Unix socket")
     }
-
-    let prefixLength: Int
+    var prefixLength = network.count * 8
     if parts.count == 2 {
-      guard let prefix = Int(parts[1]), (0...(addressBytes.count * 8)).contains(prefix) else {
-        throw MagentError.invalidPolicy("invalid CIDR prefix: \(value)")
-      }
+      guard !parts[1].isEmpty, parts[1].utf8.allSatisfy({ (48...57).contains($0) }),
+        let prefix = Int(parts[1]), (0...prefixLength).contains(prefix)
+      else { throw MagentError.invalidPolicy("invalid CIDR prefix: \(value)") }
       prefixLength = prefix
-    } else {
-      prefixLength = addressBytes.count * 8
     }
-
-    var networkBytes = addressBytes
-    for index in networkBytes.indices {
-      let byteStartBit = index * 8
-      if byteStartBit + 8 <= prefixLength {
-        continue
+    if network.count == 16, network.prefix(10).allSatisfy({ $0 == 0 }),
+      network[10] == 0xff, network[11] == 0xff
+    {
+      guard prefixLength >= 96 else {
+        throw MagentError.invalidPolicy("mapped IPv6 CIDR prefix must be in 96...128: \(value)")
       }
-
-      if byteStartBit >= prefixLength {
-        networkBytes[index] = 0
-        continue
+      network = Array(network.suffix(4))
+      prefixLength -= 96
+    }
+    for index in network.indices {
+      let retainedBits = prefixLength - index * 8
+      if retainedBits <= 0 {
+        network[index] = 0
+      } else if retainedBits < 8 {
+        network[index] &= UInt8.max << UInt8(8 - retainedBits)
       }
-
-      let retainedBitCount = prefixLength - byteStartBit
-      networkBytes[index] &= UInt8.max << UInt8(8 - retainedBitCount)
     }
-
-    var buffer = ByteBufferAllocator().buffer(capacity: networkBytes.count)
-    buffer.writeBytes(networkBytes)
-    guard let networkAddress = try? SocketAddress(packedIPAddress: buffer, port: 0),
-      let normalizedAddress = networkAddress.ipAddress
-    else {
-      throw MagentError.invalidPolicy("invalid CIDR address: \(value)")
-    }
-
-    return "\(normalizedAddress)/\(prefixLength)"
+    return .ipCIDR(network: network, prefixLength: UInt8(prefixLength))
   }
 }

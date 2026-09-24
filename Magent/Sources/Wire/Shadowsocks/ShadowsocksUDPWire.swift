@@ -22,12 +22,8 @@ internal final class ShadowsocksUDPWire: Wire {
 
   /// 使用代理节点配置创建 UDP wire。
   internal init(proxyNode: ProxyNode) throws {
-    let timeoutMilliseconds = (proxyNode.timeout * 1_000).rounded(.up)
-    guard timeoutMilliseconds >= 1, timeoutMilliseconds < Double(Int64.max) else {
-      throw MagentError.invalidPolicy("proxy node timeout must fit positive Int64 milliseconds")
-    }
     self.proxyAddress = proxyNode.address
-    self.timeout = Int64(timeoutMilliseconds)
+    self.timeout = proxyNode.timeoutMilliseconds
     self.method = proxyNode.cipher
     self.masterKey = passwordToKey(
       password: proxyNode.password,

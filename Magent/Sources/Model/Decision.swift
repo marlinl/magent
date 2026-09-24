@@ -7,7 +7,7 @@
 import Foundation
 
 /// 代理规则命中后的动作。
-public enum Decision: Sendable, Equatable {
+public enum Decision: Sendable, Hashable {
   /// 使用指定 UUID 的代理节点。
   case proxy(UUID)
 

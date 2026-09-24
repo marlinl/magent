@@ -7,17 +7,16 @@ import XCTest
 /// Shadowsocks UDP Wire 数据报编解码契约测试。
 final class ShadowsocksUDPWireTests: XCTestCase {
 
-  private func makeNode(timeout: TimeInterval = 30) -> ProxyNode {
-    ProxyNode(
-      address: try! SocketAddress(ipAddress: "192.0.2.30", port: 8388),
+  private func makeNode() throws -> ProxyNode {
+    try ProxyNode(
+      address: try SocketAddress(ipAddress: "192.0.2.30", port: 8388),
       cipher: .aes256Gcm,
-      password: "test-password",
-      timeout: timeout
+      password: "test-password"
     )
   }
 
   func testUDPWireRoundTripsDatagramPayload() throws {
-    let node = makeNode()
+    let node = try makeNode()
     let sender = try ShadowsocksUDPWire(proxyNode: node)
     let receiver = try ShadowsocksUDPWire(proxyNode: node)
     let target = NetworkAddress.domain("example.com", port: 53)
@@ -31,7 +30,7 @@ final class ShadowsocksUDPWireTests: XCTestCase {
   }
 
   func testUDPWireRoundTripsEveryAddressTypeAndUsesUniquePackets() throws {
-    let node = makeNode()
+    let node = try makeNode()
     let sender = try ShadowsocksUDPWire(proxyNode: node)
     let receiver = try ShadowsocksUDPWire(proxyNode: node)
     let payload = Data("payload".utf8)
@@ -53,7 +52,7 @@ final class ShadowsocksUDPWireTests: XCTestCase {
   }
 
   func testUDPWireRejectsMissingTargetTamperingAndWrongPassword() throws {
-    let node = makeNode()
+    let node = try makeNode()
     let sender = try ShadowsocksUDPWire(proxyNode: node)
     XCTAssertThrowsError(try sender.encodeOutbound(Data([0x01]), address: nil))
 
@@ -63,12 +62,12 @@ final class ShadowsocksUDPWireTests: XCTestCase {
     let receiver = try ShadowsocksUDPWire(proxyNode: node)
     XCTAssertThrowsError(try receiver.decodeInbound(tampered))
 
-    let wrongNode = ProxyNode(
+    let wrongNode = try ProxyNode(
       id: node.id,
       address: node.address,
       cipher: node.cipher,
       password: "wrong-password",
-      timeout: node.timeout
+      timeoutMilliseconds: node.timeoutMilliseconds
     )
     let validPacket = try sender.encodeOutbound(
       Data([0x03]), address: .domain("example.com", port: 53))
