@@ -1,12 +1,16 @@
 ---
-desc: "本地 SOCKS4 / SOCKS4a 代理的报文解析、路由、DNS、出站连接、配置及验收标准，附解析向量和测试工具。"
-version: "0.1.0"
-updated_at: "2026-09-21"
+desc: "SOCKS4 / SOCKS4a 入口、抽象 Wire 集成、连接生命周期及验收标准，附解析向量与测试工具。"
+version: "0.2.0"
+updated_at: "2026-09-24"
 status: "草案"
 references_checked_at: "2026-09-21"
 ---
 
 # 本地 SOCKS4 / SOCKS4a 代理服务 · 完整 SPEC
+
+本文规定本地入口协议与抽象 Wire 的协作契约。入口只处理自己的报文、目标和本地响应；具体出站协议的线上格式、认证、加密、节点部署及配置属于 Wire 和节点模型，不在本文定义，也不能由入口协议推断。
+
+抽象接口统一由 [Wire 规范](WIRES_SPEC.md) 定义。业务目标使用 [模型规范](MODELS_SPEC.md) 中的 `NetworkAddress`；节点引用、实际端点和规则由 Core 按同一模型契约处理。本文的逻辑流程和示例不新增模型构造入口或具体 Wire 类型。协议字段限制仍由入口负责。
 
 ## 单文件导航
 
@@ -17,12 +21,12 @@ references_checked_at: "2026-09-21"
 - [03 · 增量解析、边界与规范化](#doc-03-incremental-parser)
 - [04 · 地址获取与分流规则引擎](#doc-04-routing-engine)
 - [05 · DNS 职责、地址选择与安全边界](#doc-05-dns-and-addresses)
-- [06 · 直连与上游代理协议](#doc-06-outbound-connectors)
+- [06 · DIRECT 与抽象 Wire](#doc-06-outbound-connectors)
 - [07 · 会话生命周期、转发与资源控制](#doc-07-session-and-relay)
 - [08 · 配置文件与启动/热更新校验](#doc-08-configuration)
 - [09 · 错误、安全与可观测性](#doc-09-errors-security-observability)
 - [10 · 测试向量、故障注入与验收](#doc-10-tests-and-acceptance)
-- [11 · macOS / Swift 落地结构与实施任务](#doc-11-swift-implementation-plan)
+- [11 · Swift 实现边界与实施任务](#doc-11-swift-implementation-plan)
 - [12 · 从客户端报文到目标服务器的完整实例](#doc-12-end-to-end-examples)
 - [13 · 原始来源、设计决策与待确认事项](#doc-13-references)
 
@@ -30,7 +34,7 @@ references_checked_at: "2026-09-21"
 
 - [config.schema.json](#attachment-config-schema-json)
 - [examples/config.direct-only.json](#attachment-examples-config-direct-only-json)
-- [examples/config.local-bridge.json](#attachment-examples-config-local-bridge-json)
+- [examples/config.wire-route.json](#attachment-examples-config-wire-route-json)
 - [examples/config.test.json](#attachment-examples-config-test-json)
 - [examples/parser-vectors.json](#attachment-examples-parser-vectors-json)
 - [tools/probe_socks4.py](#attachment-tools-probe-socks4-py)
@@ -50,7 +54,7 @@ references_checked_at: "2026-09-21"
 
 **SOCKS4 不携带域名；SOCKS4a 才增加域名字段。** 因而需要按域名分流时，本地入口必须兼容 SOCKS4a，且客户端确实需要使用它。请求只有 IP 时，本服务不能凭空恢复原始域名。报文字段的规范来源见 [S01](#s01)、[S02](#s02)。
 
-**本地入口协议不等于远端节点协议。** 本稿要求实现 `DIRECT` 和 `SOCKS5 CONNECT` 出站；已有 Shadowsocks 节点时，可以经本机 `sslocal` 的 SOCKS5 端口桥接。不能把 SOCKS4 原始请求直接写到 Shadowsocks 服务端。扩展边界见 [06](#doc-06-outbound-connectors)。
+**本地入口与出站 Wire 分离。** DIRECT 连接业务目标；PROXY 由 Core 选择 Wire，Connection 按 Wire 的启动与编解码契约处理下游。具体规则见 [06](#doc-06-outbound-connectors)。
 
 **不提供 DNS 监听端口，不等于完全不调用解析器。** 域名直连需要取得目标 IP；域名代理默认把名称交给上游；节点自身的域名还可能需要单独解析。DNS 职责见 [05](#doc-05-dns-and-addresses)。
 
@@ -64,12 +68,12 @@ references_checked_at: "2026-09-21"
 | [03 · 增量解析器](#doc-03-incremental-parser) | 半包、粘包、NUL 字符串、提前数据怎么处理 |
 | [04 · 分流规则引擎](#doc-04-routing-engine) | 地址从哪里来、规则顺序、默认走向如何确定 |
 | [05 · DNS 与地址安全](#doc-05-dns-and-addresses) | 谁解析哪个域名、何时解析、如何避免重复解析 |
-| [06 · 出站与上游协议](#doc-06-outbound-connectors) | 直连、SOCKS5 握手、Shadowsocks 桥接、扩展协议 |
+| [06 · DIRECT 与抽象 Wire](#doc-06-outbound-connectors) | 目标、节点、启动、编解码与本地回复的职责边界 |
 | [07 · 会话与转发状态机](#doc-07-session-and-relay) | 何时回复成功、背压、半关闭、取消和停机 |
 | [08 · 配置规格](#doc-08-configuration) | 可用字段、默认值、启动校验、热更新 |
 | [09 · 错误、安全与观测](#doc-09-errors-security-observability) | 失败映射、防止开放代理、日志与指标 |
 | [10 · 测试与验收](#doc-10-tests-and-acceptance) | 协议向量、故障注入、DNS 验证、验收门槛 |
-| [11 · Swift 落地与任务拆分](#doc-11-swift-implementation-plan) | macOS 模块结构、接口契约、实施顺序 |
+| [11 · Swift 落地与任务拆分](#doc-11-swift-implementation-plan) | 库内所有权、接口契约、实施顺序 |
 | [12 · 端到端实例](#doc-12-end-to-end-examples) | 从一段客户端字节一直走到目标服务器 |
 | [13 · 来源与设计决策](#doc-13-references) | 原始协议、官方实现、本稿假设和待确认项 |
 
@@ -86,10 +90,10 @@ references_checked_at: "2026-09-21"
                          ┌──────────────────┼──────────────────┐
                          ▼                  ▼                  ▼
                        DIRECT             PROXY              REJECT
-                  需要时解析目标域名      选定 outbound        返回失败
-                  TCP 连接目标 IP        TCP/TLS 连接节点      关闭连接
-                         │               SOCKS5 CONNECT
-                         │               提交目标 IP/域名
+                  需要时解析目标域名      Core 选择 Wire        返回失败
+                  TCP 连接目标 IP        连接节点 Channel      关闭连接
+                         │               向 Wire 提交目标
+                         │               Wire 就绪且启动写完
                          └─────────┬────────┘
                                    ▼
                          完成入口成功响应写入
@@ -99,7 +103,7 @@ references_checked_at: "2026-09-21"
 
 ### 附件
 
-`examples/config.local-bridge.json`：本机 `127.0.0.1:1086` 作为 SOCKS5 出站的示例；该端口必须另有服务，文档不会启动它。
+`examples/config.wire-route.json`：通过不透明节点引用选择 PROXY；实际节点和 Wire 由运行配置装配。
 
 `examples/config.direct-only.json`：不依赖上游、默认直连的对照配置。
 
@@ -131,7 +135,7 @@ references_checked_at: "2026-09-21"
 
 本服务是显式 TCP 代理，不是 IP 路由器，也不是 HTTP 服务。应用连接本地端口，把目标交给本服务；本服务替应用建立连接并中继流量。
 
-本稿按你当前的 macOS / Swift 开发方向给出落地结构，但核心协议、规则和验收不依赖 Swift。UI、系统代理设置、PAC、订阅管理属于外围控制面，不混入入口报文解析器。
+本规范面向可复用代理库。UI、系统代理设置、应用权限、PAC 与订阅管理属于宿主应用，不构成本地协议或 Wire 接口的前提。
 
 ### 2. 规范用语与来源优先级
 
@@ -153,11 +157,7 @@ references_checked_at: "2026-09-21"
 | IPv6 字面量入口 | 不实现 | SOCKS4 请求没有 16 字节目标地址字段 |
 | SOCKS4a 域名的 IPv6 出站 | 本产品支持 | DIRECT 可使用 AAAA；上游自行决定其解析和网络能力 |
 | DIRECT / PROXY / REJECT | 必须 | 每条连接只选定一个结果 |
-| SOCKS5 CONNECT 出站 | 必须 | IPv4/域名编码；完整处理上游响应地址类型 |
-| 上游 TCP / TLS 传输 | 必须 | TLS 由平台库完成，不自研密码协议 |
-| 外部 sslocal 桥接 | 支持 | 使用同一个 SOCKS5 出站适配器 |
-| 原生 Shadowsocks 加密实现 | 不实现 | 版本、加密方法及互操作另立 SPEC |
-| HTTP CONNECT、SOCKS4a 出站 | 扩展设计 | 未声明能力的构建必须拒绝对应配置 |
+| TCP Wire 集成 | 必须 | 由 Core 选择，入口只依赖抽象启动与编解码契约 |
 | 独立 DNS 服务端口 / fake-IP | 不实现 | 不监听 53，也不维护伪 IP 映射 |
 | HTTP Host / TLS SNI 嗅探 | 不实现 | 不依赖应用数据补齐域名 |
 | TUN / Network Extension flow 接管 | 不实现 | 可另做入口适配，不能声称此版本已接管所有应用 |
@@ -174,11 +174,11 @@ references_checked_at: "2026-09-21"
 | Target / 业务目标 | 应用实际希望访问的 `host:port` |
 | Upstream / 代理节点 | 本服务为了 PROXY 路径而连接的服务器 |
 | Outbound / 出站 | 建立直连或代理通道的适配器及其配置 |
-| Bootstrap DNS | 为连接代理节点而解析节点自己的域名 |
+| 节点名称解析 | 配置装配时解析节点自己的名称，与入口业务目标 DNS 分开 |
 | Target DNS | 把业务目标域名解析成 IP |
 | Relay | 建立通道之后的双向字节转发 |
 | 配置快照 | 会话固定引用的不可变配置版本 |
-| 上游接受 | 上游代理协议报告成功；不是业务请求完成，也不是独立验证远端状态 |
+| Wire 就绪 | ready=true 且必要控制输出写完；不是业务请求完成，也不要求统一的远端确认 |
 
 ### 5. 强制需求与不变量
 
@@ -207,13 +207,13 @@ references_checked_at: "2026-09-21"
 
 DIRECT：已建立到通过检查的某个目标 IP 的 TCP 连接。
 
-PROXY：已完成到节点的 TCP/TLS 连接和该节点协议所要求的成功确认。对于 SOCKS5，这是收到并消费完整成功响应。它仍然是**上游报告**的成功；经外部桥接时不能额外宣称已经独立确认最终服务可达。
+PROXY：下游 Channel 已建立，Wire 契约要求的启动处理已完成。本地成功不等于远端应用请求成功，也不假定存在统一的远端确认报文，详见 [06](#doc-06-outbound-connectors)。
 
 入口 `0x5A` 不表示 HTTP 返回 200、不表示目标 TLS 验证成功、更不表示业务操作成功。本服务不解析这些应用层结果。
 
 ### 7. 本稿选定但尚非你的既定配置
 
-本稿默认监听 `127.0.0.1:1080`，把未匹配目标交给 `main` 出站，示例 `main` 指向 `127.0.0.1:1086`。这是方便接入本机代理核心的设计基线，并非对你实际端口和节点协议的断言。
+本稿示例监听 `127.0.0.1:1080`，把未匹配目标交给 `main` 节点引用。实际节点端点与 Wire 由运行配置装配；示例不固定外部服务、端口或节点协议。
 
 协议文本没有规定本稿的 512 会话、64 待握手、10 秒入口握手等阈值；这些是待压测校准的初值。交付不得写成已经达到某个 QPS、吞吐或内存成绩。
 
@@ -225,69 +225,31 @@ PROXY：已完成到节点的 TCP/TLS 连接和该节点协议所要求的成功
 
 [返回目录](#doc-readme)
 
-### 1. 控制面与数据面
+### 1. 数据路径与所有权
 
 ```text
-控制面
-配置文件 / UI → ConfigLoader → Validator → ImmutableSnapshot
-                                            │ 原子替换引用
-数据面                                      ▼
-Listener → AdmissionController → Session(snapshot)
-                               ├─ Socks4Decoder
-                               ├─ TargetNormalizer
-                               ├─ KnownTargetGuard
-                               ├─ RuleEngine
-                               ├─ OutboundFactory
-                               │   ├─ DirectConnector → Resolver → TCP
-                               │   └─ Socks5Connector → NodeResolver → TCP/TLS → SOCKS5
-                               └─ ReplyWriter → DuplexRelay → Cleanup
+MagentTCPConnection → Socks4Connection → NetworkAddress → Core 路由
+                                                    ├─ DIRECT → 目标 Channel
+                                                    └─ PROXY  → Wire + 节点 Channel
+本地 SOCKS4 回复 ← Socks4Connection ← 解码后的业务数据
 ```
 
-入口解析器不查询 DNS，规则引擎不打开 socket，出站适配器不决定业务规则，转发器不理解 HTTP/TLS。每个组件只承担一类职责。
+accepted Channel 由 MagentTCPConnection 管理；Socks4Connection 管理请求状态与下游 Channel；Wire 仅管理出站启动和编解码状态。协议解析不执行 DNS，规则匹配不解析业务载荷。
 
-### 2. 模块输入、输出和副作用
+### 2. 模块输入与输出
 
-| 模块 | 输入 | 输出 | 允许的副作用 |
-|---|---|---|---|
-| Decoder | 任意分片字节 | NeedMore / Parsed / Invalid | 无网络访问 |
-| Normalizer | IPv4 字节或域名原始字节 | CanonicalTarget | 无 DNS |
-| KnownTargetGuard | 已知数值地址、端口、监听集合 | Permit / Deny | 无 DNS |
-| RuleEngine | Target + 配置快照 | RouteDecision + trace | 纯计算 |
-| Resolver | 域名、用途、截止时间 | 受限候选 IP 集合 | 系统解析 |
-| DirectConnector | 固定目标及预算 | EstablishedStream | TCP 连接 |
-| Socks5Connector | 节点配置 + 原始目标 | EstablishedStream | 节点解析、TCP/TLS、SOCKS5 |
-| ReplyWriter | 单一结果、客户端流 | 写入完成 | 入口方向写操作 |
-| DuplexRelay | 两条流及预读尾部 | 会话统计 / 结束原因 | 双向转发 |
-| Metrics/Logger | 脱敏事件 | 结构化记录 | 不访问目标网络 |
+| 模块 | 输入 | 输出 |
+|---|---|---|
+| SOCKS4 解析器 | 任意分片入口字节 | 命令、NetworkAddress、已消费长度及余量 |
+| Core | 已验证的逻辑目标 | DIRECT 或所选 Wire；失败保持原始错误 |
+| Wire | 逻辑目标、业务数据或下游协议字节 | 启动字节、编码字节或解码后的业务数据 |
+| SOCKS4 Connection | 出站结果与业务数据 | 本地八字节回复、双向转发及资源清理 |
 
 ### 3. 地址模型
 
-以下是语言无关的模型，实际 Swift 定义见 [11](#doc-11-swift-implementation-plan)。
+业务目标使用 NetworkAddress；节点端点和实际 TCP 本地/远端地址使用 SocketAddress。SOCKS4 的四字节地址由协议层借助 NIO 转成数值文本，再调用模型的文本构造入口；SOCKS4a 解码名称后调用同一个入口。CONNECT 端口 0 由协议层拒绝。
 
-```text
-TargetHost = IPv4(bytes[4]) | Domain(asciiName)
-IPAddress  = IPv4(bytes[4]) | IPv6(bytes[16])
-
-Target {
-  host: TargetHost
-  port: UInt16                  // 必须 1..65535
-  origin: socks4 | socks4a
-  originalAddressKind: ipv4 | domain
-}
-
-NodeEndpoint {
-  host: IPAddress | Domain      // 节点自己的地址
-  port: UInt16
-  transport: tcp | tls
-  tlsServerName?: String
-}
-```
-
-`TargetHost` 暂时不提供原生 IPv6 入口分支；`IPAddress` 必须支持 IPv6，因为系统 DNS 的 AAAA 结果和节点地址可能是 IPv6。
-
-SOCKS4a 传入规范 IPv4 文本时，规范化成 `TargetHost.IPv4`，但 `origin` 仍为 `socks4a`。它不再参与域名规则，也不执行 DNS，见 [03](#doc-03-incremental-parser)。
-
-**严禁用一个 `host` 可变变量先保存目标域名，再覆盖成代理节点域名。** 两者有不同的 DNS、安全、日志和连接语义。
+入口只允许本章规定的 SOCKS4 / SOCKS4a 地址表达；模型支持其他地址形式不会自动扩大入口语法。目标与节点必须分别保存，不得相互覆盖。
 
 ### 4. 会话模型
 
@@ -326,20 +288,9 @@ RouteDecision {
 
 规则命中时只确定 DNS 职责，不要求立即解析。对于 DIRECT IP，owner 为 `none`；DIRECT 域名为 `system`；PROXY 域名为 `upstream`。
 
-### 5. 出站结果不是一个普通 socket
+### 5. 出站状态与业务余量
 
-```text
-EstablishedStream {
-  stream: AsyncByteStream
-  upstreamRemainder: byte[]    // 握手响应之后已经收到的业务字节
-  readiness: tcpConnected | upstreamAccepted
-  selectedTargetIP?: IPAddress
-  connectedNodeIP?: IPAddress
-  negotiatedProtocol: direct | socks5 | extension
-}
-```
-
-对于 PROXY 域名，不知道上游实际选了哪个目标 IP 时，`selectedTargetIP` 必须为空；不能拿 SOCKS5 的 `BND.ADDR` 当目标 IP。`BND.ADDR` 是绑定地址语义，见 [S03](#s03)。
+Connection 保存下游 Channel、可选 Wire、启动状态和有界业务余量。DIRECT 没有 Wire；PROXY 的具体控制帧只交由 Wire 消费。不得为本地回复猜测远端选中的目标 IP，也不得把节点端点当成业务目标。
 
 ### 6. 字节流契约
 
@@ -357,26 +308,15 @@ abort() -> 立即终止；幂等
 ### 7. 端到端时序
 
 ```text
-Client          Local Proxy            Upstream              Target
-  | TCP accept      |                      |                     |
-  | SOCKS4a request |                      |                     |
-  |---------------->| parse + route        |                     |
-  |                 | TCP/TLS to node      |                     |
-  |                 |--------------------->|                     |
-  |                 | SOCKS5 negotiation  |                     |
-  |                 |<-------------------->|                     |
-  |                 | CONNECT name:port   |                     |
-  |                 |--------------------->| resolve + connect   |
-  |                 |                      |-------------------->|
-  |                 | complete success    |                     |
-  |                 |<---------------------|                     |
-  | SOCKS4 success  |                      |                     |
-  |<----------------|                      |                     |
-  | payload         | payload              | payload             |
-  |<--------------->|<-------------------->|<------------------->|
+客户端 SOCKS4/4a 请求
+→ Connection 解析并构造 NetworkAddress
+→ Core 路由并选择可选 Wire
+→ Connection 创建下游 Channel；PROXY 完成 Wire 启动
+→ Connection 写完本地 SOCKS4 成功回复
+→ 双向业务转发；PROXY 数据经过同一个 Wire 编解码
 ```
 
-图中最后一段远端连接是常规上游职责；若 Upstream 实际是多级代理或外部桥接，本地只观察其协议确认，不能观察所有远端状态。
+Wire 的线上报文不属于本地 SOCKS4 会话，入口不为它增加另一套协议状态机。
 
 ### 8. 非目标模块
 
@@ -793,9 +733,9 @@ GEOIP 也需要数据来源、版本和更新策略，不应把“看起来像�
 |---|---|---|
 | Client 自己的解析 | 应用选择 SOCKS4 前已把域名转成 IPv4 | 应用及操作系统，不在本入口控制范围 |
 | Target DNS | DIRECT 时把 `example.com` 转成地址 | 本服务调用系统解析器 |
-| Bootstrap DNS | 连接 `proxy.example.net:443` 节点 | 本服务独立解析节点地址 |
+| 节点名称解析 | 节点配置中使用名称 | 配置装配层负责；入口消费 Wire 已校验的实际端点 |
 
-PROXY 域名路径则把名称放入支持域名的上游请求，由上游解析或继续转交。SOCKS4a 和 SOCKS5 的名称传递机制参见 [S02](#s02)、[S03](#s03)。
+PROXY 域名路径将完整 NetworkAddress 交给 Wire；具体名称编码属于 Wire，入口不复制该逻辑。
 
 **本稿不提供 UDP/TCP 53 监听，不实现自定义 DNS 包处理，不要求应用把 DNS 服务器改成它。** 系统解析器内部可能使用 DNS、hosts、系统缓存或平台名称服务；本服务只调用解析接口，不接管这些基础设施。
 
@@ -804,21 +744,21 @@ PROXY 域名路径则把名称放入支持域名的上游请求，由上游解�
 | 请求目标 | 决策 | 本服务目标解析 | 出站携带什么 |
 |---|---|---|---|
 | IPv4 | DIRECT | 不解析 | 连接该 IPv4 |
-| IPv4 | PROXY | 不解析 | 上游地址类型 IPv4 |
+| IPv4 | PROXY | 不解析 | 向 Wire 提交数值 NetworkAddress |
 | Domain | DIRECT | 解析一次取得本会话候选集合 | 连接选定数值 IP |
-| Domain | PROXY | **禁止解析** | 上游地址类型 Domain |
+| Domain | PROXY | **禁止解析** | 向 Wire 提交域名 NetworkAddress |
 | 任意 | REJECT | 不解析 | 无出站 |
 
 表中的“解析一次”指本会话发起一次逻辑解析操作；操作系统为 A、AAAA、CNAME 或重试发送多少网络消息，不由此承诺限制。
 
-节点自身为域名时仍可能产生 Bootstrap DNS。因此“不在本地解析代理目标”不等于“本机绝不产生任何 DNS 流量”。应用此前自行解析过的域名，也无法在入口补救为未泄露。
+节点配置装配时仍可能需要名称解析。因此“不在本地解析代理目标”不等于“本机绝不产生任何 DNS 流量”。应用此前自行解析过的域名，也无法在入口补救为未泄露。
 
 ### 3. Resolver 契约
 
 ```text
 resolve(
   name: canonical ASCII hostname,
-  purpose: directTarget | upstreamBootstrap,
+  purpose: directTarget,
   familyPolicy: dual,
   deadline: monotonic instant,
   networkContext: platform context
@@ -854,27 +794,23 @@ IPv4/IPv6 可采用 RFC 8305 思路做有界错峰竞争；本稿默认间隔 25
 
 保留规范化名称，不发起本服务的 Target DNS，不为了日志、GEOIP、预热、测速、证书查询而旁路解析。
 
-如果上游不能接受名称，首版返回 `OUTBOUND_ADDRESS_UNSUPPORTED`；禁止未经配置就把名称在本地解析成 IP。当前必选 SOCKS5 出站必须支持名称，所以通常不会遇到此限制。
+如果所选 Wire 无法表达名称目标，该操作明确失败；禁止入口偷偷解析成 IP 后重试。
 
-这里的保证是**本进程不发起目标解析**。上游或外部 `sslocal` 的配置如果选择本地解析/直连，本入口无法仅凭 SOCKS5 接口阻止它；外部组件必须单独核查并做 DNS 观测验收。
+这里的保证是入口不为 PROXY 业务目标执行本地 DNS。Wire 自身的解析行为按其契约单独验收，不能从本地成功回复推断整机 DNS 行为。
 
-### 6. 节点 Bootstrap 与防递归
+### 6. 节点端点与防递归
 
-节点域名只使用独立的系统解析路径，不送入普通域名路由；节点连接也不能重新调用本入口。
+Wire 提供配置装配后确定的实际节点端点。Connection 连接该端点并向 Wire 提交原始逻辑业务目标；不为节点重复运行目标路由，不在入口解析节点配置名称。
 
 ```text
-PROXY example.com:443
-  node = proxy.example.net:443
-  bootstrapResolve(proxy.example.net)
-  TCP/TLS → nodeIP:443
-  SOCKS5 CONNECT → example.com:443
+PROXY target=example.com:443
+→ Core 选择 Wire
+→ Connection 连接 Wire.getEndpoint()
+→ Wire.start(target) / decodeInbound 推进启动
+→ ready 且必要控制输出写完
 ```
 
-使用配置中的节点 IP 可以避免本服务查询节点域名；若外层 TLS 需要服务器名称，TLS 验证名称和实际连接 IP 分开保存，不为验证名称额外查询 DNS。
-
-对于本机桥接，节点为 `127.0.0.1:1086` 是允许的；它不是业务目标，所以不受“禁止访问回环业务目标”的同一条规则拦截。但必须检查该端口不是本服务自己的入口端口。
-
-自回环检查使用数值地址、端口和当前监听集合；域名节点解析之后再次检查。对于通配监听，需要把本机接口地址和回环地址映射到该监听端口；不能只比较配置字符串。
+显式节点与业务目标具有不同的授权语义。实际节点端点仍须检查自身监听回环；通配监听按实际本机地址集合比较，不能只比较配置字符串。
 
 ### 7. 缓存
 
@@ -900,187 +836,38 @@ PROXY example.com:443
 
 <a id="doc-06-outbound-connectors"></a>
 
-## 06 · 直连与上游代理协议
+## 06 · DIRECT 与抽象 Wire
 
 [返回目录](#doc-readme)
 
-### 1. 出站接口的共同要求
+### Wire 与连接的职责
 
-```text
-connect(target, outboundConfig, deadline) -> EstablishedStream
-```
+Wire 的接口、状态和验收以 [Wire 规范](WIRES_SPEC.md) 为准。本文只补充本地入口如何使用它：
 
-适配器必须保留 target，不接受原始入口报文作为“直接转发的握手”。每条入口连接对应一条独立出站隧道；首版不做多路复用或跨目标连接池。
-
-出站适配器负责自己的协议控制字节；这些字节不计入业务载荷统计。返回时必须说明剩余预读业务数据，且将所有控制响应恰好消费完。
-
-基线实现 DIRECT 和 SOCKS5。第 7、8 节是扩展设计，不要求首版实现，不允许配置后静默当作另一种协议运行。
-
-### 2. DIRECT
-
-IP 目标通过安全检查后直接拨号；Domain 按 [05](#doc-05-dns-and-addresses) 解析、过滤并固定候选。
-
-```text
-TCP connect(targetIP, targetPort)
-→ ready(tcpConnected)
-→ 等待本地 SOCKS4 成功响应写完
-→ 业务字节直接读写，不增加 SOCKS 头
-```
-
-本服务不替应用做目标 HTTPS 握手，不改 SNI，不校验目标应用证书。客户端自己的 TLS 字节经隧道透传；有外层节点 TLS 时，其证书验证是另一个层次。
-
-### 3. 到代理节点的传输
-
-节点的 `server:port` 是 TCP/TLS 对端，target 是之后提交给它的目的地。
-
-`transport.type=tcp`：回环节点可用；非回环必须显式设置 `allow_insecure=true` 才允许。此标志仅承认该连接本身没有外层 TLS，不代表网络已加密或可信。启动时要有清晰警告。
-
-`transport.type=tls`：先通过系统 TLS 栈连接节点，验证信任链和服务器名称，然后才交换 SOCKS5 字节。必须校验失败即关闭，不支持 `skipVerify`。节点必须实际支持这种外层 TLS 部署；不能把普通 SOCKS5 端口擅自套 TLS 后期待兼容。
-
-节点认证失败、证书失败、握手失败都不能降级为无认证、明文或直连。
-
-SOCKS5 的无认证/用户名密码模式不会自行提供传输加密；RFC 1929 的密码字段是明文子协商。[S03](#s03)、[S04](#s04)
-
-### 4. SOCKS5 CONNECT 必选适配器
-
-线上格式依据 RFC 1928/1929；本稿只实现所列认证方法，不宣称实现了 RFC 1928 中包括 GSSAPI 在内的全部认证要求。[S03](#s03)、[S04](#s04)
-
-#### 4.1 方法协商
-
-```text
-无认证配置：      Local → Node  05 01 00
-                 Node  → Local 05 00
-
-强制用户名密码：  Local → Node  05 01 02
-                 Node  → Local 05 02
-```
-
-只发送当前配置允许的方法。上游选择未提供的方法、版本不为 5，或返回 `05 FF` 都失败。用户名密码模式不得因为上游选 `00` 就接受降级。
-
-#### 4.2 用户名密码
-
-```text
-01 | ULEN[1] | USER[ULEN] | PLEN[1] | PASS[PLEN]
-上游应答：01 | STATUS[1]，STATUS=00 才成功
-```
-
-用户名和密码是编码后的 1..255 字节，按字节计长而不是字符数。本稿配置采用 UTF-8 字节，实际互操作需与节点约定一致；不能假定所有节点都接受所有 Unicode 凭据。
-
-密码通过 `password_ref` 从密钥存储读取，不写入普通配置和日志。入口 USERID 与这里的上游认证完全分离。
-
-#### 4.3 CONNECT 请求
-
-```text
-05 | 01 | 00 | ATYP | DST.ADDR | DST.PORT[2]
-```
-
-| 目标 | ATYP | DST.ADDR 编码 |
-|---|---|---|
-| IPv4 | `01` | 四个原始地址字节 |
-| Domain | `03` | 一字节名称长度 + 名称 ASCII 字节，**不带 NUL** |
-| IPv6 | `04` | 16 字节；留给内部扩展，不为 SOCKS4 增加原生 IPv6 入口 |
-
-Domain 示例 `example.com:443`：
-
-```text
-05 01 00 03 0B 65 78 61 6D 70 6C 65 2E 63 6F 6D 01 BB
-```
-
-与入口 SOCKS4a 不同，上游这里使用长度前缀，不附加 USERID，也不附加字符串结束零。
-
-IPv4 示例 `203.0.113.10:443`：
-
-```text
-05 01 00 01 CB 00 71 0A 01 BB
-```
-
-#### 4.4 完整读取 CONNECT 响应
-
-```text
-05 | REP | 00 | ATYP | BND.ADDR | BND.PORT[2]
-```
-
-先读 4 字节，检查版本、保留位和地址类型，再按类型读取剩余控制字段：
-
-| ATYP | 还需要读取 |
+| 所有者 | 契约 |
 |---|---|
-| `01` | 4 字节地址 + 2 字节端口 |
-| `03` | 1 字节长度 L，再读 L 字节地址 + 2 字节端口 |
-| `04` | 16 字节地址 + 2 字节端口 |
+| Connection | 解析入口、构造目标、生成本地回复；持有并读写下游 Channel，负责背压、EOF、取消和清理 |
+| Core | 对业务目标完成路由；PROXY 按节点引用选择匹配传输种类的 Wire；创建下游 Channel |
+| Wire | 提供实际节点端点与毫秒超时，管理启动、控制状态及编解码；不持有 Channel，不生成本地协议回复 |
 
-未知 ATYP、空 Domain 地址长度、截断、超长或错误保留位视为上游协议错误。即使请求是 IPv4，也必须能消费其他合法响应地址类型，不得固定只读 10 字节。
+DIRECT 使用目标端点。PROXY 连接 `getEndpoint()` 的实际端点，采用 `getTimeout()` 的连接超时；同一条 TCP 连接使用独立 Wire，节点端点不重新进入业务路由。
 
-`REP=00` 才可返回 `upstreamAccepted`。非零分别映射内部原因，入口统一失败：`01` general、`02` denied、`03` network-unreachable、`04` host-unreachable、`05` refused、`06` TTL-expired、`07` command-unsupported、`08` address-unsupported；其他值为 unknown-failure。
+### 启动与本地成功屏障
 
-失败响应也应在阶段预算内读取完整格式以保留诊断；截断则报告协议错误并关闭，不进入 relay。
+Channel 建立后，Connection 将同一个 NetworkAddress 传给 `start(handshake:)`。WireResult.outbound 是必须按序写入下游的控制字节，不能再次编码；inbound 是解码后的业务数据；ready 表示 Wire 自身的启动条件是否满足。
 
-上游响应之后同批到达的字节是业务数据，保存在 `upstreamRemainder`。在本地成功响应完整写完前不得发送给客户端。
+ready=false 时继续按预算读取下游，调用 decodeInbound 推进启动并处理必要控制输出。只有 ready=true 且此前必要控制输出全部写入成功，Connection 才能按本地入口规则进入下一阶段。不得假定存在统一的远端成功码，也不得等待首段业务数据判断就绪。
 
-#### 4.5 SOCKS5 状态机
+对需要本地成功回复的入口，业务数据必须排在完整成功回复之后；普通 HTTP 在 Wire 就绪后发送源站请求。Wire 的具体控制报文始终不进入入口解析器。就绪不等于最终目标应用已经成功。
 
-```text
-ResolveNode → ConnectTransport → [TLSHandshake]
-→ SendMethods → ReadMethod
-→ [SendCredentials → ReadAuthResult]
-→ SendConnect → ReadConnectHeader → ReadConnectAddress
-→ Ready | Failed
-```
+### 业务、错误与资源
 
-每个读写支持部分完成、绝对截止时间与取消。TCP 连上节点不等于 CONNECT 已成功。
+TCP 后续业务调用 encodeOutbound，address 为 nil；目标已经在 start 固定。收到的下游字节调用 decodeInbound，业务结果与必要控制输出分别保序。空解码结果不是 EOF。
 
-### 5. 接入已有 Shadowsocks：外部桥接方案
+Connection 在下游正常 EOF 时调用 finishInbound 检查截断；本地输入 EOF 时等已排队业务和控制输出写完再关闭下游输出方向。最终清理由 Connection 关闭所属 Channel 并释放 Wire 引用，不增加 Wire 的网络关闭操作。bufferedBytes 与结果队列一起计入预算。Wire 保留原始错误，Connection 在最高拥有边界统一决定本地失败和关闭；PROXY 失败不回退 DIRECT、不重放载荷，成功回复开始后不追加失败回复。
 
-```text
-应用
-  → SOCKS4/4a → 本服务 127.0.0.1:1080
-  → SOCKS5 CONNECT → sslocal 127.0.0.1:1086
-  → Shadowsocks 加密链路 → 远端 ssserver
-  → 业务目标
-```
+测试使用行为可观察的 Wire 与 Channel 验证接口及真实消费路径；具体实现的线上格式另行验收。更换 Wire 不应改变本地报文、本地凭据或目标来源，也不应增加入口专属节点协议分支。
 
-shadowsocks-rust 官方项目提供本地 SOCKS 入口，参见 [S11](#s11)。本稿使用它作为一种可替换外部节点，而非把它的配置格式合并到本服务中。
-
-此时本服务的 `outbound.type` 仍然是 `socks5`。Shadowsocks 密钥、算法、远端地址和协议版本由 sslocal 负责。必须确认桥接组件对于交给它的目标采用预期远端路径，不另行配置直连回退或不期望的目标本地解析。
-
-**握手成功的盲区：** 不同代理链实现可能在实际目标连接尚未完全可观察时就确认本地隧道。本服务只能声明“上游已接受”，不能凭外部桥接的响应独立证明远端已完成 TCP 建连。测试中要验证不可达目标怎样表现，记录晚失败，不等待第一字节才回复成功，否则服务器先发和客户端先发协议都可能出现死锁。
-
-### 6. 原生 Shadowsocks 的扩展边界
-
-不能把 SOCKS4 头部、SOCKS5 greeting 或未经加密的 `ATYP+address+port` 直接发给 Shadowsocks 服务端并称为支持。
-
-原生适配器必须固定协议版本、加密方法、密钥格式、分帧、nonce、认证失败、重放保护和首包策略。传统 AEAD 与 2022 的详细构造不同，不能只换一个算法名混用。[S14](#s14)、[S15](#s15)
-
-本稿不提供不完整的自研密码协议伪实现。引入原生适配器前应另交密码与互操作 SPEC，并明确没有通用 CONNECT 成功码时 `readyForRelay` 的含义。
-
-### 7. 可选扩展：SOCKS4a 上游
-
-Domain 目标按 [02](#doc-02-inbound-wire-protocol) 重新编码为 SOCKS4a；IPv4 按 SOCKS4 编码，用户标识来自出站配置，默认空，不复制入口 USERID。
-
-完整读取 8 字节响应，要求版本 0、结果 `0x5A`；其他结果均失败。不支持 IPv6 字面量。对方只有 SOCKS4 不支持 4a 时，Domain 目标失败，不静默本地解析。
-
-此适配器未包含在首版 JSON Schema 中；直接配置 `type=socks4a` 必须报“不支持的出站类型”。
-
-### 8. 可选扩展：HTTP/1.1 CONNECT
-
-```http
-CONNECT example.com:443 HTTP/1.1
-Host: example.com:443
-
-```
-
-实际行结束使用 `\r\n`，头部结束使用 `\r\n\r\n`；目标不带 URL scheme 或路径。IPv6 authority 扩展须使用方括号。
-
-依据 HTTP 语义，最终 2xx 成功后进入隧道，而不只限于 200；成功响应后不解析普通 HTTP 消息体，也不按其中 Content-Length / Transfer-Encoding 去吞掉隧道字节。[S05](#s05)
-
-扩展实现必须限制累计响应头 16 KiB、最多 4 个 1xx 中间响应；101 不作为本适配器成功。407 为认证失败，3xx 不跟随重定向，其他最终非 2xx 失败。必须保留头部结束后的预读业务字节。
-
-本稿不实现此适配器，也不接受相应配置；以上给出未来交付的最低边界，而不是声明已完整规定全部 HTTP 解析与认证机制。
-
-### 9. 超时、重试与故障
-
-DIRECT / 节点连接可以在固定候选集合内尝试其他 IP，但总预算不重置。首版不在 SOCKS5 协商失败后自动重建隧道，不跨节点故障转移。
-
-任何 PROXY 失败都不会变为 DIRECT。入口成功一旦开始，路由已经承诺；之后只能继续该通道或关闭，禁止新建通道重放缓存数据。
 
 ---
 
@@ -1113,8 +900,8 @@ Accepted → ReadingRequest → Validating → Routing
 | 入口握手绝对期限 | 10 s | TCP accept |
 | 出站总建连期限 | 20 s | 路由决策完成 |
 | 单次逻辑 DNS 期限 | 5 s | 发起解析，含等待解析额度 |
-| 单候选 TCP/TLS 建连期限 | 8 s | 发起该候选，含 TLS |
-| SOCKS5 上游协商期限 | 8 s | 节点传输 ready，覆盖所有认证和 CONNECT 阶段 |
+| 单候选 TCP 建连期限 | 8 s | 发起该候选 |
+| Wire 启动期限 | 8 s | 下游 Channel 就绪后至所需启动处理完成 |
 | 入口响应写期限 | 1 s | 首次尝试写该响应 |
 | 完整双向 relay 空闲期限 | 0，关闭 | 最近实际业务转发进展 |
 | 半关闭最大存活期限 | 30 s | 首次观察到某一方向 EOF |
@@ -1199,7 +986,7 @@ Client 发完请求并 shutdown(write)
 
 对客户端请求后紧跟 FIN 的场景，头部完成与 EOF 都要保留，先建连、回复成功、转发剩余载荷，再向出站传递 EOF。不要把 EOF 直接等同于整个连接不可写。
 
-TLS 出站适配层也必须验证可用的单向关闭行为；不能在接口里写 `finishWrite`，实现却总是取消整条连接。TLS 适配器不满足反向继续读取测试时，不得宣称通过该传输能力验收。
+PROXY 在下游正常 EOF 时调用 Wire.finishInbound 检查完整性；本地输入结束由 Connection 排空写入并半关闭 Channel，不能把关闭整条 Channel 当作单向结束。不满足反向继续读取测试时，不得宣称通过半关闭验收。
 
 ### 7. 异常、取消和清理
 
@@ -1219,7 +1006,7 @@ RST、读写错误、显式停止会话、超时：取消两个方向并关闭�
 
 ### 9. 禁止的自动补救
 
-禁止 PROXY 失败改 DIRECT；禁止 HTTPS 失败改 HTTP；禁止证书错误跳过验证；禁止成功响应后切节点重放；禁止目标无响应就假定目标需要本地 DNS。
+禁止 PROXY 失败改 DIRECT；禁止放宽 Wire 要求的校验；禁止成功响应后切节点重放；禁止目标无响应就假定目标需要本地 DNS。
 
 这些行为即使偶尔“让网页能打开”，也改变了调用方的隐私或传输语义，必须作为未来显式产品能力评审，不能隐藏在异常处理里。
 
@@ -1233,7 +1020,7 @@ RST、读写错误、显式停止会话、超时：取消两个方向并关闭�
 
 ### 1. 文件格式
 
-使用 UTF-8 JSON，顶层 `schema_version=1`。完整示例见 [本机桥接配置](#attachment-examples-config-local-bridge-json)、[直连配置](#attachment-examples-config-direct-only-json)、[受控测试配置](#attachment-examples-config-test-json)。
+使用 UTF-8 JSON，顶层 `schema_version=1`。完整示例见 [Wire 路由配置](#attachment-examples-config-wire-route-json)、[直连配置](#attachment-examples-config-direct-only-json)、[受控测试配置](#attachment-examples-config-test-json)。
 
 所有顶层和子对象的已定义字段均必须提供，除非 schema 的分支明确声明为可选。本文“默认值”是创建新配置时采用的初值，不意味着运行时漏填字段会悄悄获得同样设置。禁止注释、重复 JSON key、未知字段和未支持的枚举值。
 
@@ -1245,27 +1032,43 @@ RST、读写错误、显式停止会话、超时：取消两个方向并关闭�
 
 ```json
 {
-  "listen": {"host":"127.0.0.1","port":1080},
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 1080
+  },
   "routing": {
     "rules": [
-      {"id":"local-direct","match":{"type":"domain_suffix","value":"local"},"action":"DIRECT"},
-      {"id":"lan-direct","match":{"type":"ip_cidr","value":"192.168.0.0/16"},"action":"DIRECT"}
+      {
+        "id": "local-direct",
+        "match": {
+          "type": "domain_suffix",
+          "value": "local"
+        },
+        "action": "DIRECT"
+      },
+      {
+        "id": "lan-direct",
+        "match": {
+          "type": "ip_cidr",
+          "value": "192.168.0.0/16"
+        },
+        "action": "DIRECT"
+      }
     ],
-    "final": {"action":"PROXY","outbound":"main"}
+    "final": {
+      "action": "PROXY",
+      "outbound": "main"
+    }
   },
-  "outbounds": [{
-    "id":"main",
-    "type":"socks5",
-    "server":"127.0.0.1",
-    "port":1086,
-    "auth":{"method":"none"},
-    "transport":{"type":"tcp","allow_insecure":false},
-    "dns_strategy":"remote"
-  }]
+  "outbounds": [
+    {
+      "id": "main"
+    }
+  ]
 }
 ```
 
-`127.0.0.1:1080` 是本产品入口，`127.0.0.1:1086` 是示例外部节点。若 1086 没有服务，PROXY 路径失败，不自动转直连。
+`127.0.0.1:1080` 是示例入口，`main` 只表示运行配置中的节点引用。对应 Wire 或节点端点不可用时，PROXY 路径失败，不自动转直连。
 
 ### 3. 顶层字段
 
@@ -1276,7 +1079,7 @@ RST、读写错误、显式停止会话、超时：取消两个方向并关闭�
 | `limits` | 会话、超时与缓冲预算 |
 | `dns` | 系统解析接口策略，不是 DNS 服务监听配置 |
 | `routing` | 有序规则及显式 final |
-| `outbounds` | 节点定义；DIRECT/REJECT 不需要节点 |
+| `outbounds` | 运行配置中的不透明节点引用；不定义节点协议字段 |
 | `security` | 客户端 CIDR、目标地址防护、精确例外 |
 | `observability` | 日志级别、目标脱敏、内部指标开关 |
 
@@ -1294,7 +1097,7 @@ RST、读写错误、显式停止会话、超时：取消两个方向并关闭�
 
 | 字段 | 本稿允许值/初值 |
 |---|---|
-| `resolver` / `bootstrap` | 均必须 `system` |
+| `resolver` | 必须 `system`；只用于入口 DIRECT 目标解析 |
 | `resolve_for_routing` | 必须 `false`；true 为不支持的功能 |
 | `application_cache` | 必须 `false`；不影响操作系统缓存 |
 | `direct_address_family` | 必须 `dual`，表示可使用 A/AAAA 候选 |
@@ -1302,37 +1105,15 @@ RST、读写错误、显式停止会话、超时：取消两个方向并关闭�
 | `max_addresses` | 1..16，默认 16 |
 | `connect_candidate_delay_ms` | 10..2000，默认 250 |
 
-`outbound.dns_strategy` 首版仅允许 `remote`。这表示 Domain 目标交给上游，不表示该节点自己的域名无需 Bootstrap DNS。
+PROXY 将域名目标交给 Wire；入口配置不定义 Wire 的名称处理策略，节点配置装配中的解析与入口目标 DNS 分开。
 
-### 6. 出站节点
+### 6. 节点引用与 Wire 配置边界
 
-首版 `type` 仅接受 `socks5`。`server` 可为规范 IPv4、IPv6 或合法 ASCII 主机名，不带端口、scheme、路径或方括号；`port` 独立提供。
+出站配置在本文只表示对运行配置中节点的引用。`outbounds` 示例中的 `id` 由配置装配层关联到模型规定的节点 UUID；这些示例是入口策略资料，不是完整节点配置，也不是新增的 Magent 公共配置 API。
 
-认证两种形式：
+Core 根据引用选择可用 Wire；具体节点协议、凭据、启动参数和端点构造由节点模型及 Wire 配置负责。入口不得增加自己的出站 `type`、认证方法、传输协议或远端控制消息字段。默认节点和规则引用的校验时机遵循模型规范；选中后不可用必须失败，不能解释为 DIRECT。
 
-```json
-{"method":"none"}
-```
-
-```json
-{"method":"username_password","username":"proxy-user","password_ref":"keychain://proxy-main/password"}
-```
-
-`password_ref` 是本产品密钥提供器接口，不是 SOCKS 协议语法。macOS 实现应使用 Keychain；密钥不存在或无法读取时，节点不可用，不允许回退无认证。用户名与解引用后的密码分别按 UTF-8 编码检查 1..255 字节。
-
-传输两种形式：
-
-```json
-{"type":"tcp","allow_insecure":false}
-```
-
-```json
-{"type":"tls","server_name":"proxy.example.net","verify_certificate":true}
-```
-
-TCP 的 `allow_insecure=false` 只允许配置数值回环节点；hostname 或非回环 IP 必须显式设 true，避免解析后意外走明文远端。即使选择 true，节点最终地址仍要执行自身监听回环检查。
-
-TLS 的 `server_name` 为用于验证节点证书的 ASCII DNS 名称，不进行独立 DNS 查询；实际拨号地址由 `server` 决定。`verify_certificate` 不允许 false。不把目标域名填成节点验证名称。
+运行时连接实际节点端点前仍须执行适用的端点安全检查。节点域名如需预先解析，由配置装配边界完成；入口只消费 Core / Wire 提供的实际端点，不为代理业务目标执行本地 DNS。
 
 ### 7. 资源限制初值
 
@@ -1342,7 +1123,7 @@ TLS 的 `server_name` 为用于验证节点证书的 ASCII DNS 名称，不进�
 | `handshake_timeout_ms` | 10000 |
 | `connect_total_timeout_ms` | 20000 |
 | `dns_timeout_ms` | 5000 |
-| `dial_timeout_ms` / `upstream_handshake_timeout_ms` | 8000 / 8000 |
+| `dial_timeout_ms` / `wire_start_timeout_ms` | 8000 / 8000 |
 | `reply_write_timeout_ms` | 1000 |
 | `relay_idle_timeout_ms` | 0，禁用 |
 | `half_close_timeout_ms` / `shutdown_grace_ms` | 30000 / 30000 |
@@ -1383,7 +1164,7 @@ deny_target_cidrs 命中 → 拒绝
 → 编译完整快照 → 尝试监听或原子发布
 ```
 
-schema 不覆盖的必需检查：ID 重复、引用不存在、CIDR host bits、错误 hostname、密码编码后过长、监听与节点的数值自回环、TLS 能力未编译、配置字段的跨版本不兼容。
+schema 不覆盖的必需检查：ID 重复、引用不存在、CIDR host bits、错误 hostname、节点引用非法、监听与节点的数值自回环、Wire 能力不可用、配置字段的跨版本不兼容。
 
 DNS 节点解析后的自回环等运行时才能确定的事项在实际建连时再次检查，不能只靠启动时字符串比较。
 
@@ -1444,11 +1225,10 @@ ProxyError {
 | `RULE_REJECT` | 规则明确拒绝 | 5B，无 DNS/出站 |
 | `TARGET_ADDRESS_DENIED` / `SELF_PROXY_LOOP` | 安全防护 | 5B，无违规拨号 |
 | `DNS_TIMEOUT` / `DNS_FAILED` / `NO_USABLE_ADDRESS` | 系统解析失败/无可用候选 | 5B |
-| `CONNECT_TIMEOUT` / `CONNECTION_REFUSED` | TCP/TLS 传输无法建立 | 5B |
-| `TLS_VERIFICATION_FAILED` | 节点证书不可信或名称不符 | 5B，禁止降级 |
-| `UPSTREAM_AUTH_FAILED` | 认证方法/凭据不被接受 | 5B，禁止降级 |
-| `UPSTREAM_PROTOCOL_ERROR` | 上游版本、字段或帧截断 | 5B |
-| `UPSTREAM_REJECTED` | SOCKS5 REP 非零 | 5B，保留内部 REP |
+| `CONNECT_TIMEOUT` / `CONNECTION_REFUSED` | 下游 Channel 无法建立 | 5B |
+| `WIRE_START_FAILED` | Wire 启动失败 | 5B，无 DIRECT 回退 |
+| `WIRE_REJECTED` | Wire 报告操作被拒绝 | 5B，保留原始原因 |
+| `WIRE_DECODE_FAILED` | Wire 输入非法或 EOF 截断 | 5B；已成功则只关闭 |
 | `OUTBOUND_ADDRESS_UNSUPPORTED` | 不能传递目标地址类型 | 5B，不临时本地解析 |
 | `RELAY_IO_ERROR` / `RELAY_IDLE_TIMEOUT` | 建连后错误/空闲限制 | 只关闭 |
 | `HALF_CLOSE_TIMEOUT` | 单方向已关闭但对向未结束 | 只关闭 |
@@ -1468,15 +1248,15 @@ ProxyError {
 
 DNS 结果必须经过数值目标检查，并在随后连接中固定使用。禁止目标访问本服务自身监听端点；相同检查适用于节点地址。IPv4-mapped IPv6 先规范化，不能用文本变体绕过。
 
-默认拒绝目标网段中包含回环及链路本地范围；受控测试的精确例外见 [08](#doc-08-configuration)。上游地址有独立权限语义，允许本机 1086 桥接，不代表允许应用任意访问本机端口。
+默认拒绝目标网段中包含回环及链路本地范围；受控测试的精确例外见 [08](#doc-08-configuration)。节点端点有独立授权语义，不能把允许某个节点扩展为允许任意本机业务目标。
 
 代理域名的远端解析盲区须由节点侧 ACL 处理；本地不能声称单靠域名透传就保证远端不会访问敏感地址。详见 [05](#doc-05-dns-and-addresses)。
 
 ### 5. 密钥与加密
 
-不记录原始 USERID、密码、认证帧、业务字节、完整配置秘密。上游用户名密码认证本身不能替代加密传输；有关明文密码风险见 [S04](#s04)。
+不记录原始 USERID、节点凭据、控制帧、业务字节或完整配置秘密。USERID 不能用作本地身份认证，也不能用作 Wire 的节点凭据。
 
-节点 TLS 由平台实现并执行正常证书验证，禁止在失败后降级。Shadowsocks 的密码能力由外部桥接或未来独立适配器承担，不能以“使用了 SOCKS”推断已有加密。
+具体出站的安全机制由 Wire 及节点配置负责；入口不解释或放宽这些要求，不因本地 SOCKS4 握手成功就宣称链路受保护。
 
 ### 6. 日志事件
 
@@ -1529,7 +1309,7 @@ DNS 结果必须经过数值目标检查，并在随后连接中固定使用。�
 
 先确认客户端确实使用 SOCKS4a 而不是已经解析后的 SOCKS4；再看 target_kind 和命中规则。随后区分目标 DNS 与节点 DNS，检查选中的 outbound 和具体失败 phase。
 
-最后检查上游确认与业务断开是否分开：代理已接受后目标应用再断开，不能倒推为本地解析器失败。默认脱敏不够诊断时，用户可在本机受控时间窗开启完整目标日志，但不得开启业务载荷日志来替代结构化观测。
+最后检查 Wire 就绪与业务断开是否分开：本地成功后目标应用再断开，不能倒推为本地解析器失败。默认脱敏不够诊断时，用户可在本机受控时间窗开启完整目标日志，但不得开启业务载荷日志来替代结构化观测。
 
 ---
 
@@ -1541,9 +1321,9 @@ DNS 结果必须经过数值目标检查，并在随后连接中固定使用。�
 
 ### 1. 测试分层与环境
 
-协议解析器、规则引擎、安全检查、预算管理必须可以脱离真实网络单测。系统解析、TCP/TLS、SOCKS5 节点使用可控替身验证，再用实际适配器做集成验证。
+协议解析器、规则引擎、安全检查和预算管理须可脱离真实网络单测；系统解析、Channel 和 Wire 使用可控替身，再通过受控传输做集成验证。
 
-测试环境准备三个独立角色：本服务；可控制延迟、分片和错误码的 SOCKS5 假节点；支持回显、服务器先发、半关闭和限速的 TCP 目标。外部 Shadowsocks 桥接再增加独立互操作场景。
+测试环境包含本地入口、可观察启动和编解码行为的测试 Wire，以及支持回显、服务器先发、半关闭和限速的受控业务目标。具体出站协议不作为本地入口测试的固定依赖。
 
 文档地址 `192.0.2.0/24`、`198.51.100.0/24`、`203.0.113.0/24` 只作示例，不假设可公网连通。[S13](#s13)
 
@@ -1594,37 +1374,35 @@ DNS 结果必须经过数值目标检查，并在随后连接中固定使用。�
 |---|---|---|
 | D01 | SOCKS4 IPv4 DIRECT/PROXY | 本服务 Target DNS 均为 0 |
 | D02 | SOCKS4a Domain DIRECT | 一次逻辑系统解析，连接被检查的数值候选 |
-| D03 | SOCKS4a Domain PROXY | 本服务 Target DNS 为 0；上游收到 ATYP=03 |
-| D04 | 节点是域名 | 只有 bootstrap 解析，名称是节点而非业务目标 |
-| D05 | 节点是 IP + 独立 TLS server_name | 不为 server_name 再查 DNS |
+| D03 | SOCKS4a Domain PROXY | 入口 Target DNS 为 0；Wire 收到域名 NetworkAddress |
+| D04 | 节点配置名称解析 | 配置装配与入口目标 DNS 分开；入口只消费实际节点端点 |
+| D05 | 读取 Wire 实际端点 | getter 无 DNS / I/O；保持端点地址族与端口 |
 | D06 | 解析结果含被拒绝与可用 IP | 过滤拒绝项；不拨号被拒绝项 |
 | D07 | DNS 首次返回 A，第二次返回敏感地址 B | 一次会话不得二次按 hostname 拨号；实际使用 A |
 | D08 | DNS 超时后返回成功 | 过期会话不再拨号；真实解析并发数仍有界 |
 | D09 | 系统接口拿不到 TTL | 不声称取得/缓存了真实 TTL |
-| D10 | 外部 sslocal 桥接 | 单独记录该进程是否本地解析目标、是否回退直连 |
+| D10 | 更换 Wire 实现 | 入口的 PROXY 目标 DNS 为零，失败不回退 DIRECT |
 
-抓取网卡上的明文 UDP 53 只能覆盖一部分解析流量，不能证明没有系统缓存或加密 DNS。验收至少同时使用可注入 Resolver 计数、假上游收到的请求地址类型、以及真实集成环境的网络观测。
+抓取网卡上的明文 UDP 53 只能覆盖一部分解析流量，不能证明没有系统缓存或加密 DNS。验收至少同时使用可注入 Resolver 计数、测试 Wire 收到的 NetworkAddress、以及真实集成环境的网络观测。
 
-D03 的强保证范围是本服务发起的解析操作，不包含应用在进入 SOCKS4 前自行解析、节点 Bootstrap 和外部桥接自己的策略。
+D03 的保证范围是本地入口发起的解析操作；客户端预解析、节点配置装配和 Wire 自身行为分别验收。
 
-### 5. 出站协议测试
+### 5. Wire 集成测试
 
-| ID | 场景 | 必须观察到 |
+| ID | 场景 | 必须断言 |
 |---|---|---|
-| O01 | 无认证成功 | 精确发送 `05 01 00`，再发 CONNECT |
-| O02 | 强制用户名密码，上游选择 00 | 拒绝降级，不发送业务字节 |
-| O03 | 认证失败或方法 FF | 入口 5B，无 DIRECT |
-| O04 | Domain CONNECT | 长度前缀，不带 NUL，不混入入口 USERID |
-| O05 | 上游响应 ATYP 为 IPv4、Domain、IPv6 | 全部完整消费，无残留控制字段 |
-| O06 | 响应分片、错误版本、非零 RSV、未知 ATYP | 分片能继续；非法字段失败 |
-| O07 | REP=01..08 或未知非零 | 内部分类正确，入口统一 5B |
-| O08 | 节点 TCP 连接成功但 CONNECT 不应答 | 不能提前 5A；阶段/总预算终止 |
-| O09 | 成功响应与服务器 greeting 同次到达 | 客户端先收到完整 8 字节 5A，再 greeting |
-| O10 | 节点 TLS 证书名称不符 | 失败，不跳过验证，不转明文 |
-| O11 | 外部桥接目标不可达 | 记录早失败/晚失败边界，不谎称最终目标已被独立验证 |
-| O12 | 服务器先发协议 | 不需要等待客户端 payload 才完成入口成功 |
-
-可选 HTTP CONNECT / SOCKS4a 出站只有宣称实现后才增加测试；未实现构建必须拒绝相应配置。
+| O01 | Core 选择 Wire | 每条 TCP 路由只选择一次；节点端点与业务目标分离 |
+| O02 | Wire 启动 | 同一个规范化目标传给 start；按 WireResult 推进启动，不透传本地凭据或入口握手 |
+| O03 | Wire 初始化、启动或编解码失败 | 由 Connection 处理本地失败；没有 DIRECT 回退 |
+| O04 | 域名与数值目标 | Wire 收到模型规定的地址身份、根点和端口；PROXY 目标 DNS 为零 |
+| O05 | Wire 返回错误 | 保留原始原因；不复制具体出站协议的状态码或控制字节 |
+| O06 | 下游输入分片、暂未解出业务数据 | Wire 保留协议状态；入口不丢字节、不误判 EOF |
+| O07 | 启动后立即产出业务数据 | 本地成功回复与业务余量按入口规定排序 |
+| O08 | 启动写未完成、超时或取消 | ready 和必要控制写入均满足才就绪；迟到回调不能恢复会话 |
+| O09 | 双向业务数据 | 出站经过 encode，入站经过 decode，入口只消费业务数据 |
+| O10 | 更换测试 Wire | 入口报文、目标来源和本地回复契约不变 |
+| O11 | 节点等于本服务监听端点 | 拒绝递归连接并清理已申请资源 |
+| O12 | 无启动字节及服务器先发 | 不等待客户端首段载荷；就绪后正常完成本地回复 |
 
 ### 6. 转发、并发与生命周期
 
@@ -1719,148 +1497,24 @@ REQ-001..018 对应的测试必须通过；基础对应关系如下：
 
 <a id="doc-11-swift-implementation-plan"></a>
 
-## 11 · macOS / Swift 落地结构与实施任务
+## 11 · Swift 实现边界与实施任务
 
 [返回目录](#doc-readme)
 
-本章给出适合 Swift 项目的结构建议，不指定尚未核验的库版本，也不把接口草案伪装成可直接启动的应用。Apple Network.framework 的连接入口可参考 [S17](#s17)。
+实现沿用 MagentTCPConnection、Socks4Connection、MagentCore 和 Wire 的现有所有权边界。协议模型使用 MODELS_SPEC.md 中的构造入口；不为 SOCKS4 新建节点类型、具体出站 connector 或绕过模型校验的地址工厂。
 
-### 1. 模块建议
-
-```text
-ProxyCore/
-  Model/          Target, RouteDecision, ProxyError, ConfigSnapshot
-  Protocol/       Socks4Decoder, Socks4ReplyEncoder, HostNormalizer
-  Routing/        RuleCompiler, RuleEngine, TargetGuard
-  DNS/            Resolver, SystemResolverAdapter, ResolutionBudget
-  Transport/      AsyncByteStream, TCPStreamAdapter, TLSStreamAdapter
-  Outbound/       DirectConnector, Socks5Connector, SecretProvider
-  Runtime/        Listener, AdmissionController, ProxySession, DuplexRelay
-  Configuration/  ConfigLoader, SemanticValidator, SnapshotStore
-  Observability/  EventSink, Metrics, Redaction
-ProxyCoreTests/
-  ProtocolTests, RoutingTests, DNSTests, OutboundTests, RelayTests, ConfigTests
-ProxyApp/
-  UI, lifecycle, settings integration
-```
-
-协议解析与路由测试不依赖 SwiftUI/AppKit。系统代理设置、PAC 和 UI 错误弹窗不得侵入单连接的快速路径。
-
-### 2. 核心接口草案
-
-下面定义数据边界；IP/域名校验工厂、实际网络适配器和错误实现仍需补齐。
-
-```swift
-import Foundation
-
-// IPv4 用网络顺序的数值表示，由受控初始化函数生成。
-enum TargetHost: Sendable {
-    case ipv4(UInt32)
-    case domain(String)
-}
-
-struct Target: Sendable {
-    let host: TargetHost
-    let port: UInt16 // 构造时拒绝 0
-}
-
-enum StreamRead: Sendable {
-    case bytes(Data) // 必须非空
-    case eof
-}
-
-protocol AsyncByteStream: AnyObject, Sendable {
-    func read(maxBytes: Int) async throws -> StreamRead
-    func writeAll(_ bytes: Data) async throws
-    func finishWrite() async throws
-    func abort() async
-}
-
-enum Readiness: Sendable {
-    case tcpConnected
-    case upstreamAccepted
-}
-
-struct EstablishedStream: Sendable {
-    let stream: any AsyncByteStream
-    let upstreamRemainder: Data
-    let readiness: Readiness
-}
-
-struct ConnectContext: Sendable {
-    let deadline: ContinuousClock.Instant
-    let snapshotID: String
-}
-
-protocol OutboundConnector: Sendable {
-    func connect(
-        target: Target,
-        context: ConnectContext
-    ) async throws -> EstablishedStream
-}
-```
-
-不要让 `connect` 仅返回 `NWConnection` 而丢掉上游预读尾部、readiness 和控制协议消费边界。真实数据模型还应包含 [01](#doc-01-architecture-and-model) 中的地址与统计元信息。
-
-### 3. 解析器实现风格
-
-`Socks4Decoder` 用独立 `struct` 保存状态、计数和扫描游标，`feed` 同步执行。`HostNormalizer`、`RuleEngine` 保持纯函数，避免在复杂业务函数里堆叠大量几十行的嵌套函数。
-
-顶层类型名采用 `Socks4Decoder`、`TargetHost`，枚举 case 采用 `.needMore`、`.complete`、`.invalid`。线上的大写 `DIRECT` / `PROXY` / `REJECT` 是配置编码，不要求 Swift case 也全大写。
-
-读取 UInt16 不对未对齐 Data 指针做不安全强制解引用；使用逐字节位移或已验证的 buffer API。Data 切片要关注真实索引和底层持有内存，不假设切片总从索引 0 开始。
-
-### 4. SessionCoordinator 与并发
-
-每条会话需要单一状态协调者，可以是 actor 或专用串行执行上下文。actor 并不意味着跨 `await` 的多个操作自动原子：读取状态 → await 网络 → 写状态之间仍可能发生取消和其他回调。
-
-所有会改变 `replyState`、`terminalReason`、资源所有权的操作，应由协调者检查 generation 和当前状态后提交。不得用无界 `Task.detached` 包装每次收包或阻塞 DNS。
-
-Relay 两个方向是受会话拥有的子任务。采用任务组时要区分正常 EOF 和异常：一个子任务正常返回不代表应该 `cancelAll()`。异常取消则必须同步关闭底层流，让悬挂读写真正结束。
-
-### 5. Network.framework 或其他传输层
-
-可用 Network.framework 适配 TCP/TLS，也可采用具有背压和半关闭能力的其他异步 socket 层。这里只规定必须满足的行为，不假定某一个高级 API 自动满足所有代理需求。
-
-Listener 必须显式绑定配置地址，不能只设置端口就认为默认是回环。传输层不能再次使用系统 SOCKS/HTTP 代理设置；应以实际连接追踪验证，不靠 UI 上“DIRECT”字样判断。
-
-接收回调如果同时包含数据和终止状态，必须先交付数据，再交付 EOF。处理系统的空回调、连接失败、发送完成和取消时，统一到 AsyncByteStream 契约，避免错误地把空 Data 当 EOF。
-
-需要测试写半关闭在 TCP 和 TLS 适配器里的真实效果。若某个所选 API 无法保留反向读取，必须更换适配方案或不声明该传输已通过验收，不能隐式全关闭。
-
-### 6. 系统解析接口
-
-Resolver 是可替换协议；测试实现按输入返回固定 IP 和可控延迟。系统适配器可封装平台解析能力，但必须满足绝对名称、A/AAAA、超时观察和实际并发限额。
-
-阻塞 `getaddrinfo` 不能直接占用处理大量连接的执行线程；如使用受限工作池，超时后尚未完成的调用仍占池额度。禁止通过每次调用都新开线程的方式制造“异步”。
-
-不同平台/SDK 对取消和名称服务的支持不同，须写平台专项测试；此接口草案不承诺某个未测试 SDK 能取消底层 DNS 查询。
-
-### 7. 实施顺序与完成条件
+解析器保存独立字段计数与扫描游标，按本 SPEC 返回 consumed / remainder。accepted Channel 与下游 Channel 在所属 EventLoop 上有序协作；Wire 不创建 Channel、线程或任务。半关闭、背压和关闭竞争按第 07 节验收。
 
 | 阶段 | 工作 | 完成条件 |
 |---|---|---|
-| M1 | 数据模型、字节解析器、规范化、回复编码 | P 系列纯单测通过 |
-| M2 | 规则引擎、安全检查、配置 schema 与语义校验 | R、C、S01..S03 通过 |
-| M3 | AsyncByteStream、受限系统解析、DIRECT、半关闭 | D01/D02/D06..D09、L01..L06 通过 |
-| M4 | SOCKS5 出站、凭据、外层 TLS、节点回环保护 | O 系列、D03..D05、S05 通过 |
-| M5 | 会话预算、全局缓冲、日志指标、停机与热更新 | 全部 L、S、C 系列通过 |
-| M6 | macOS UI 接入和外部 sslocal 互操作 | 真实客户端、DNS 观测、桥接晚失败报告完成 |
+| M1 | 入口模型适配、增量解析和回复 | P 系列通过 |
+| M2 | Core 路由、地址安全与配置引用 | R、C、S 系列通过 |
+| M3 | DIRECT、DNS、半关闭 | D、L 系列的直连路径通过 |
+| M4 | 抽象 Wire 启动、编解码与失败路由 | O 系列通过 |
+| M5 | 预算、取消、日志与服务生命周期 | 剩余 L/C/S 项通过 |
+| M6 | 真实客户端与受控传输集成 | 字节、DNS 调用及资源回收证据完整 |
 
-不以“浏览器打开一次网页”代替 M4/M5 验收。服务器先发、客户端写半关闭、慢速接收和超时取消是发布前必测路径。
-
-### 8. 交给编码代理的任务模板
-
-```text
-阅读 README 与 00..10 的 SPEC。先实现 M1，遵循已有 Swift 工程约定。
-不要增加 SOCKS5 入站、UDP、DNS 监听、SNI 嗅探或未规定的 fallback。
-先把 examples/parser-vectors.json 接入单元测试。
-协议组件必须纯计算；保存 consumed 与 remainder；不能执行网络。
-接口、错误枚举和测试必须提交；暂不实现 UI 和真实出站。
-若已有工程命名冲突，做明确适配，不静默改变线上字段或规则语义。
-```
-
-后续每阶段分别引用自己的验收条件。先拆模块再集成，不要求编码代理一次同时重写 UI、网络栈和密码协议。
+测试 Wire 与受控 Channel 用于验证入口集成边界。具体出站协议的互操作在对应 Wire 的验收中进行，不能用一次入口成功替代整条链路的验收。
 
 ---
 
@@ -1902,33 +1556,18 @@ Resolver 是可替换协议；测试实现按输入返回固定 IP 和可控延�
 
 这说明“客户端使用 SOCKS4a”只把解析决策交给本地代理，**不意味着所有请求都由远端 DNS 解析**。最终解析位置由 DIRECT/PROXY 路径决定。
 
-### 实例 C：SOCKS4a 域名未命中，走上游
+### 实例 C：SOCKS4a 域名选择 PROXY
 
-目标 `outside.example.net:443`，USERID 为空；原始名字只用于受控示例，不假设公共 DNS 中存在。
+目标为 `outside.example.net:443`，USERID 为空：
 
 ```text
 04 01 01 BB 00 00 00 01 00
 6F 75 74 73 69 64 65 2E 65 78 61 6D 70 6C 65 2E 6E 65 74 00
 ```
 
-解析得到 Domain，未命中任何示例直连或拒绝规则，final 选择 `PROXY(main)`。
+Connection 构造逻辑域名目标并提交 Core。Core 选择 Wire；Connection 连接该 Wire 的实际端点，将原目标传给 `start(handshake:)`，通过 WireResult 和后续 decodeInbound 完成启动。本服务不解析这个 PROXY 业务域名。
 
-main 是数值回环节点 `127.0.0.1:1086`，所以本服务这次既不执行 Target DNS，也不执行 Bootstrap DNS。先连接该端口，再进行 SOCKS5：
-
-```text
-Local → main   05 01 00
-main  → Local  05 00
-
-Local → main   05 01 00 03 13
-               6F 75 74 73 69 64 65 2E 65 78 61 6D 70 6C 65 2E 6E 65 74
-               01 BB
-
-main  → Local  05 00 00 01 00 00 00 00 00 00
-```
-
-`0x13=19` 是 ASCII 名称长度。SOCKS5 响应中的地址/端口只是格式示例，不能据此推断最终目标 IP。上游完整报告成功后，本地返回八字节 SOCKS4 成功；之后只转发业务字节。
-
-main 如果是 sslocal，余下的 Shadowsocks 加密、远端解析和目标连接由它与远端节点承担；本服务不能从 SOCKS5 确认独立看到整条后续链路。机制见 [06](#doc-06-outbound-connectors)。
+WireResult.ready=true 且必要控制输出写完后，本地回复 `00 5A 00 00 00 00 00 00`。后续业务数据经同一个 Wire 编解码。示例不规定任何节点协议报文，也不由本地回复推断远端应用已成功。
 
 ### 实例 D：客户端只交了 IP，却希望按域名走
 
@@ -1954,7 +1593,7 @@ main 如果是 sslocal，余下的 Shadowsocks 加密、远端解析和目标连
 
 ### 实例 F：上游不可用
 
-与实例 C 相同，但 1086 没有服务或拒绝连接。本地最多在本稿出站预算内失败，返回 5B。目标直连适配器调用次数必须为零。
+与实例 C 相同，但 Wire 提供的实际端点不可用或拒绝连接。本地最多在本稿出站预算内失败，返回 5B。目标直连适配器调用次数必须为零。
 
 用户看到“代理失败”比在不知情的情况下走直连更符合该规则契约。不得把默认路由 PROXY 理解为“优先代理，失败就算了”。
 
@@ -1968,20 +1607,13 @@ Client write #3：61 6D 70 6C 65 2E 63 6F 6D 00 AA BB CC
 
 解析器等到第三批才完成 21 字节头部；`AA BB CC` 进入 clientRemainder，不当作域名。出站成功后本地先完整写 5A，再把这三个业务字节交给出站。
 
-如果上游 CONNECT 成功响应后紧跟 `HELLO\n`，它进入 upstreamRemainder，也必须排在本地 8 字节成功响应后才能发给客户端。两个方向的尾部各自保序，不要求彼此建立额外的全局顺序。
+如果 Wire 启动后立即解出 `HELLO\n`，它进入业务余量，也必须排在本地 8 字节成功响应之后。两个方向的余量各自保序。
 
-### 实例 H：节点自身是域名
+### 实例 H：节点端点与业务目标分离
 
-假设节点配置 `server=proxy.example.net`，业务目标仍为 `outside.example.net`。本服务会解析前者用于建立节点连接，但不解析后者。
+业务目标仍为 `outside.example.net:443`；Wire 提供已经装配的实际节点端点。Connection 只拨号节点端点，不将该端点再次交给业务规则引擎，也不替换业务目标。
 
-日志必须区分：
-
-```text
-dns purpose=upstreamBootstrap, name=proxy.example.net
-route action=PROXY, target_dns_owner=upstream
-```
-
-这里只为解释展示名称；普通日志默认脱敏。抓包看到 proxy.example.net 查询，不能据此断言业务域名被本地解析。
+节点配置的名称解析属于配置装配边界；入口的 Target DNS 计数仍为零。日志分别记录目标、节点引用及实际连接端点，名称默认脱敏。
 
 ### 实例 I：实际 TCP 业务的半关闭
 
@@ -1991,7 +1623,7 @@ route action=PROXY, target_dns_owner=upstream
 
 ### 实例 J：为什么不需要单独 DNS 服务端口
 
-整个链路只需要本地 TCP SOCKS 监听和出站连接。DIRECT 使用操作系统已有名称解析能力；PROXY 使用上游协议的名称字段。没有任何步骤要求本服务开一个面向应用的 DNS 端口。
+整个链路只需要本地 TCP SOCKS 监听和出站连接。DIRECT 使用操作系统已有名称解析能力；PROXY 将域名 NetworkAddress 交给 Wire。没有任何步骤要求本服务开一个面向应用的 DNS 端口。
 
 只有计划接管应用自己的 DNS 请求、提供 fake-IP、透明代理 UDP 或按解析结果做额外规则时，才需要另行设计相关能力；这些不属于本版。
 
@@ -2028,21 +1660,8 @@ route action=PROXY, target_dns_owner=upstream
 
 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928.html)
 
-重点为方法协商、CONNECT 地址类型、名称长度字段、完整响应格式、绑定地址语义及 UDP 与 TCP 的区别。
+仅用于说明 SOCKS4 与另一种本地入口在地址及 UDP 能力上的区别，不定义出站报文。
 
-<a id="s04"></a>
-#### S04 · RFC 1929 · 用户名密码认证
-
-[RFC 1929](https://www.rfc-editor.org/rfc/rfc1929.html)
-
-用于核对认证版本、字段字节长度和明文密码安全边界。
-
-<a id="s05"></a>
-#### S05 · RFC 9110 · HTTP CONNECT
-
-[RFC 9110，§9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6)
-
-只用于可选 HTTP CONNECT 扩展的语义边界，不代表首版已经实现该协议。
 
 <a id="s06"></a>
 #### S06 · RFC 9293 · TCP
@@ -2079,12 +1698,6 @@ route action=PROXY, target_dns_owner=upstream
 
 可检索 `channel_decode_socks4` 对照服务端解析流程；实现细节不是本稿全部产品限制的来源。
 
-<a id="s11"></a>
-#### S11 · shadowsocks-rust 官方项目
-
-[shadowsocks / shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust)
-
-用于确认本地 SOCKS 入口和外部桥接架构可行。具体配置、DNS 策略及确认时点必须针对实际版本验证。
 
 <a id="s12"></a>
 #### S12 · RFC 5890 · IDNA 定义
@@ -2100,19 +1713,6 @@ route action=PROXY, target_dns_owner=upstream
 
 说明报文示例中的保留文档网段不是可用互联网目标服务。
 
-<a id="s14"></a>
-#### S14 · Shadowsocks AEAD 官方文档
-
-[Shadowsocks · AEAD ciphers](https://shadowsocks.org/doc/aead.html)
-
-用于说明原生 Shadowsocks 需要自己的加密流构造，不能直接接收 SOCKS 握手。
-
-<a id="s15"></a>
-#### S15 · Shadowsocks 2022 官方规格
-
-[Shadowsocks · SIP022 AEAD-2022](https://shadowsocks.org/doc/sip022.html)
-
-用于明确 2022 与传统 AEAD 不应混用；本稿不实现其中密码机制。
 
 <a id="s16"></a>
 #### S16 · curl 命令行官方文档
@@ -2120,13 +1720,6 @@ route action=PROXY, target_dns_owner=upstream
 [curl manpage](https://curl.se/docs/manpage.html)
 
 用于 `--socks4`、`--socks4a` 的客户端互操作验证命令。
-
-<a id="s17"></a>
-#### S17 · Apple Network.framework
-
-[Apple Developer · NWConnection](https://developer.apple.com/documentation/network/nwconnection)
-
-作为 macOS 传输适配实现的 API 入口。半关闭、取消、代理绕过和绑定地址等行为必须针对选用 SDK 与实际适配器验证，不能只引用一个类名就视为完成。
 
 ### 2. 本稿设计决策记录
 
@@ -2137,7 +1730,7 @@ route action=PROXY, target_dns_owner=upstream
 | ADR-03 | Target 与 NodeEndpoint 分离 | 防止把节点当目标，便于 DNS 和日志归因 |
 | ADR-04 | 分流不做 DNS | 可预测地保留域名代理路径；不能自动按解析 IP 分流域名 |
 | ADR-05 | 默认 final PROXY(main) | 提供一个明确基线；用户可显式改 DIRECT |
-| ADR-06 | 必选 SOCKS5 出站，Shadowsocks 走外部桥接 | 先固定接口而不假设远端密码协议 |
+| ADR-06 | PROXY 通过抽象 Wire | 入口不定义具体出站协议、认证或部署 |
 | ADR-07 | 不提供 DNS 服务端口 | 显式代理入口可依赖系统解析/上游名称传递 |
 | ADR-08 | 代理失败封闭处理 | 不偷偷泄漏或改变路径，代价是故障时不能自动可用 |
 | ADR-09 | 已解析 DIRECT 候选固定为数值拨号 | 避免检查地址与实际地址不同 |
@@ -2145,25 +1738,13 @@ route action=PROXY, target_dns_owner=upstream
 | ADR-11 | 无应用层 DNS 缓存与路由 DNS 扩展 | 避免 TTL、网络切换、多 IP 冲突先进入首版 |
 | ADR-12 | 不嗅探应用载荷、不推断进程身份 | 保持目标来源明确，减少未可靠取得的元数据 |
 | ADR-13 | 配置只热更规则/节点/观测 | 降低监听、预算与权限变化的运行时复杂性 |
-| ADR-14 | 成功只声明本地可观察的传输/上游确认 | 不能把多跳桥接误描述成端到端业务验证 |
+| ADR-14 | 成功只表达可观察的就绪条件 | 不把本地回复当作端到端业务成功证明 |
 
 这些是此文档草案的决定，并非记录用户已经确认的所有取舍。
 
-### 3. 接入你的工程前需要实际填入的信息
+### 3. 配置与验收范围
 
-真实上游究竟是本机 sslocal、远端 SOCKS5、其他现有代理核心，还是需要新写的原生协议适配器；实际节点地址、端口、认证和链路保护是什么。
-
-你最终希望“未命中”默认 PROXY 还是 DIRECT；域名/IP 规则从本地文件、UI 还是其他控制面产生。本文只规定编译后规则语义，不自行假设已有规则订阅。
-
-是否要开放 LAN；若开放，允许哪些来源网段、哪些内网目标，以及管理面的权限模型。本文默认仅回环，不把既有家庭网络配置直接植入软件安全策略。
-
-这些项目可按当前基线开始实现，不妨碍先完成无网络协议测试。替换真实节点参数时，不应同时改动报文字段、DNS 保证和错误回退语义。
-
-### 4. 明确未宣称完成的事项
-
-未实现你的 Swift 服务；未访问或修改你的项目仓库；未启动你的真实代理节点；未测得产品 QPS、吞吐或内存成绩；未证明任何第三方桥接进程的目标 DNS 行为。
-
-附带工具只验证文档包内部一致性和供你对运行中的服务做主动探测。具体已执行的本地校验，应以交付说明和校验结果为准。
+入口只需要明确的监听与访问策略、Core 路由配置和可用节点引用。具体 Wire 的配置不进入本文件。本文规定的测试是验收要求，不代表已经运行或通过；性能和资源回收结论必须有实际记录。
 
 ---
 
@@ -2235,7 +1816,7 @@ route action=PROXY, target_dns_owner=upstream
           "minimum": 1,
           "maximum": 2147483647
         },
-        "upstream_handshake_timeout_ms": {
+        "wire_start_timeout_ms": {
           "type": "integer",
           "minimum": 1,
           "maximum": 2147483647
@@ -2293,7 +1874,7 @@ route action=PROXY, target_dns_owner=upstream
         "connect_total_timeout_ms",
         "dns_timeout_ms",
         "dial_timeout_ms",
-        "upstream_handshake_timeout_ms",
+        "wire_start_timeout_ms",
         "reply_write_timeout_ms",
         "relay_idle_timeout_ms",
         "half_close_timeout_ms",
@@ -2318,9 +1899,6 @@ route action=PROXY, target_dns_owner=upstream
         "application_cache": {
           "const": false
         },
-        "bootstrap": {
-          "const": "system"
-        },
         "direct_address_family": {
           "const": "dual"
         },
@@ -2344,7 +1922,6 @@ route action=PROXY, target_dns_owner=upstream
         "resolver",
         "resolve_for_routing",
         "application_cache",
-        "bootstrap",
         "direct_address_family",
         "max_concurrent_queries",
         "max_addresses",
@@ -2552,120 +2129,17 @@ route action=PROXY, target_dns_owner=upstream
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string",
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
-          },
-          "type": {
-            "const": "socks5"
-          },
-          "server": {
-            "type": "string",
             "minLength": 1,
-            "maxLength": 254
-          },
-          "port": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 65535
-          },
-          "auth": {
-            "oneOf": [
-              {
-                "type": "object",
-                "properties": {
-                  "method": {
-                    "const": "none"
-                  }
-                },
-                "required": [
-                  "method"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "method": {
-                    "const": "username_password"
-                  },
-                  "username": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 255
-                  },
-                  "password_ref": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 254
-                  }
-                },
-                "required": [
-                  "method",
-                  "username",
-                  "password_ref"
-                ],
-                "additionalProperties": false
-              }
-            ]
-          },
-          "transport": {
-            "oneOf": [
-              {
-                "type": "object",
-                "properties": {
-                  "type": {
-                    "const": "tcp"
-                  },
-                  "allow_insecure": {
-                    "type": "boolean"
-                  }
-                },
-                "required": [
-                  "type",
-                  "allow_insecure"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "type": {
-                    "const": "tls"
-                  },
-                  "server_name": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 254
-                  },
-                  "verify_certificate": {
-                    "const": true
-                  }
-                },
-                "required": [
-                  "type",
-                  "server_name",
-                  "verify_certificate"
-                ],
-                "additionalProperties": false
-              }
-            ]
-          },
-          "dns_strategy": {
-            "const": "remote"
+            "maxLength": 64
           }
         },
         "required": [
-          "id",
-          "type",
-          "server",
-          "port",
-          "auth",
-          "transport",
-          "dns_strategy"
-        ],
-        "additionalProperties": false
+          "id"
+        ]
       },
       "minItems": 0,
       "maxItems": 256
@@ -2794,7 +2268,7 @@ route action=PROXY, target_dns_owner=upstream
     "connect_total_timeout_ms": 20000,
     "dns_timeout_ms": 5000,
     "dial_timeout_ms": 8000,
-    "upstream_handshake_timeout_ms": 8000,
+    "wire_start_timeout_ms": 8000,
     "reply_write_timeout_ms": 1000,
     "relay_idle_timeout_ms": 0,
     "half_close_timeout_ms": 30000,
@@ -2809,7 +2283,6 @@ route action=PROXY, target_dns_owner=upstream
     "resolver": "system",
     "resolve_for_routing": false,
     "application_cache": false,
-    "bootstrap": "system",
     "direct_address_family": "dual",
     "max_concurrent_queries": 16,
     "max_addresses": 16,
@@ -2852,9 +2325,9 @@ route action=PROXY, target_dns_owner=upstream
 
 ---
 
-<a id="attachment-examples-config-local-bridge-json"></a>
+<a id="attachment-examples-config-wire-route-json"></a>
 
-## 附录 · examples/config.local-bridge.json
+## 附录 · examples/config.wire-route.json
 
 ```json
 {
@@ -2870,7 +2343,7 @@ route action=PROXY, target_dns_owner=upstream
     "connect_total_timeout_ms": 20000,
     "dns_timeout_ms": 5000,
     "dial_timeout_ms": 8000,
-    "upstream_handshake_timeout_ms": 8000,
+    "wire_start_timeout_ms": 8000,
     "reply_write_timeout_ms": 1000,
     "relay_idle_timeout_ms": 0,
     "half_close_timeout_ms": 30000,
@@ -2885,7 +2358,6 @@ route action=PROXY, target_dns_owner=upstream
     "resolver": "system",
     "resolve_for_routing": false,
     "application_cache": false,
-    "bootstrap": "system",
     "direct_address_family": "dual",
     "max_concurrent_queries": 16,
     "max_addresses": 16,
@@ -2949,18 +2421,7 @@ route action=PROXY, target_dns_owner=upstream
   },
   "outbounds": [
     {
-      "id": "main",
-      "type": "socks5",
-      "server": "127.0.0.1",
-      "port": 1086,
-      "auth": {
-        "method": "none"
-      },
-      "transport": {
-        "type": "tcp",
-        "allow_insecure": false
-      },
-      "dns_strategy": "remote"
+      "id": "main"
     }
   ],
   "security": {
@@ -3011,7 +2472,7 @@ route action=PROXY, target_dns_owner=upstream
     "connect_total_timeout_ms": 20000,
     "dns_timeout_ms": 5000,
     "dial_timeout_ms": 8000,
-    "upstream_handshake_timeout_ms": 8000,
+    "wire_start_timeout_ms": 8000,
     "reply_write_timeout_ms": 1000,
     "relay_idle_timeout_ms": 0,
     "half_close_timeout_ms": 30000,
@@ -3026,7 +2487,6 @@ route action=PROXY, target_dns_owner=upstream
     "resolver": "system",
     "resolve_for_routing": false,
     "application_cache": false,
-    "bootstrap": "system",
     "direct_address_family": "dual",
     "max_concurrent_queries": 16,
     "max_addresses": 16,
@@ -3906,25 +3366,8 @@ def validate_semantics(config: dict[str, Any]) -> None:
     for outbound in config['outbounds']:
         assert outbound['id'] not in ids, 'duplicate outbound id'
         ids.add(outbound['id'])
-        server = outbound['server']
-        try:
-            server_ip = normalized_ip(server)
-        except ValueError:
-            kind, _ = normalized_host(server.encode('ascii'))
-            assert kind == 'domain', 'non-canonical node host'
-            server_ip = None
-        if server_ip is not None:
-            assert not (server_ip == listen and outbound['port'] == config['listen']['port']), 'node points to listener'
-        transport = outbound['transport']
-        if transport['type'] == 'tcp' and not transport['allow_insecure']:
-            assert server_ip is not None and server_ip.is_loopback, 'plaintext node needs explicit permission'
-        if transport['type'] == 'tls':
-            kind, _ = normalized_host(transport['server_name'].encode('ascii'))
-            assert kind == 'domain', 'TLS server_name must be DNS name'
-        auth = outbound['auth']
-        if auth['method'] == 'username_password':
-            assert 1 <= len(auth['username'].encode('utf-8')) <= 255, 'username byte length'
-            # Secrets are intentionally not read by a document-bundle validator.
+        # Node construction and Wire configuration are validated by their owning layer.
+
     rule_ids: set[str] = set()
     decisions = [config['routing']['final']]
     for rule in config['routing']['rules']:
@@ -4020,7 +3463,7 @@ def main() -> int:
             'configuration_examples':len(configs), 'schema_validation':schema_status,
             'parser_vectors':len(vectors), 'fragmentation_checks':partitions,
             'socks4a_marker_checks':255, 'relative_links':links,
-            'not_tested':['real proxy service', 'real resolver privacy', 'TLS transport adapter', 'external bridge behavior', 'performance', 'secret provider']
+            'not_tested':['real proxy service', 'real resolver privacy', 'Wire integration', 'performance']
         }, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:

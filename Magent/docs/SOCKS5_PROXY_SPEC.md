@@ -1,12 +1,16 @@
 ---
-desc: "本地 SOCKS5 代理的 TCP CONNECT、UDP ASSOCIATE、地址解析、路由、DNS、出站协议、配置、错误处理及验收标准。"
-version: "1.0.0"
-updated_at: "2026-09-21"
+desc: "SOCKS5 入口的 TCP CONNECT、UDP ASSOCIATE、抽象 Wire 集成、地址与 DNS 边界及验收标准。"
+version: "1.1.0"
+updated_at: "2026-09-24"
 status: "草案"
 references_checked_at: "2026-09-21"
 ---
 
 # 本地 SOCKS5 代理服务完整规格说明书
+
+本文规定本地入口协议与抽象 Wire 的协作契约。入口只处理自己的报文、目标和本地响应；具体出站协议的线上格式、认证、加密、节点部署及配置属于 Wire 和节点模型，不在本文定义，也不能由入口协议推断。
+
+抽象接口统一由 [Wire 规范](WIRES_SPEC.md) 定义。业务目标使用 [模型规范](MODELS_SPEC.md) 中的 `NetworkAddress`；节点引用、实际端点和规则由 Core 按同一模型契约处理。本文的逻辑流程和示例不新增模型构造入口或具体 Wire 类型。协议字段限制仍由入口负责。
 
 <a id="contents"></a>
 ## 目录
@@ -23,13 +27,13 @@ references_checked_at: "2026-09-21"
 | [08](#s08) | 分流规则与决策算法 |
 | [09](#s09) | DNS 职责与解析时机 |
 | [10](#s10) | TCP DIRECT 完整链路 |
-| [11](#s11) | TCP SOCKS5 上游完整链路 |
+| [11](#s11) | TCP PROXY 与抽象 Wire |
 | [12](#s12) | TCP 双向转发、背压与半关闭 |
 | [13](#s13) | UDP ASSOCIATE 控制连接 |
 | [14](#s14) | SOCKS5 UDP 数据报解析与编码 |
 | [15](#s15) | UDP 分流、直连、代理与回包 |
 | [16](#s16) | UDP 与 DNS 的关系 |
-| [17](#s17) | Shadowsocks 桥接、加密与部署边界 |
+| [17](#s17) | Wire 能力与安全边界 |
 | [18](#s18) | 错误码与失败处理 |
 | [19](#s19) | 超时、资源限制与生命周期 |
 | [20](#s20) | 完整配置示例与字段语义 |
@@ -106,17 +110,15 @@ TCP 目标来自 `CONNECT` 请求；UDP 目标来自**每一个 SOCKS5 UDP 数�
 | 无认证 | 必须实现 | 默认仅允许回环地址监听 |
 | 用户名/密码认证 | 必须实现，可配置启用 | 使用 RFC 1929 子协商 |
 | `DIRECT / PROXY / REJECT` | 必须实现 | TCP 按连接；UDP 按逻辑流 |
-| SOCKS5 TCP 上游 | 必须实现 | 与入站协商独立 |
-| SOCKS5 UDP 上游 | 必须实现 | 真实 UDP 中继，不是将 UDP 写入 TCP |
-| 通过外部 `sslocal` 接入 Shadowsocks | 必须支持集成 | 本服务使用其 SOCKS5 入口 |
-| 上游 SOCKS5 外层 TLS | 可选适配能力 | 双方必须明确支持；不是 RFC 1928 自带特性 |
+| TCP Wire 集成 | 必须 | 独立启动与编解码状态，不依赖具体节点协议 |
+| UDP Wire 集成 | 必须 | 逐包传递目标与 DATA，后端端点和解码器归属明确 |
 | 配置校验、日志、资源预算、优雅退出 | 必须实现 | 不能只实现协议 happy path |
 
 SOCKS5 的地址类型和命令编码见 RFC 1928；用户名/密码子协商见 RFC 1929。[S1](#ref-s1) [S2](#ref-s2)
 
 ### 2.2 明确不实现的能力
 
-本版本不实现 `BIND`、GSSAPI、SOCKS4/4a 入站、HTTP 代理入站、原生 Shadowsocks 加密编解码、TUN、透明代理、NetworkExtension 流量接管、PAC 执行、进程识别、HTTP Host / TLS SNI 嗅探、UDP-over-TCP 私有扩展、SOCKS UDP 分片重组以及独立 DNS 服务。
+本版本不实现 `BIND`、GSSAPI、SOCKS4/4a 入站、HTTP 代理入站、TUN、透明代理、NetworkExtension 流量接管、PAC 执行、进程识别、HTTP Host / TLS SNI 嗅探、UDP-over-TCP 私有扩展、SOCKS UDP 分片重组以及独立 DNS 服务。
 
 本服务不因为监听了 SOCKS5 端口就自动接管所有应用流量。客户端必须实际使用 SOCKS5；不会使用 SOCKS5 UDP 的应用，也不会因为设置了一个 TCP SOCKS 代理而自动获得 UDP 代理能力。
 
@@ -124,7 +126,7 @@ SOCKS5 的地址类型和命令编码见 RFC 1928；用户名/密码子协商见
 
 本产品实现的是**明确约束的 SOCKS5 功能集**，不能宣称“完整实现 RFC 1928 的全部合规要求”：RFC 1928 对 GSSAPI 有额外的实现要求，而本产品不实现 GSSAPI。[S1](#ref-s1)
 
-另外，本 SPEC 对域名语法、UDP 客户端源端口、目标安全策略和上游中继地址采用更严格的产品约束。它们必须作为可见限制记录，不能在实现中偷偷放宽，也不能被包装成 SOCKS5 标准唯一允许的做法。
+另外，本 SPEC 对域名语法、UDP 客户端源端口、目标安全策略和后端端点归属采用更严格的产品约束。它们必须作为可见限制记录，不能在实现中偷偷放宽，也不能被包装成 SOCKS5 标准唯一允许的做法。
 
 ---
 
@@ -134,45 +136,24 @@ SOCKS5 的地址类型和命令编码见 RFC 1928；用户名/密码子协商见
 ### 3.1 总体结构
 
 ```text
-                         ┌──────────────────────┐
-客户端 ── SOCKS5 TCP ───→ │ 入站监听 / 认证 / 会话 │
-                         └──────────┬───────────┘
-                                    │
-                         ┌──────────▼───────────┐
-                         │ 地址解码 / 规范化      │
-                         │ Target + Transport    │
-                         └──────────┬───────────┘
-                                    │
-                         ┌──────────▼───────────┐
-                         │ 安全检查 + 纯规则引擎  │
-                         └───┬────────┬──────┬───┘
-                             │        │      │
-                           DIRECT   PROXY  REJECT
-                             │        │      └──→ 回复失败 / 丢弃 UDP
-                    ┌────────▼──┐ ┌───▼────────────────┐
-                    │直接出站适配│ │ SOCKS5 上游适配器   │
-                    │系统 DNS   │ │节点解析/协商/中继    │
-                    └─────┬─────┘ └───────┬────────────┘
-                          │               │
-                        目标端       上游 SOCKS5 服务
-                                          │
-                               远端代理，或本地 sslocal
-                                          │
-                                         目标端
+本地 SOCKS5 TCP → Socks5Connection → NetworkAddress → Core
+本地 SOCKS5 UDP → 来源校验与数据报解码 → 每包目标 → Core
+Core → DIRECT 目标 Channel，或 PROXY Wire + 节点 Channel
+下游响应 → DIRECT 业务数据，或 Wire 解码 → 本地 SOCKS5 回复/UDP 封装
 ```
 
-UDP 的数据面通过 `UDP ASSOCIATE` 创建的本地 UDP 端口进入，复用地址模型与规则引擎，但不复用 TCP 字节流转发器。
+Connection 拥有本地状态、下游 Channel 和 UDP 关联资源。Core 路由与选择 Wire。Wire 只处理所属出站协议的启动和编解码，不解析本地方法协商或拥有本地控制连接。
 
 ### 3.2 四类地址必须区分
 
-| 名称 | 示例 | 用途 |
-|---|---|---|
-| `ClientEndpoint` | `127.0.0.1:53000` | 客户端的 TCP 或 UDP 来源；用于访问控制及关联绑定 |
-| `TargetEndpoint` | `example.com:443` | 客户端真正希望访问的业务目标 |
-| `ProxyEndpoint` | `127.0.0.1:11080` | 本服务直接连接的 SOCKS5 上游 |
-| `RelayEndpoint` | `127.0.0.1:52001` | SOCKS5 `UDP ASSOCIATE` 回复给出的 UDP 中继地址 |
+| 地址 | 模型与用途 |
+|---|---|
+| 客户端来源 | 实际 SocketAddress；用于本地认证、来源固定和回包 |
+| 业务目标 | NetworkAddress；来自 CONNECT 或每个 UDP 数据报 |
+| 节点端点 | Wire 提供的实际 SocketAddress；用于发送编码后的数据 |
+| 本地 UDP 中继端点 | 本地关联绑定的 SocketAddress；编码到本地 ASSOCIATE 回复 |
 
-`ProxyEndpoint` 不一定等于 `RelayEndpoint`。若上游是 `sslocal`，远端 Shadowsocks 服务器地址由 `sslocal` 管理，它既不是本服务的业务目标，也不是本服务能直接发送 SOCKS5 握手的端口。
+本地中继端点不等于节点端点。具体 Wire 的远端控制信息不能直接作为本地 BND 字段或业务来源；相应元数据必须按明确的语义交给 Connection。
 
 ### 3.3 DIRECT 不是把控制权退回客户端
 
@@ -237,7 +218,7 @@ RouteDecision {
 ```text
 ResolutionResult {
     addresses: [NumericIPAddress],
-    purpose: TARGET_DIRECT | PROXY_BOOTSTRAP | RELAY_BOOTSTRAP,
+    purpose: TARGET_DIRECT,
     source: SYSTEM,
     ttl: Optional<Duration>     // 系统接口未提供时必须是 unknown
 }
@@ -403,7 +384,7 @@ VER(1) | REP(1) | RSV(1) | ATYP(1) | BND.ADDR(variable) | BND.PORT(2)
 | 场景 | `BND.ADDR:BND.PORT` 的产品语义 |
 |---|---|
 | DIRECT CONNECT 成功 | 本服务连接目标的出站 socket 实际本地绑定地址和端口 |
-| SOCKS5 上游 CONNECT 成功 | 校验后转交上游报告的绑定端点；不冒充可独立验证的远端事实 |
+| PROXY CONNECT 成功 | 本版统一回复 `0.0.0.0:0`；Wire 抽象不提供目标侧绑定元数据，不能拿节点端点或本地监听地址伪造 |
 | UDP ASSOCIATE 成功 | 客户端实际应该发送 SOCKS5 UDP 数据报的本地中继地址和端口 |
 | 请求失败 | 本产品统一使用 `0.0.0.0:0`，`ATYP=01` |
 
@@ -411,9 +392,9 @@ CONNECT 的绑定端点不是目标地址，也不应无条件填本服务监听
 
 ### 5.7 成功回复的发送时机
 
-DIRECT 必须等目标 TCP 连接成功；上游代理必须等上游完整成功回复通过校验；UDP ASSOCIATE 必须等本地 UDP 中继 socket 完成绑定且关联对象可用。
+DIRECT 等目标 TCP 建立成功；PROXY 等第 11 节规定的 Wire 就绪条件；UDP ASSOCIATE 等本地中继绑定且关联可用。三者不能互相替代。
 
-在此之前不发送下游成功，不转发客户端业务载荷。成功回复只表明相应传输/上游协议条件满足，不证明 HTTP、TLS、数据库登录或最终应用请求已经成功。
+在此之前不发送下游成功，不转发客户端业务载荷。成功回复只表明对应 DIRECT、Wire 或本地 UDP 关联就绪条件满足，不证明 HTTP、TLS、数据库登录或最终应用请求已经成功。
 
 ---
 
@@ -481,7 +462,7 @@ READ_GREETING → WRITE_METHOD_SELECTION
 
 `earlyDataBuffer` 默认最大 64 KiB，计入全局预算。填满后暂停从客户端继续读，不能无限缓存。握手消息自身仍按其独立长度上限校验。
 
-如果上游的成功回复与服务端先发数据出现在同一次读取中，也必须保留回复后的余留字节，待下游成功回复发送完成后再交给下游。
+如果 Wire 在同一结果中返回 ready=true 和首段业务数据，Connection 必须保留业务数据，待必要控制输出与本地成功回复发送完成后，再交给客户端。
 
 ### 6.5 EOF、取消与失败
 
@@ -491,11 +472,9 @@ READ_GREETING → WRITE_METHOD_SELECTION
 
 正常 TCP relay 阶段的数据不再当作 SOCKS5 消息解析。不存在“读到 `05` 就重新握手”的逻辑。
 
-### 6.6 上游解析器独立
+### 6.6 Wire 状态与本地解析器独立
 
-上游连接有自己的方法选择、认证响应、请求回复解析状态。下游选择无认证，上游仍可以要求用户名密码，两者没有一一映射关系。
-
-上游返回了本服务未提议的方法、错误版本、非零保留字段、未知地址类型或不完整回复时，连接必须失败，不能只看到 `REP=00` 一个字节就宣布隧道建立。
+本地 SOCKS5 方法协商、认证和请求状态仅服务于客户端。Wire 管理自己的启动与编解码状态；Connection 不再解析第二套出站协商报文，也不把本地认证字段交给 Wire 作为节点凭据。
 
 ---
 
@@ -582,7 +561,7 @@ host == suffix OR host.endsWith("." + suffix)
 
 ```text
 { "type": "DIRECT" }
-{ "type": "PROXY", "outbound": "ss-local" }
+{ "type": "PROXY", "outbound": "proxy-main" }
 { "type": "REJECT" }
 ```
 
@@ -651,10 +630,9 @@ UDP 流本身固定路由；每个新目标建立自己的流。一个关联中�
 |---|---|---|---|
 | TCP / UDP 数值 IP DIRECT | 不需要 | 无 | 数值 IP |
 | TCP / UDP 域名 DIRECT | 需要 | 无 | 选定并校验后的数值 IP |
-| TCP / UDP 数值 IP PROXY | 不需要 | 节点可能需要 Bootstrap DNS | 数值 IP |
-| TCP / UDP 域名 PROXY | 禁止 | 节点可能需要 Bootstrap DNS | 域名 |
+| TCP / UDP 数值 IP PROXY | 不需要 | 节点配置装配可能需要解析 | 数值 IP |
+| TCP / UDP 域名 PROXY | 禁止 | 节点配置装配可能需要解析 | 域名 |
 | REJECT | 禁止 | 不得因该请求新建节点连接 | 无 |
-| 上游 UDP BND 是获准的中继域名 | 不需要 | Relay Bootstrap DNS | 中继域名解析后的 IP |
 | UDP 载荷内包含 DNS 查询 | 不因载荷而解析 | 按外层目标正常处理 | 原封不动的 DNS 载荷 |
 
 ### 9.3 系统解析器契约
@@ -677,9 +655,9 @@ DNS 结果只产生地址候选，不产生 `RouteDecision`。最多接受配置
 收到 example.com → 先本地查询 IP → 判断能不能直连 → 不行再代理
 ```
 
-对已经决定 PROXY 的域名，本服务应直接构造上游的域名地址头。上游究竟在远端解析，还是由本地桥接进程解析，属于相应出站实现的行为；不能仅因为传了域名就宣称“整台机器没有本地 DNS”。
+对已经决定 PROXY 的域名，入口将 NetworkAddress 交给 Wire，不自行构造具体节点的地址头；Wire 自身的名称处理按其契约验收。
 
-本 SPEC 的可验证保证是：**本服务自己的 Resolver 没有被用于解析 PROXY 业务目标**。客户端预解析、节点 Bootstrap、系统其他进程以及 `sslocal` 自身必须分别观察。
+本 SPEC 的可验证保证是：入口的 Resolver 不用于解析 PROXY 业务目标。客户端、配置装配层、Wire 与其他进程的 DNS 行为分别观察。
 
 ### 9.5 超时后的真实资源
 
@@ -687,13 +665,11 @@ DNS 结果只产生地址候选，不产生 `RouteDecision`。最多接受配置
 
 禁止“超时就释放许可，但原阻塞任务继续运行”的假限流。解析工作池、等待队列和截止时间都必须有界；全部解析工作槽被卡住时应明确失败，而不是无限创建新线程。
 
-### 9.6 代理节点 Bootstrap
+### 9.6 节点端点与配置装配
 
-`proxy.example.net` 是代理节点，`example.com` 是业务目标。两者即使都是域名，也必须使用不同的 purpose 记录。
+节点配置中的名称与请求中的业务域名属于不同边界。节点名称解析在配置装配层完成，入口只消费 Wire 提供的已校验 SocketAddress；Wire getter 不访问 DNS。
 
-节点连接不再经过业务规则引擎。否则容易出现“为了连接代理，先决定把代理连接再次送给自己”的递归。
-
-配置数值节点地址可以减少节点 Bootstrap 查询，但不能据此断言其他进程或客户端不会查询 DNS。
+实际节点端点不再经过业务规则引擎，避免把节点连接再次送回当前代理。节点装配、入口目标解析与客户端自己的解析须分别记录和验收。
 
 ---
 <a id="s10"></a>
@@ -755,79 +731,36 @@ DIRECT 成功后，目标最先发送的数据同样需要转发。不能要求�
 ---
 
 <a id="s11"></a>
-## 11. TCP SOCKS5 上游完整链路
+## 11. TCP PROXY 与抽象 Wire
 
-### 11.1 下游与上游是两个独立 SOCKS 会话
+### Wire 与连接的职责
 
-```text
-应用客户端               本服务                  SOCKS5 上游             目标
-    │                       │                         │                    │
-    │── 方法列表 ──────────→│                         │                    │
-    │←─ 方法选择 ───────────│                         │                    │
-    │── 可选本地认证 ──────→│                         │                    │
-    │←─ 本地认证结果 ───────│                         │                    │
-    │── CONNECT 域名:端口 ─→│                         │                    │
-    │                       │── 节点 TCP/TLS 连接 ───→│                    │
-    │                       │── 上游方法列表 ─────────→│                    │
-    │                       │←─ 上游方法选择 ─────────│                    │
-    │                       │── 可选上游认证 ─────────→│                    │
-    │                       │←─ 上游认证结果 ─────────│                    │
-    │                       │── CONNECT 域名:端口 ───→│                    │
-    │                       │                         │── 解析/连接目标 ──→│
-    │                       │←─ 完整 CONNECT 成功 ────│                    │
-    │←─ CONNECT 成功 ───────│                         │                    │
-    │←══════ 原始字节流 ════╪═════════════════════════╪═══════════════════→│
-```
+Wire 的接口、状态和验收以 [Wire 规范](WIRES_SPEC.md) 为准。本文只补充本地入口如何使用它：
 
-上图最后一段是典型 SOCKS5 上游职责；若上游是桥接或代理链，本服务只观察到它的协议确认，不能直接观测所有后续节点。
-
-### 11.2 节点连接
-
-先根据 `outboundID` 获取固定配置，再解析节点地址或使用数值地址，执行自回环保护，随后建立实际 TCP 连接。
-
-节点连接必须使用不隐式套用本服务系统代理设置的底层传输适配器。节点地址不能再当成业务目标送回规则引擎。
-
-### 11.3 上游协商和认证
-
-`authentication.mode=none`：只发送 `05 01 00`。
-
-`authentication.mode=username_password`：只发送 `05 01 02`，读取上游 `05 02` 后发送独立配置的凭据。
-
-禁止把客户端的本地认证凭据自动转发给上游。本地账户决定谁能使用本服务，上游凭据决定本服务如何访问代理节点，两套身份必须分离。
-
-配置要求认证时，上游返回无认证不能视为成功降级；上游认证失败也不触发 DIRECT。
-
-### 11.4 编码上游目标
-
-| 入站规范化目标 | 上游 CONNECT |
+| 所有者 | 契约 |
 |---|---|
-| IPv4 | `05 01 00 01 + 4 字节 IP + 2 字节端口` |
-| Domain | `05 01 00 03 + 长度 + forwardName + 端口` |
-| IPv6 | `05 01 00 04 + 16 字节 IP + 2 字节端口` |
+| Connection | 解析入口、构造目标、生成本地回复；持有并读写下游 Channel，负责背压、EOF、取消和清理 |
+| Core | 对业务目标完成路由；PROXY 按节点引用选择匹配传输种类的 Wire；创建下游 Channel |
+| Wire | 提供实际节点端点与毫秒超时，管理启动、控制状态及编解码；不持有 Channel，不生成本地协议回复 |
 
-对 Domain，不调用本服务 Target DNS。不把域名写成 URL，也不把 `https://`、路径、用户名密码或 HTTP Host 头放到目标字段中。
+DIRECT 使用目标端点。PROXY 连接 `getEndpoint()` 的实际端点，采用 `getTimeout()` 的连接超时；同一条 TCP 连接使用独立 Wire，节点端点不重新进入业务路由。
 
-`ATYP` 表示目标地址类型，不代表节点连接使用的地址族。因此完全可以通过 IPv4 的代理节点访问 IPv6 目标，前提是上游具备对应能力。
+### 启动与本地成功屏障
 
-### 11.5 处理上游回复
+Channel 建立后，Connection 将同一个 NetworkAddress 传给 `start(handshake:)`。WireResult.outbound 是必须按序写入下游的控制字节，不能再次编码；inbound 是解码后的业务数据；ready 表示 Wire 自身的启动条件是否满足。
 
-必须读取并校验完整的 `VER / REP / RSV / ATYP / BND.ADDR / BND.PORT`。成功后可将上游报告的绑定地址和端口重新编码为下游 CONNECT 回复。
+ready=false 时继续按预算读取下游，调用 decodeInbound 推进启动并处理必要控制输出。只有 ready=true 且此前必要控制输出全部写入成功，Connection 才能按本地入口规则进入下一阶段。不得假定存在统一的远端成功码，也不得等待首段业务数据判断就绪。
 
-本服务不应为了填 BND 而查询上游返回的域名；对 CONNECT 的 BND，它是回复信息，不是本服务下一步必须拨号的地址。UDP 的 BND 则是中继目的地，必须按第 15 节单独验证。
+对需要本地成功回复的入口，业务数据必须排在完整成功回复之后；普通 HTTP 在 Wire 就绪后发送源站请求。Wire 的具体控制报文始终不进入入口解析器。就绪不等于最终目标应用已经成功。
 
-上游回复与业务数据粘连时，把剩余业务字节交给 relay，而不是丢弃或继续按 SOCKS 回复解析。
+### 业务、错误与资源
 
-### 11.6 连接复用与重试
+TCP 后续业务调用 encodeOutbound，address 为 nil；目标已经在 start 固定。收到的下游字节调用 decodeInbound，业务结果与必要控制输出分别保序。空解码结果不是 EOF。
 
-本版本一个下游 TCP CONNECT 对应一个专用上游 TCP 隧道。不能把多个无关 TCP 会话交错写进同一个普通 SOCKS5 CONNECT 连接；标准 SOCKS5 CONNECT 不提供这种多路复用封装。[S1](#ref-s1)
+Connection 在下游正常 EOF 时调用 finishInbound 检查截断；本地输入 EOF 时等已排队业务和控制输出写完再关闭下游输出方向。最终清理由 Connection 关闭所属 Channel 并释放 Wire 引用，不增加 Wire 的网络关闭操作。bufferedBytes 与结果队列一起计入预算。Wire 保留原始错误，Connection 在最高拥有边界统一决定本地失败和关闭；PROXY 失败不回退 DIRECT、不重放载荷，成功回复开始后不追加失败回复。
 
-节点 TCP 建立前可以在该节点的多个数值候选之间竞速；一旦已经发送上游 CONNECT，本版本不自动重建并重放整次请求。上游失败直接返回失败，不切换 DIRECT，不换未配置的其他节点。
+测试使用行为可观察的 Wire 与 Channel 验证接口及真实消费路径；具体实现的线上格式另行验收。更换 Wire 不应改变本地报文、本地凭据或目标来源，也不应增加入口专属节点协议分支。
 
-### 11.7 “成功”边界
-
-原生 SOCKS5 服务的成功回复通常表示它已建立目标连接，但外部桥接可能在较早阶段返回成功。例如桥接协议可能没有可端到端验证的目标连接确认。
-
-因此必须把状态记为 `upstream_protocol_ready`，不能把它描述为“已证明最终网站可用”。后续关闭属于建立后的传输失败，此时不得再向已进入业务流的客户端插入第二条 SOCKS5 失败回复。
 
 ---
 
@@ -877,7 +810,7 @@ outbound → client
 
 反方向同理。两个方向均完成，或者发生不可恢复错误、取消、空闲超时或半关闭排空超时后，再释放整个会话。
 
-平台适配器必须真实支持上述契约。不能用立即取消整个 `NWConnection` 或关闭整个文件描述符代替写半关闭，然后声称半关闭已经实现。
+平台适配器必须真实支持上述契约。不能用关闭整个 Channel 或文件描述符代替写半关闭，然后声称半关闭已经实现。
 
 ### 12.5 透明性
 
@@ -949,11 +882,11 @@ LAN 监听时使用该控制连接被接受时的具体本地地址，不能把 
 
 本地 ASSOCIATE 成功时，尚未知道后续每个数据报的业务目标，因此不预先解析业务域名，也不提前固定业务出口。
 
-上游 UDP 通道可以等第一个匹配 PROXY 的数据报到来后再创建。此时发生的目标或上游错误只能按 UDP 失败策略处理，不再补发第二条 TCP ASSOCIATE 结果。
+UDP Wire 与下游资源可以等第一个匹配 PROXY 的数据报到来后再选择和创建。此时发生的目标或上游错误只能按 UDP 失败策略处理，不再补发第二条 TCP ASSOCIATE 结果。
 
 ### 13.7 关闭顺序
 
-关闭关联时，原子地标记停止接收，关闭所有 DIRECT UDP socket、上游 UDP socket 及其控制 TCP，释放待发送报文和流表项，最后释放本地中继 socket 与父控制连接。
+关闭关联时，先标记停止接收，关闭所属 DIRECT / PROXY UDP Channel，释放待发报文、端点记录和独占 Wire，最后释放本地中继资源。共享 Wire 按 WIRES_SPEC 的运行周期所有权处理；本地 accepted 控制 Channel 的最终关闭仍归 MagentTCPConnection。
 
 任何迟到的 DNS、拨号或发送完成回调都必须检查关联是否仍存活，不能把已关闭关联重新插入注册表。
 
@@ -1083,91 +1016,31 @@ RSV=0000 | FRAG=00 | ATYP=实际源地址类型 | SRC.ADDR | SRC.PORT | DATA
 
 域名请求收到数值源地址回包是正常情况。基础版本采用端点依赖过滤，不接受目标另一个未关联端口发送的回包；需要这类行为的协议不属于基础兼容范围。
 
-### 15.4 PROXY UDP：必须另建上游关联
+### 15.4 PROXY UDP：目标和载荷交给 Wire
 
-本服务作为 SOCKS5 UDP 客户端，向选定上游建立 TCP 控制连接，完成认证并发送 `UDP ASSOCIATE`；读取成功回复后，向回复的中继地址发送 SOCKS5 UDP 数据报。
+Connection 校验客户端来源，解析本地 SOCKS5 UDP 头，取得规范化 NetworkAddress 和 DATA。Core 按该目标选择 UDP Wire；Connection 调用 `encodeOutbound(DATA, address: target)`，通过自己持有的 UDP Channel 将结果发送到 Wire 提供的实际节点端点。
 
-```text
-应用                 本服务                        SOCKS5 上游             目标
- │                     │                              │                    │
- │ 控制 TCP 保持打开    │                              │                    │
- │                     │── 上游 TCP + 协商/认证 ──────→│                    │
- │                     │── UDP ASSOCIATE ─────────────→│                    │
- │                     │←─ BND=上游 UDP 中继 ──────────│                    │
- │                     │                              │                    │
- │══ SOCKS5 UDP ═══════→│══ 新编码的 SOCKS5 UDP ══════→│══ 原始 UDP ═══════→│
- │←═ SOCKS5 UDP ════════│←═ SOCKS5 UDP ════════════════│←═ 原始 UDP ═════════│
-```
+本地 SOCKS5 的 RSV、FRAG、ATYP 和控制请求不作为出站报文透传。入口不得要求 Wire 使用相同封装或增加远端关联流程；出站状态与能力边界以 WIRES_SPEC 为准。
 
-标准 SOCKS5 UDP 数据报在 UDP 上发送，不写入上游控制 TCP。普通 TCP CONNECT 也不能替代 UDP ASSOCIATE。[S1](#ref-s1)
+### 15.5 端点、Wire 与关联归属
 
-### 15.5 基础隔离策略：每个 UDP 逻辑流一个上游通道
+每个本地 UDP 关联记录实际发送过的后端端点及其所选 Wire。收到后端报文时，先确认所属关联仍存活、来源是实际登记的后端，再使用对应 Wire 解码。不能根据最后一次路由、未验证载荷或另一个客户端的记录选择解码器。
 
-基础版本选择：每个 `UDPFlowKey` 创建一个专属上游 TCP 控制连接和专属 UDP socket，并只在该上游通道发送该流的一个逻辑目标。
+Core 可以按节点复用支持独立数据报的 Wire；关联、客户端和实际端点的授权记录仍由 Connection 隔离。若一种传输需要额外状态，应由所属实现明确其生命周期，入口不强制它采用某种远端关联协议。
 
-这是为了简化回包归属和安全检查，尤其是域名目标由上游解析时，本服务并不知道其数值目标 IP。代价是 socket 与上游关联数量较多，必须受全局限制。
+### 15.6 回包封装
 
-这不是 SOCKS5 的要求。未来可以在一个下游关联、同一个 outbound 内共享上游 UDP 关联，但必须另行解决域名回包归属、同端点多域名、跨用户隔离和生命周期问题。基础版不得先随意共享，再用“猜测最近一次请求”的方法匹配回包。
+WireResult.inbound 返回业务 DATA 和对应的逻辑来源地址；outbound 中的控制数据报由 Connection 按包写回该 Wire 的实际后端。Connection 校验适用的地址、端口与长度约束，重新生成本地 `RSV=0000 | FRAG=00 | ATYP | SRC.ADDR | SRC.PORT | DATA`，经原关联中继发给已经固定的客户端端点。
 
-### 15.6 上游关联源提示与网络路径
+节点端点只用于传输来源验证，不能冒充业务回复来源。域名来源不为转发或展示而触发本地 DNS。畸形编码、未知来源或超长回包整包丢弃，不截断、不跨包补齐。
 
-先创建并绑定上游 UDP socket，再建立上游控制 TCP。若能可靠知道上游看到的 UDP 源地址和端口，可发送准确提示；否则按协议使用全零提示，本版本默认如此。
+### 15.7 失败、等待与资源释放
 
-上游必须看到符合其关联要求的 UDP 源 IP。TCP 和 UDP 走不同出口网卡、不同公网 NAT 地址或不同隧道时可能违反这一条件。基础配置以回环 `sslocal` 为默认，远程部署必须验证这条路径约束。
+等待 DIRECT DNS 或创建下游资源时，每流待发队列最多 8 包、128 KiB；任一上限先到则丢新包。队列不是重传机制；失败或取消释放全部待发数据，已发送数据不得重放。
 
-### 15.7 上游 RelayEndpoint 校验
+单个后端或 Wire 失败只清理所属状态并丢弃相关数据报；不回退 DIRECT，不向已成功的本地 TCP 控制连接写入新的 REP。需要重建时，冷却 1000 ms 后只能由新报文触发。
 
-上游 BND 是本服务实际要发送 UDP 的地方，不能未经检查就使用。
-
-| 上游返回 | 行为 |
-|---|---|
-| 数值地址等于控制 TCP 的实际对端 IP | 允许，端口必须非零 |
-| 数值地址不等于控制对端 | 仅在显式 `relay_allow_cidrs` 中允许 |
-| 未指定地址 `0.0.0.0` / `::` | 仅在配置允许时替换为实际控制对端 IP；保留非零端口 |
-| 域名地址 | 仅在显式 `relay_allow_domains` 精确允许后执行 Relay Bootstrap 解析 |
-| 零端口、组播、广播或本服务自身中继端点 | 拒绝 |
-
-未指定地址替换是兼容策略，不应宣称 RFC 要求客户端向 wildcard 地址发送数据。默认配置允许该兼容策略，但必须记录其发生。
-
-Relay Bootstrap 解析结果还需通过“控制对端或允许 CIDR”检查。不得让一个获准的中继名称解析到任意未授权地址。
-
-上游 UDP socket 固定连接选定的中继端点，只接受该端点的 UDP 回包，不能仅凭回包载荷内的目标字段信任来源。
-
-### 15.8 上游目标编码
-
-对 Domain，重新编码 `ATYP=03 + forwardName + port`，本服务不做 Target DNS。对 IPv4 / IPv6，使用对应数值地址编码。
-
-本版本可以复用解析后的 DATA 缓冲，但不得直接无条件透传客户端整包：入站包中的 `RSV`、`FRAG`、地址规范化结果、报文上限和关联来源都必须先通过校验。
-
-### 15.9 上游回包校验与归属
-
-必须满足：上游通道仍存活、来源等于固定中继端点、该流至少已发送过一个请求、SOCKS5 UDP 头合法、`FRAG=0`、回包目标端口符合本版本的同端口约束。
-
-对原始数值目标，回包头中的源地址和端口必须与该目标一致。
-
-对原始域名目标：若回包头仍用域名，规范化后必须等于该逻辑目标；若回包头是数值 IP，本服务不额外查询 DNS 去建立等价关系，而是在该**专属、可信上游流通道**上接受通过数值安全检查的源地址。
-
-这意味着域名 PROXY 回包依赖上游正确性；不能声称本地已经独立验证“该 IP 一定属于这个域名”。专属通道避免跨流误归属，但不把普通 SOCKS UDP 变成加密或可认证的协议。
-
-### 15.10 上游回包向客户端转发
-
-解析并检查上游头后，用有效的回复源地址重新编码下游 SOCKS5 UDP 头，保留 DATA，通过原关联的本地中继 socket 发往已固定客户端端点。
-
-若上游返回域名源地址，可按域名重新封装，不为展示或转发而本地解析。不得把上游中继 BND 地址冒充为业务回复源地址。
-
-### 15.11 失败与等待队列
-
-创建流或等待 DNS / 上游关联时，每流最多排队 8 个数据报，且总字节不超过 128 KiB，任何一个上限先到都执行丢弃新包。队列只用于首次链路建立，不是重传队列。
-
-链路建立成功后按接收顺序逐包发送；超过建立截止时间、关联已关闭或流失败时，释放所有待发送包并计数。
-
-本版本失败流冷却 1000 ms。冷却结束后，只有新到达的数据报可以触发新通道；之前已丢弃或可能已发送的数据报绝不自动重放。
-
-### 15.12 上游控制连接结束
-
-某个流的上游控制连接结束时，关闭该流的上游 UDP socket，丢弃该流待发报文并标记失败。其他 DIRECT 流或其他代理流可以继续。
-
-若本地下游控制连接结束，则整个下游关联及其所有流一起结束，不保留“孤儿 UDP 通道”。
+本地控制 TCP 关闭时，整个关联及其下游 Channel、端点记录、待发队列和解析资源全部结束；迟到回包不得恢复关联。Wire 不负责关闭本地 accepted Channel。
 
 ---
 
@@ -1224,81 +1097,16 @@ DoH / DoT 等加密 DNS 在本服务中也只是相应目标上的应用流量�
 ---
 
 <a id="s17"></a>
-## 17. Shadowsocks 桥接、加密与部署边界
+## 17. Wire 能力与安全边界
 
-### 17.1 推荐的基础集成边界
+入口只依赖 Wire 的目标表达、TCP / UDP 编解码能力与错误契约，不选择具体节点协议。TCP 能力不证明 UDP 可用；Core 无法为某目标提供所需 Wire 时，该次操作失败，不能改走直连或把 UDP 载荷写入本地 TCP 控制连接。
 
-```text
-应用
-   │ 本地 SOCKS5 TCP / UDP
-   ▼
-本服务：127.0.0.1:1080
-   │ SOCKS5 TCP CONNECT / UDP ASSOCIATE
-   ▼
-sslocal：127.0.0.1:11080
-   │ Shadowsocks 对应的 TCP / UDP 协议
-   ▼
-远端 ssserver
-   │ 原始 TCP / UDP
-   ▼
-目标服务
-```
+本地认证不等于远端认证或数据保护。凭据与具体协议安全机制属于节点配置及 Wire；入口不得复用本地用户凭据、关闭具体实现要求的校验，或把未经支持的地址形式静默改成其他形式。
 
-`shadowsocks-rust` 的本地 SOCKS 服务支持相应监听及 TCP/UDP 模式配置；实际 UDP 能力还受所用服务端、构建选项和插件支持影响，必须做集成验收。[S6](#ref-s6)
-
-### 17.2 本服务不直接连接 Shadowsocks 协议端口
-
-本服务的 `type=socks5` 节点必须填写 `sslocal` 的 SOCKS5 地址，例如 `127.0.0.1:11080`，不能填写 `ssserver` 的 Shadowsocks 加密端口。
-
-SOCKS5 握手不能直接被 Shadowsocks 服务端当作合法加密协议解释。原生 Shadowsocks 支持应由独立出站模块实现完整地址封装、认证加密、密钥管理与 UDP 处理，本版本明确不实现，也不自己设计简化加密格式。
-
-### 17.3 外部 sslocal 的配置示意
-
-下面是外部进程的示意配置，不属于本服务 JSON schema；服务器名、密码和算法必须替换成实际兼容配置。
-
-```json
-{
-  "server": "ss-server.example.net",
-  "server_port": 8388,
-  "password": "REPLACE_WITH_REAL_SECRET",
-  "method": "aes-256-gcm",
-  "local_address": "127.0.0.1",
-  "local_port": 11080,
-  "mode": "tcp_and_udp"
-}
-```
-
-字段参考 `shadowsocks-rust` 官方配置说明；此片段不是对任何部署的可达性、安全强度或 UDP 支持状况的测试结果。[S6](#ref-s6)
-
-### 17.4 桥接进程必须单独验收
-
-必须检查 `sslocal` 是否实际启用 UDP、是否允许域名目标、是否在本地解析业务域名、是否存在 ACL 导致的直连绕过、是否存在失败自动回退，以及插件是否支持 UDP。
-
-本服务默认不主动管理外部进程安装和更新。它可以连接配置中的端点并报告失败，不能悄悄修改外部代理配置。
-
-本服务路由与 `sslocal` ACL 不能相互打架。例如本服务决定 PROXY，但 `sslocal` 因另一套 ACL 直接访问目标，就不符合用户理解的代理链路；该行为必须在桥接验收中发现并关闭或明确记录。
-
-### 17.5 SOCKS5 自身不等于加密隧道
-
-本地回环 SOCKS5 可以依赖同机信任边界；跨不可信网络使用无加密 SOCKS5 则会暴露目标信息，用户名密码方法还会暴露凭据。应用 HTTPS 只保护相应应用载荷，不自动保护 SOCKS 握手。[S1](#ref-s1) [S2](#ref-s2)
-
-本产品默认禁止未加密的远程 SOCKS5 节点，除非用户显式开启对应风险开关，或实际连接被明确部署在可信的外部加密通道中并经过验证。
-
-### 17.6 SOCKS5 over TLS 的准确含义
-
-可选的 `transport=tls` 仅表示先建立经过证书验证的 TLS 连接，再在里面执行 SOCKS5 TCP 协商；服务端必须有对应 TLS 接入层。
-
-TLS 验证必须使用配置的服务器名或 IP 身份，不能关闭验证，也不能在验证失败后降级成普通 TCP。
-
-**只给 UDP ASSOCIATE 控制 TCP 加 TLS，不会自动加密随后独立发送的 UDP 数据报。** 因此远程 UDP 仍必须单独满足数据面保护或显式风险授权要求。本版本不实现 DTLS、QUIC 中继或私有 UDP-over-TLS。
-
-### 17.7 本地 DNS 保证的范围
-
-`sslocal` 在同机运行时，本服务把域名交给它，能够证明的只是本服务没有自行解析该业务目标。要保证域名最终在远端处理，还必须验证所用 `sslocal` 的实际地址处理和 DNS 策略。
-
-不能只看到 `ATYP=03`，就忽略桥接进程、客户端和系统解析器的其他活动。
+PROXY 域名按 NetworkAddress 原样交给 Wire，不调用入口的目标 Resolver。该保证不替代 Wire 自身的解析行为验收，也不能证明客户端或其他进程没有执行 DNS。
 
 ---
+
 <a id="s18"></a>
 ## 18. 错误码与失败处理
 
@@ -1335,13 +1143,11 @@ TLS 验证必须使用配置的服务器名或 IP 身份，不能关闭验证，
 | 已成功建立的 TCP 流发生错误 | 关闭/中止流，不追加 SOCKS5 错误帧 |
 | UDP ASSOCIATE 成功后的单包失败 | 丢包、计数、限速日志，不往控制 TCP 写 REP |
 
-### 18.3 上游错误
+### 18.3 Wire 与节点错误
 
-节点 Bootstrap 失败、无法连接节点、节点 TLS 验证失败、上游方法协商失败和上游认证失败，统一向下游报告 `REP=01`，内部记录精确阶段。
+节点连接、Wire 初始化、启动及编解码失败由 Connection 在统一边界处理；无更精确且可靠语义时，本地请求回复 `REP=01`。保留原始原因用于内部诊断，不读取具体出站控制字节或直接复制其状态码。
 
-上游已返回一条完整、结构有效的请求失败回复时，可以保留 `01..08` 的 REP；未知值规范化为 `01`，不能把未识别值直接当成功。
-
-一个节点端口拒绝连接不应被描述成“业务目标拒绝连接”。日志必须区分 `proxy_endpoint` 和 `target_endpoint`。
+有明确目标不可达、拒绝或地址不支持语义的错误，才按本节的本地 REP 表映射。节点连接失败不能伪装成业务目标拒绝；本地成功之后仅关闭或丢包，不追加 REP。
 
 ### 18.4 多候选失败的确定性
 
@@ -1370,8 +1176,7 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
 | `outbound_total_ms` | 25000 | 完整请求/UDP 新流开始后至出站准备好 |
 | `dns_ms` | 5000 | 一次逻辑解析，包括等待工作槽 |
 | `connect_attempt_ms` | 10000 | 单个 TCP 候选尝试 |
-| `tls_ms` | 5000 | 可选节点 TLS 建立 |
-| `upstream_handshake_ms` | 10000 | 上游方法、认证和请求回复，合计预算 |
+| `wire_start_ms` | 10000 | Wire 启动所需处理，合计预算 |
 | `reply_flush_ms` | 1000 | 写入站结果回复 |
 | `tcp_idle_ms` | 900000 | TCP relay 两个方向均无实际业务进展 |
 | `half_close_drain_ms` | 30000 | 一个方向结束后等待另一方向排空 |
@@ -1380,7 +1185,7 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
 | `udp_failure_cooldown_ms` | 1000 | 流失败后新报文触发重建的最短等待 |
 | `shutdown_grace_ms` | 30000 | 服务停止时允许存量活动排空 |
 
-有效阶段截止时间总是 `min(阶段截止时间, 所属总截止时间)`。禁止把 DNS、多个地址、TLS、上游协商的超时简单串联，产生远大于总预算的真实等待。
+有效阶段截止时间总是 `min(阶段截止时间, 所属总截止时间)`。禁止把 DNS、多个地址与 Wire 启动的超时简单串联，产生远大于总预算的真实等待。
 
 只有成功解析并处理的有效活动才能刷新 UDP 空闲时间；畸形包、来源不符、REJECT 包和限流丢包不能用来永久维持关联。TCP 仅有控制连接存活不刷新 UDP 活跃时间。
 
@@ -1402,7 +1207,7 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
 
 这些上限是共享预算，不是保证所有独立上限可以同时达到。例如 TCP 会话数尚未到顶，但全局 socket 已满，也必须拒绝新建出站。
 
-启动时读取操作系统实际描述符限制，保留至少 64 个描述符供日志、文件和其他系统用途；有效网络 socket 上限取配置值与可用预算中的较小者，并报告配置值及有效值。不能假定任意 macOS 进程都默认拥有 2048 个可用网络描述符。
+启动时读取操作系统实际描述符限制，保留至少 64 个描述符供日志、文件和其他系统用途；有效网络 socket 上限取配置值与可用预算中的较小者，并报告配置值及有效值。不能假定任意宿主进程都默认拥有 2048 个可用网络描述符。
 
 ### 19.3 缓冲预算
 
@@ -1454,7 +1259,7 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
 
 ### 20.1 基础配置
 
-以下是本产品配置，不是现有第三方软件的通用配置格式。示例可用于实现 JSON 解码与语义校验；代理功能要求已有 `sslocal` 在 `127.0.0.1:11080` 正确运行。
+以下是入口策略的示例格式，供文档校验使用；节点以不透明引用出现，实际节点模型及 Wire 由运行配置装配。本文不提供具体节点的部署配置，也不宣称该 JSON 可直接传给 Magent。
 
 `example.com`、`blocked.example`、`203.0.113.0/24`、`2001:db8::/32` 用于展示规则与测试，不是推荐的生产分流清单。
 
@@ -1463,7 +1268,10 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
   "schema_version": 1,
   "listener": {
     "tcp": {
-      "hosts": ["127.0.0.1", "::1"],
+      "hosts": [
+        "127.0.0.1",
+        "::1"
+      ],
       "port": 1080,
       "ipv6_v6only": true
     },
@@ -1478,7 +1286,10 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
     "udp": {
       "enabled": true,
       "bind_mode": "per_association",
-      "port_range": [49152, 65535],
+      "port_range": [
+        49152,
+        65535
+      ],
       "source_port_policy": "pin"
     }
   },
@@ -1487,38 +1298,83 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
     "rules": [
       {
         "id": "reject-blocked-domain",
-        "match": {"domain_suffix": ["blocked.example"]},
-        "action": {"type": "REJECT"}
+        "match": {
+          "domain_suffix": [
+            "blocked.example"
+          ]
+        },
+        "action": {
+          "type": "REJECT"
+        }
       },
       {
         "id": "direct-local-domains",
-        "match": {"domain_suffix": ["lan", "local"]},
-        "action": {"type": "DIRECT"}
+        "match": {
+          "domain_suffix": [
+            "lan",
+            "local"
+          ]
+        },
+        "action": {
+          "type": "DIRECT"
+        }
       },
       {
         "id": "direct-private-ip",
         "match": {
-          "ip_cidr": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
+          "ip_cidr": [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "fc00::/7"
+          ]
         },
-        "action": {"type": "DIRECT"}
+        "action": {
+          "type": "DIRECT"
+        }
       },
       {
         "id": "proxy-udp-dns",
-        "match": {"transport": "udp", "ports": [53]},
-        "action": {"type": "PROXY", "outbound": "ss-local"}
+        "match": {
+          "transport": "udp",
+          "ports": [
+            53
+          ]
+        },
+        "action": {
+          "type": "PROXY",
+          "outbound": "proxy-main"
+        }
       },
       {
         "id": "proxy-example-domain",
-        "match": {"domain_suffix": ["example.com"]},
-        "action": {"type": "PROXY", "outbound": "ss-local"}
+        "match": {
+          "domain_suffix": [
+            "example.com"
+          ]
+        },
+        "action": {
+          "type": "PROXY",
+          "outbound": "proxy-main"
+        }
       },
       {
         "id": "proxy-test-ip",
-        "match": {"ip_cidr": ["203.0.113.0/24", "2001:db8::/32"]},
-        "action": {"type": "PROXY", "outbound": "ss-local"}
+        "match": {
+          "ip_cidr": [
+            "203.0.113.0/24",
+            "2001:db8::/32"
+          ]
+        },
+        "action": {
+          "type": "PROXY",
+          "outbound": "proxy-main"
+        }
       }
     ],
-    "default": {"type": "DIRECT"}
+    "default": {
+      "type": "DIRECT"
+    }
   },
   "resolver": {
     "kind": "system",
@@ -1530,21 +1386,7 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
   },
   "outbounds": [
     {
-      "id": "ss-local",
-      "type": "socks5",
-      "server": "127.0.0.1",
-      "port": 11080,
-      "transport": {"type": "tcp"},
-      "authentication": {"mode": "none"},
-      "udp": {
-        "enabled": true,
-        "association_scope": "per_flow",
-        "relay_allow_cidrs": [],
-        "relay_allow_domains": [],
-        "unspecified_bnd": "use_control_peer",
-        "allow_plaintext_remote": false
-      },
-      "fallback": "never"
+      "id": "proxy-main"
     }
   ],
   "security": {
@@ -1552,8 +1394,7 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
     "allow_loopback_targets": false,
     "allow_link_local_targets": false,
     "deny_self_endpoints": true,
-    "deny_cidrs": [],
-    "allow_plaintext_remote_socks": false
+    "deny_cidrs": []
   },
   "dialing": {
     "parallel_candidates": 2,
@@ -1564,15 +1405,14 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
     "outbound_total_ms": 25000,
     "dns_ms": 5000,
     "connect_attempt_ms": 10000,
-    "tls_ms": 5000,
-    "upstream_handshake_ms": 10000,
     "reply_flush_ms": 1000,
     "tcp_idle_ms": 900000,
     "half_close_drain_ms": 30000,
     "udp_association_idle_ms": 300000,
     "udp_flow_idle_ms": 60000,
     "udp_failure_cooldown_ms": 1000,
-    "shutdown_grace_ms": 30000
+    "shutdown_grace_ms": 30000,
+    "wire_start_ms": 10000
   },
   "limits": {
     "tcp_sessions": 512,
@@ -1655,44 +1495,13 @@ DIRECT 域名候选全部被安全策略过滤时返回 `02`。没有任何地�
 
 UDP 开启时，一条未限制为 TCP 的 PROXY 规则可能命中 UDP，因此引用的出站必须声明 UDP 能力；默认 PROXY 同理。要引用 TCP-only 出站，规则必须明确限定 `transport=tcp`。
 
-### 20.5 出站字段
+### 20.5 节点引用与 Wire 配置边界
 
-| 字段 | 允许值 / 语义 |
-|---|---|
-| `type` | 本版本只接受 `socks5` |
-| `server / port` | 上游 SOCKS5 的主机与端口，不是业务目标 |
-| `transport.type` | `tcp`；实现了可选适配器时可用 `tls` |
-| `authentication.mode` | `none` / `username_password` |
-| `udp.enabled` | 声明并允许使用该出站的 UDP 中继 |
-| `udp.association_scope` | 只接受 `per_flow` |
-| `udp.relay_allow_cidrs` | 允许不同于控制对端的中继数值地址范围 |
-| `udp.relay_allow_domains` | 允许解析的中继域名精确列表，不是业务分流域名 |
-| `udp.unspecified_bnd` | `use_control_peer` 或 `reject` |
-| `udp.allow_plaintext_remote` | 远程未加密 UDP 数据面的显式授权 |
-| `fallback` | 本版本必须为 `never` |
+出站配置在本文只表示对运行配置中节点的引用。`outbounds` 示例中的 `id` 由配置装配层关联到模型规定的节点 UUID；这些示例是入口策略资料，不是完整节点配置，也不是新增的 Magent 公共配置 API。
 
-上游用户名密码认证使用以下片段替换该出站的 `authentication`：
+Core 根据引用选择可用 Wire；具体节点协议、凭据、启动参数和端点构造由节点模型及 Wire 配置负责。入口不得增加自己的出站 `type`、认证方法、传输协议或远端控制消息字段。默认节点和规则引用的校验时机遵循模型规范；选中后不可用必须失败，不能解释为 DIRECT。
 
-```json
-{
-  "mode": "username_password",
-  "username": "proxy-user",
-  "password_ref": "keychain:local-proxy/outbound/proxy-user"
-}
-```
-
-可选 TLS transport 片段：
-
-```json
-{
-  "type": "tls",
-  "server_name": "proxy.example.net"
-}
-```
-
-`server_name` 是验证身份，不替代 `server` 的拨号地址；节点为数值 IP 时也不为 `server_name` 再查 DNS。默认使用系统信任根。未实现 TLS 适配器的版本必须拒绝该配置，不能退回 TCP。
-
-普通远程 TCP SOCKS 必须显式允许 `security.allow_plaintext_remote_socks`；远程 UDP 还必须显式允许该出站的 `udp.allow_plaintext_remote`，即使控制 TCP 使用 TLS。通过外部 VPN 等受保护路径部署时，也需要显式记录允许这些底层明文协议的部署决定；本服务不自动识别“链路已经安全”。
+运行时连接实际节点端点前仍须执行适用的端点安全检查。节点域名如需预先解析，由配置装配边界完成；入口只消费 Core / Wire 提供的实际端点，不为代理业务目标执行本地 DNS。
 
 ### 20.6 安全字段
 
@@ -1718,7 +1527,7 @@ JSON 解析必须拒绝重复键；未知字段拒绝，不能依靠普通解码
 
 ```text
 routing.rules[3].action.outbound: unknown outbound "proxy-b"
-outbounds[0].udp.enabled: required by UDP-capable rule "proxy-example-domain"
+routing.rules[0].action.outbound: selected node cannot provide a UDP Wire
 listener.access: non-loopback binding requires explicit authenticated LAN policy
 ```
 
@@ -1766,7 +1575,7 @@ PROXY 域名目标不会在本地解析，因此本服务无法完整判断它�
 
 节点最终数值地址与本机地址、监听端口组合相同则拒绝。检查必须覆盖 IPv4-mapped IPv6、节点域名解析到本机、所有实际绑定地址及当前活动 UDP 中继端点。
 
-`127.0.0.1:11080` 的外部 sslocal 可以作为节点；`127.0.0.1:1080` 的本服务自己不能作为节点。两者不能因为都在 loopback 就混成同一个规则。
+明确配置的节点端点不能等于本服务监听端点；同处回环网络不表示两者具有相同用途或授权。
 
 跨多个进程或远端代理造成的复杂环路不能仅靠本地端点比较彻底识别，需要部署验证；本服务不得启用会再次读取系统代理设置的出站 HTTP API 来制造明显递归。
 
@@ -1819,13 +1628,11 @@ local_auth_failed
 target_rejected
 target_dns_failed
 target_dns_timeout
-proxy_bootstrap_failed
-relay_bootstrap_failed
 proxy_connect_failed
-proxy_tls_failed
-proxy_auth_failed
-upstream_request_rejected
-upstream_protocol_error
+wire_start_failed
+wire_encode_failed
+wire_decode_failed
+wire_target_unsupported
 udp_source_mismatch
 udp_fragment_unsupported
 udp_packet_truncated
@@ -1856,9 +1663,9 @@ cancelled
 
 ### 22.4 故障定位顺序
 
-TCP：检查入站协商是否完成 → 目标类型是否正确 → 命中规则 → 是否触发预期 DNS → 节点/目标连接阶段 → 上游认证与 REP → relay 是否半关闭或超时。
+TCP：检查本地协商 → 目标 → Core 路由 → 目标 DNS → 下游 Channel → Wire 启动/编解码 → 本地回复 → relay 与清理。
 
-UDP：检查控制 TCP 是否仍开着 → 客户端是否发到实际 BND 端口 → 来源是否匹配 → `FRAG` 是否为 0 → 外层目标和路由 → 上游是否真的支持 UDP → BND 地址能否到达 → 回包是否因端点不匹配或长度限制被丢弃。
+UDP：检查本地控制 TCP → 本地中继端点 → 客户端来源与 FRAG → 目标与路由 → Wire 能力 → 实际后端登记 → 解码与本地回包封装。
 
 “TCP 能访问网页”不能证明 UDP 链路正常。“只抓不到 UDP 53”也不能证明从未调用系统解析器。
 
@@ -1867,91 +1674,21 @@ UDP：检查控制 TCP 是否仍开着 → 客户端是否发到实际 BND 端�
 <a id="s23"></a>
 ## 23. Swift 模块划分与接口契约
 
-### 23.1 模块结构
+### 23.1 模块与所有权
 
-```text
-ProxyCore/
-  Model/
-    Address, TargetEndpoint, RouteDecision, ConfigSnapshot
-  Protocol/
-    Socks5GreetingDecoder, Socks5AuthDecoder
-    Socks5RequestDecoder, Socks5ReplyDecoder
-    Socks5UDPCodec, AddressCodec
-  Routing/
-    HostNormalizer, RuleCompiler, RuleEngine, TargetGuard
-  Resolution/
-    Resolver, SystemResolverAdapter, ResolutionBudget
-  Transport/
-    AsyncByteStream, DatagramChannel
-    TCPAdapter, UDPAdapter, OptionalTLSAdapter
-  Outbound/
-    DirectTCPConnector, Socks5TCPConnector
-    DirectUDPFlow, Socks5UDPFlow, SecretProvider
-  Runtime/
-    Listener, AdmissionController, ProxySession
-    DuplexRelay, UDPAssociation, UDPFlowRegistry
-    ResourceBudget, Deadline, CancellationCoordinator
-  Configuration/
-    ConfigLoader, StructuralValidator, SemanticValidator, SnapshotStore
-  Observability/
-    EventSink, Metrics, Redaction
-ProxyCoreTests/
-  ProtocolTests, RoutingTests, ResolutionTests
-  OutboundTests, TCPRelayTests, UDPTests
-  ConfigTests, LifecycleTests, SecurityTests
-ProxyApp/
-  UI, settings, lifecycle integration
-```
+沿用 MagentTCPConnection、Socks5Connection、MagentCore 和 Wire。SOCKS5 的 greeting、认证、请求、回复与 UDP codec 属于 Connection；模型与路由使用 MODELS_SPEC.md 的统一契约；Wire 负责具体出站编解码。
 
-协议与规则单元测试不依赖 SwiftUI / AppKit。UI 不直接拥有单连接数据面，系统代理设置逻辑不进入报文解析器。
+### 23.2 调用契约
 
-### 23.2 Swift 风格接口草案
+TCP 按第 11 节先选 Wire、建 Channel、完成启动，再提交本地成功；后续载荷只走编解码。UDP 按第 15 节逐包提供目标与 DATA，并将实际后端及 Wire 绑定到所属本地关联。
 
-以下代码只描述职责，省略具体类型定义与平台适配，不应当作完整可编译实现：
+所有 Channel 使用 Magent 管理的 EventLoopGroup；Connection 持有并清理它们。Wire 接口不返回或拥有本地控制 Channel，不替 Connection 发送 SOCKS5 回复。
 
-```swift
-protocol RouteEngine: Sendable {
-    func decide(
-        target: TargetEndpoint,
-        transport: TransportKind,
-        snapshot: ConfigSnapshot
-    ) throws -> RouteDecision
-}
+### 23.3 Channel 传输契约
 
-protocol Resolver: Sendable {
-    func resolveAbsolute(
-        host: DomainName,
-        purpose: ResolutionPurpose,
-        deadline: Deadline
-    ) async throws -> ResolutionResult
-}
+TCP Channel 必须提供完整读写顺序、实际端点、取消和半关闭。UDP Channel 必须保持消息边界、固定源端点、识别截断，并对关联端口有明确控制。Wire 不代替 Channel 执行这些操作。
 
-protocol TCPOutboundConnector: Sendable {
-    func open(
-        target: TargetEndpoint,
-        decision: RouteDecision,
-        context: OutboundContext
-    ) async throws -> EstablishedTCP
-}
-
-protocol UDPFlowFactory: Sendable {
-    func open(
-        target: TargetEndpoint,
-        decision: RouteDecision,
-        context: UDPFlowContext
-    ) async throws -> EstablishedUDPFlow
-}
-```
-
-地址枚举可采用 `.ipv4`、`.ipv6`、`.domain`，动作枚举采用 `.direct`、`.proxy`、`.reject`；JSON 的大写动作值是持久化格式，不要求 Swift 枚举定义也全大写。
-
-### 23.3 平台网络适配
-
-可以使用 Network.framework 建立连接和管理状态；Apple 的 `NWConnection` 文档作为平台 API 入口参考。实际选择的 SDK、最低系统版本、接收与半关闭实现都必须在工程中编译并实测，不在 SPEC 中把接口草案冒充已经验证的代码。[S7](#ref-s7)
-
-TCP 适配器必须提供完整读写顺序、实际端点、取消和半关闭。UDP 适配器必须保持消息边界、固定源端点、识别截断，并对关联端口有明确控制；高级接口不能满足时可以使用隔离的 POSIX socket 适配层。
-
-`NWConnection` 的对象状态、Swift Task 的取消、底层 socket 生命周期不能只靠“任务退出后大概会释放”来绑定，需要明确的 owner 和幂等关闭实现。
+Channel、连接状态和可能存在的 Swift Task 需要明确的 owner 和幂等清理路径，不能依赖“任务退出后大概会释放”。平台权限和应用集成由宿主文档规定。
 
 ### 23.4 并发模型
 
@@ -1988,9 +1725,9 @@ TCP 适配器必须提供完整读写顺序、实际端点、取消和半关闭�
 └─ SOCKS5
 ```
 
-本服务命中 `proxy-example-domain`，选择 `ss-local`。它连接 `127.0.0.1:11080`，独立协商，并向该上游发送域名 CONNECT。
+本服务命中 `proxy-example-domain`，Core 根据节点引用选择 Wire。Connection 连接 Wire 提供的实际端点，并以原域名目标完成 Wire 启动。
 
-本服务自己的 Target DNS 计数必须保持 0。收到上游完整成功回复后，才向客户端发送成功，随后双向转发包括 TLS 握手在内的原始字节。
+本服务入口的 Target DNS 计数保持 0。满足第 11 节就绪条件后发送本地成功；后续业务数据经 Wire 编解码，入口不再解释其中的应用协议。
 
 ### 24.2 内网 IP TCP 命中直连
 
@@ -2000,7 +1737,7 @@ TCP 适配器必须提供完整读写顺序、实际端点、取消和半关闭�
 05 01 00 01 C0 A8 02 0A 1F 90
 ```
 
-示例安全策略允许私网，规则命中 `direct-private-ip`，直接向这个数值地址拨号，不查询 DNS，也不连接 `ss-local`。
+示例安全策略允许私网，规则命中 `direct-private-ip`，直接向这个数值地址拨号，不查询 DNS，也不连接 `proxy-main`。
 
 假设受控环境中实际出站本地绑定为 `192.168.2.20:50000`，成功回复应编码为：
 
@@ -2042,10 +1779,10 @@ TCP 适配器必须提供完整读写顺序、实际端点、取消和半关闭�
 
 ```text
 包 A：目标 192.168.2.10:9000 → direct-private-ip → DIRECT
-包 B：目标 example.com:443   → proxy-example-domain → ss-local
+包 B：目标 example.com:443   → proxy-example-domain → proxy-main
 ```
 
-本服务建立两个不同 UDP 流。包 A 去掉 SOCKS5 头后直接发送；包 B 保留域名语义，通过上游 UDP ASSOCIATE 的中继转发。控制连接的 `0.0.0.0:0` 不参与这两次业务分流。
+本服务记录两个目标的出口。包 A 去掉本地 SOCKS5 头后直接发送；包 B 将域名目标及 DATA 交给 UDP Wire 编码。控制请求的 `0.0.0.0:0` 不参与业务分流。
 
 ### 24.6 DNS 数据报命中端口规则
 
@@ -2063,13 +1800,13 @@ TCP 适配器必须提供完整读写顺序、实际端点、取消和半关闭�
 
 ### 24.7 代理故障
 
-如果 `ss-local` 端口关闭，TCP PROXY 请求在成功回复前失败，客户端得到 `REP=01`；UDP PROXY 新流建立失败，对应数据报被丢弃并记录 `proxy_connect_failed`。
+如果选定节点连接或 Wire 启动失败，TCP 在本地成功前返回 `REP=01`；UDP 丢弃相关数据报并记录失败阶段。
 
 两种情况都不会改走 DIRECT。其他已经存在的 DIRECT UDP 流仍可工作，除非父关联整体关闭。
 
 ### 24.8 客户端结束 UDP 使用
 
-客户端关闭创建关联的 TCP 控制连接。即使稍后还有 UDP 包发到旧中继端口，本服务也不能继续替这个关联转发。所有关联子流、上游控制连接和缓冲必须被释放。
+客户端关闭创建关联的 TCP 控制连接。即使稍后还有 UDP 包发到旧中继端口，本服务也不能继续替这个关联转发。所有关联子流、下游 Channel、端点记录和缓冲必须被释放。
 
 ---
 
@@ -2214,7 +1951,7 @@ TCP 适配器必须提供完整读写顺序、实际端点、取消和半关闭�
 
 对每个有效 TCP 消息，尝试在每个字节边界切成两段，再按一字节一段及随机分段喂入解析器，最终消息、消费长度和余留字节必须相同。
 
-再测试 `greeting + request + earlyData` 以及 `upstreamReply + serverFirstData` 的粘包情况。UDP 不执行跨数据报补齐测试，而是验证每个短包独立丢弃。
+再测试 `greeting + request + earlyData`，以及 Wire 在同次解码结果中返回 ready=true 与首段业务数据的情况。UDP 不执行跨数据报补齐测试，而是验证每个短包独立丢弃。
 
 ---
 
@@ -2232,7 +1969,7 @@ TCP 适配器必须提供完整读写顺序、实际端点、取消和半关闭�
 | P05 | 每个切分点半包 | 最终结果与一次输入一致 |
 | P06 | 多阶段粘包 | 回复顺序不变，余留字节不丢失 |
 | P07 | early data | 成功前不发送目标载荷，成功后保持顺序 |
-| P08 | 上游回复粘业务数据 | 回复之后的字节交给 relay |
+| P08 | Wire 就绪与首段业务数据同时返回 | 必要控制输出和本地成功回复完成后，业务数据按序转发 |
 | P09 | 错误版本、RSV、ATYP | 精确按阶段失败，不越界 |
 | P10 | BIND / 未知 CMD / UDP 关闭 | `REP=07` |
 | P11 | 方法、认证、域名最大长度 | 解析长度正确且资源有界 |
@@ -2259,30 +1996,32 @@ TCP 适配器必须提供完整读写顺序、实际端点、取消和半关闭�
 |---|---|---|
 | D01 | 数值目标 DIRECT / PROXY | Target DNS 调用为 0 |
 | D02 | TCP / UDP 域名 DIRECT | 合法系统解析；只连接已检查的数值候选 |
-| D03 | TCP / UDP 域名 PROXY | 本服务 Target DNS 为 0，上游收到 Domain |
-| D04 | 节点用域名 | 仅有独立 PROXY_BOOTSTRAP 目的 |
-| D05 | 合法中继域名 | 独立 RELAY_BOOTSTRAP；受 allowlist 约束 |
+| D03 | TCP / UDP 域名 PROXY | 入口 Target DNS 为 0，Wire 收到域名 NetworkAddress |
+| D04 | 节点配置名称解析 | 配置装配与入口目标 DNS 分开；入口只消费实际节点端点 |
+| D05 | UDP 后端端点 | 使用所选 Wire 提供的实际端点，不从本地控制请求推导 |
 | D06 | DNS 超时后迟到成功 | 不为已结束会话拨号；真实工作槽有界 |
 | D07 | 一次安全 IP、下一次危险 IP 的假解析器 | 不出现按名称二次拨号 |
 | D08 | UDP 载荷中 QNAME 命中域名规则 | 不据此分流；只使用外层目标 |
-| D09 | 外部 sslocal 桥接 | 单独检查其 Target DNS 和 DIRECT 回退行为 |
+| D09 | 更换 Wire 实现 | 入口的目标 DNS 和失败不直连契约不变 |
 
-D03 必须使用可注入 Resolver 调用计数和可观察的假上游报文断言。真实环境的网络抓包作为补充，不能把未抓到明文 DNS 当成唯一证据。
+D03 必须同时断言入口 Resolver 调用计数和测试 Wire 收到的 NetworkAddress。真实环境的网络抓包作为补充，不能把未抓到明文 DNS 当成唯一证据。
 
-### 26.4 O：上游 TCP 与桥接
+### 26.4 O：TCP Wire 集成
 
-| ID | 场景 | 必须满足 |
+| ID | 场景 | 必须断言 |
 |---|---|---|
-| O01 | 上游无认证 | 独立完成协商 |
-| O02 | 上游用户名密码 | 凭据来自出站配置，不是本地用户 |
-| O03 | 上游选未提议方法或降级 | 失败，不继续 CONNECT |
-| O04 | 上游不同 ATYP 回复 | 完整消费可变长度回复 |
-| O05 | 上游有效失败 REP | 按表映射，成功不会提前发送 |
-| O06 | 节点拒绝、Bootstrap 失败、超时 | 记录节点阶段，不自动 DIRECT |
-| O07 | 上游早成功但随后关闭 | 记录建立后失败，不再插入 REP |
-| O08 | 两个 TCP 请求并发 | 独立上游隧道，不交错复用 |
-| O09 | TLS 支持版本中的证书失败 | 不关闭验证，不降级 TCP |
-| O10 | sslocal TCP / UDP 集成 | 分别验证，不以 TCP 成功替代 UDP 验收 |
+| O01 | Core 选择 Wire | 每条 TCP 路由只选择一次；节点端点与业务目标分离 |
+| O02 | Wire 启动 | 同一个规范化目标传给 start；按 WireResult 推进启动，不透传本地凭据或入口握手 |
+| O03 | Wire 初始化、启动或编解码失败 | 由 Connection 处理本地失败；没有 DIRECT 回退 |
+| O04 | 域名与数值目标 | Wire 收到模型规定的地址身份、根点和端口；PROXY 目标 DNS 为零 |
+| O05 | Wire 返回错误 | 保留原始原因；不复制具体出站协议的状态码或控制字节 |
+| O06 | 下游输入分片、暂未解出业务数据 | Wire 保留协议状态；入口不丢字节、不误判 EOF |
+| O07 | 启动后立即产出业务数据 | 本地成功回复与业务余量按入口规定排序 |
+| O08 | 启动写未完成、超时或取消 | ready 和必要控制写入均满足才就绪；迟到回调不能恢复会话 |
+| O09 | 双向业务数据 | 出站经过 encode，入站经过 decode，入口只消费业务数据 |
+| O10 | 更换测试 Wire | 入口报文、目标来源和本地回复契约不变 |
+| O11 | 节点等于本服务监听端点 | 拒绝递归连接并清理已申请资源 |
+| O12 | 无启动字节及服务器先发 | 不等待客户端首段载荷；就绪后正常完成本地回复 |
 
 ### 26.5 U：UDP
 
@@ -2299,10 +2038,10 @@ D03 必须使用可注入 Resolver 调用计数和可观察的假上游报文断
 | U09 | 零长度 DATA | 允许，回包不误判为 EOF |
 | U10 | DIRECT 数值目标 | 只发送 DATA，回包补 SOCKS 头 |
 | U11 | DIRECT 域名多候选 | 只选一个端点，不复制业务包做探测 |
-| U12 | PROXY 域名 | 上游 UDP 头保留 Domain，无本地 Target DNS |
+| U12 | PROXY 域名 | Wire 收到域名 NetworkAddress 和 DATA，无入口目标 DNS |
 | U13 | 一个关联两个代理目标 | 流通道隔离、回包不串流 |
-| U14 | 上游 BND wildcard | 只按配置替换为控制对端，端口非零 |
-| U15 | 上游 BND 指向其他未授权地址 | 拒绝通道，不发 UDP |
+| U14 | Wire 提供后端端点 | 实际发送端点与登记端点一致，不能使用本地 BND 作为后端 |
+| U15 | Wire 解码业务来源 | 重新编码本地 UDP 头，节点端点不冒充业务来源 |
 | U16 | 上游 UDP 从陌生端点回包 | 丢弃 |
 | U17 | 控制 TCP 关闭 | 所有关联资源释放，后续 UDP 不再转发 |
 | U18 | 上游不支持 UDP | 该流失败，不改 DIRECT，不写入普通 TCP |
@@ -2344,9 +2083,9 @@ D03 必须使用可注入 Resolver 调用计数和可观察的假上游报文断
 | S01 | 业务回环/未指定/组播/link-local | 按安全策略拒绝 |
 | S02 | 域名解析到被禁止地址 | 不拨号，不能二次解析绕过 |
 | S03 | 节点指向本服务，含映射 IPv6/域名形式 | 自回环拒绝 |
-| S04 | 允许回环 sslocal 节点 | 不被业务回环禁令误伤 |
-| S05 | 上游域名回包为数值地址 | 隔离通道处理，不宣称本地 DNS 已验证归属 |
-| S06 | 未加密远程 SOCKS / UDP 未获授权 | 拒绝，控制 TLS 不替代 UDP 数据面授权 |
+| S04 | 授权节点与业务目标 | 独立端点授权，不绕过自身监听保护 |
+| S05 | UDP 业务域名对应数值来源回包 | 先验证实际后端并选择登记的 Wire；不宣称本地 DNS 已验证域名归属 |
+| S06 | Wire 能力或节点端点授权不足 | 操作失败，不放宽实现要求的校验，不回退 DIRECT |
 | S07 | 密码、载荷、畸形输入进入日志 | 无秘密泄漏，控制字符转义 |
 | S08 | UDP 伪造来源及反射尝试 | 不发送给任意客户端端点，不创建无界状态 |
 
@@ -2392,10 +2131,10 @@ curl --noproxy "" \
 | M1 | 地址模型、所有 SOCKS5 codec、增量解析 | P 系列及固定向量通过 |
 | M2 | 主机名规范化、纯路由、安全检查、配置加载 | R、C 的纯计算用例及 S01/S03 通过 |
 | M3 | 系统解析适配、DIRECT TCP、字节流和半关闭 | D01/D02/D06/D07、L01/L02/L03/L06 通过 |
-| M4 | SOCKS5 TCP 上游、凭据、可选 TLS | O01..O09 以及 D03/D04 通过 |
+| M4 | TCP Wire 启动、编解码、错误与清理 | O01..O12 以及 D03/D04 通过 |
 | M5 | 本地 UDP 关联、UDP codec、DIRECT UDP | U01..U11、U17/U19/U21/U22 通过 |
-| M6 | 上游 UDP 通道、回包归属、混合出口 | U12..U20、D05/D08、S05/S06/S08 通过 |
-| M7 | 全局预算、热更新、日志、退出、sslocal 集成 | 剩余 L/C/S、D09、O10 及稳定性测试通过 |
+| M6 | UDP Wire、实际后端归属、混合出口 | U12..U20、D05/D08、S05/S06/S08 通过 |
+| M7 | 全局预算、生命周期、日志与 Wire 集成 | 剩余 L/C/S、D09、O10 及稳定性测试通过 |
 
 M3 或 M4 完成时可以交付明确标识的 TCP-only 开发构建，但它**不等于本文件定义的完整版本验收通过**。完整版本必须完成 UDP 和资源生命周期要求。
 
@@ -2408,36 +2147,36 @@ M3 或 M4 完成时可以交付明确标识的 TCP-only 开发构建，但它**�
 | REQ-03 | 纯规则引擎、顺序首命中、默认直连 | R01..R10 |
 | REQ-04 | PROXY 域名不做本服务 Target DNS | D01/D03/D04 |
 | REQ-05 | DIRECT 安全解析且无二次解析 | D02/D06/D07、S02 |
-| REQ-06 | 独立 SOCKS5 上游协商与错误处理 | O01..O08 |
+| REQ-06 | TCP Wire 启动、编解码与本地错误映射 | O01..O12 |
 | REQ-07 | TCP 不丢字节、背压、半关闭 | L01..L06 |
 | REQ-08 | UDP 关联与 TCP 生命周期绑定 | U01..U05、U17/U22 |
 | REQ-09 | UDP 报文边界、三类地址、无分片重组 | U06..U09、U21 |
 | REQ-10 | UDP 多目标分流与 DIRECT 正确封装 | R10、U10/U11 |
-| REQ-11 | 上游 UDP ASSOCIATE 与安全回包归属 | U12..U16、S05 |
+| REQ-11 | UDP Wire 与实际后端端点归属 | U12..U16、S05 |
 | REQ-12 | 失败不隐式 DIRECT、不重放载荷 | O06/O07、U18/U20 |
 | REQ-13 | 无独立 DNS 服务，不按 DATA QNAME 分流 | D08 及监听面检查 |
 | REQ-14 | 所有任务、socket、缓冲和队列有界 | L04/L05/L07/L08、U19 |
 | REQ-15 | 配置原子更新和快照一致性 | C01..C07 |
 | REQ-16 | 凭据隐私和默认回环监听 | C04/C08、S06/S07 |
 | REQ-17 | 自回环保护与目标安全限制 | S01..S04 |
-| REQ-18 | sslocal 独立 DNS/出口/UDP 验收 | D09、O10 |
+| REQ-18 | Wire 替换不改变本地入口契约 | D09、O10 |
 
 ### 27.3 可交给编码代理的任务说明
 
 ```text
-以本单文件 SPEC 为唯一协议和行为基线，按 M1 到 M7 实施。
+入口协议按本 SPEC，模型与出站抽象分别遵循 MODELS_SPEC.md 和 WIRES_SPEC.md；按 M1 到 M7 实施。
 先完成数据模型、纯 codec 和测试，不先耦合 UI、真实 DNS 或真实代理节点。
-当前范围包括 SOCKS5 CONNECT 与 UDP ASSOCIATE，不实现 BIND 和 GSSAPI。
+当前范围包括本地 SOCKS5 CONNECT 与 UDP ASSOCIATE；出站接口遵循 WIRES_SPEC.md，不实现本地 BIND 和 GSSAPI。
 保留 consumed / remainder，TCP 支持半包粘包，UDP 不跨数据报拼接。
 路由按顺序首命中，默认 DIRECT，禁止在规则引擎中执行 DNS。
 PROXY 域名保留域名交上游；DIRECT 域名由系统解析并只向已校验数值地址拨号。
-上游接入实现 SOCKS5；Shadowsocks 通过外部 sslocal，不自写密码协议。
-UDP 按每个目标建立逻辑流，默认每流独立上游 UDP 通道。
+PROXY 只经抽象 Wire 启动和编解码；Channel 与本地回复归 Connection。
+UDP 按目标记录路由和实际后端，收到响应后使用对应 Wire 解码并封装本地回复。
 代理失败不回退直连，不自动重放 TCP/UDP 业务载荷。
 不添加独立 DNS 监听、TUN、SNI 嗅探、PAC 执行或隐含规则优先级。
 所有异步任务、解析工作、套接字、缓冲、队列和定时器必须有明确预算与 owner。
 每个阶段提交对应测试；不得以浏览器打开网页替代 UDP 和生命周期验收。
-未验证的 SDK 行为、第三方桥接行为和性能指标必须保留为待验证项，不写成完成事实。
+未验证的传输、Wire 集成行为和性能指标必须保留为待验证项，不写成完成事实。
 ```
 
 ---
@@ -2453,10 +2192,10 @@ UDP 按每个目标建立逻辑流，默认每流独立上游 UDP 通道。
 | 域名规则是否为 IP 查询 DNS | 否 | 保持分流纯计算、避免代理目标本地解析；无法按解析后 IP 自动分类域名 |
 | DNS 服务 | 不实现 | 只需内部系统解析和普通 DNS 载荷转发 |
 | 原始域名缺失 | 不恢复 | 不做不可靠反查、历史 IP 映射或应用嗅探 |
-| TCP 上游 | 独立 SOCKS5 隧道 | 职责清晰；不实现多路复用 |
-| Shadowsocks | 外部 sslocal 桥接 | 不自写密码协议；需要单独验证桥接 DNS 和 UDP 行为 |
+| TCP PROXY | 每连接独立 Wire 状态 | 启动和流编解码不与其他连接混用 |
+| Wire 边界 | 不指定具体出站协议 | 节点协议格式与配置在所属契约中验收 |
 | 本地 UDP 端口 | 每关联一个 | 归属简单；消耗更多端口和 socket |
-| 上游 UDP 关联 | 每逻辑流一个 | 域名回包容易隔离；资源成本更高 |
+| UDP 后端 | 按关联登记实际端点与 Wire | 回包使用正确解码器且不跨客户端转发 |
 | UDP 源端口 | 首合法包后固定 | 简化安全与映射；不支持无感 NAT 重绑定 |
 | UDP SOCKS 分片 | 不支持 | 明确丢弃非零 FRAG，减少复杂状态 |
 | UDP 多地址候选 | 不并发复制载荷 | 避免重复副作用；不自动探测最快目标 |
@@ -2473,13 +2212,13 @@ UDP 按每个目标建立逻辑流，默认每流独立上游 UDP 通道。
 | 从哪里拿到目标地址？ | TCP 从 CONNECT；UDP 从每个 UDP 包的目标头，不能从 ASSOCIATE 的源提示取业务目标。 |
 | 怎么知道走哪条链路？ | 目标规范化、安全检查、顺序首匹配规则，得到 DIRECT / PROXY / REJECT。 |
 | 没有规则匹配怎么办？ | 默认 DIRECT；域名到此时才使用系统解析，数值 IP 不查询。 |
-| 域名代理时谁解析？ | 本服务保留域名交上游；最终在哪里解析还取决于真实上游/桥接实现。 |
-| 到代理服务器怎么通信？ | 本服务作为 SOCKS5 客户端独立协商；TCP 发 CONNECT，UDP 另建 ASSOCIATE 并向 BND 发送 UDP。 |
+| 域名代理时谁解析？ | 入口保留名称交给 Wire；入口不执行目标 DNS，Wire 自身行为另行验收。 |
+| 到代理服务器怎么通信？ | Core 选择 Wire，Connection 读写其实际端点，Wire 负责启动和编解码。 |
 | 需要一个 DNS 端口吗？ | 不需要；内部 Resolver 和普通 DNS 报文转发已覆盖本版需求，UDP 中继端口不是 DNS 服务端口。 |
 
 ### 28.3 标准与官方资料
 
-标准字段和第三方配置事实以以下原始资料为依据；本产品的超时、限制、配置格式、路由语义及隔离策略是本文件明确选择的工程设计。
+入口协议字段以以下原始资料为依据；本产品的超时、限制、配置格式、路由语义及隔离策略是本文件明确选择的工程设计。
 
 <a id="ref-s1"></a>
 **S1 — RFC 1928, SOCKS Protocol Version 5**\
@@ -2506,15 +2245,6 @@ UDP 按每个目标建立逻辑流，默认每流独立上游 UDP 通道。
 用于 `--socks5`、`--socks5-hostname` 和 `--noproxy` 测试方式。\
 <https://curl.se/docs/manpage.html>
 
-<a id="ref-s6"></a>
-**S6 — shadowsocks-rust 官方仓库与配置文档**\
-用于 `sslocal` SOCKS 入口、`tcp_and_udp` 配置以及外部桥接集成边界。仓库内容可能更新，实际部署应固定版本再验收。\
-<https://github.com/shadowsocks/shadowsocks-rust>
-
-<a id="ref-s7"></a>
-**S7 — Apple Network.framework / NWConnection 官方文档**\
-作为 macOS 网络适配 API 入口；本文件的接口草案不是某个 SDK 版本的可编译保证。\
-<https://developer.apple.com/documentation/network/nwconnection>
 
 ---
 

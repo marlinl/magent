@@ -5,9 +5,11 @@
 ### Architecture and specifications
 
 Keep architecture and normative SPECs under `docs/`. [Architecture](docs/ARCHITECTURE.md) defines package-wide
-API, layer, ownership, and lifecycle boundaries and indexes SPECs and designs. SPECs must define self-contained
-functionality, constraints, contracts, and acceptance criteria. Check source and tests before presenting proposed
-requirements as implemented behavior.
+API, layer, ownership, and lifecycle boundaries and indexes SPECs and designs.
+[Wire specification](docs/WIRES_SPEC.md) defines the abstract outbound interface used by HTTP/SOCKS SPECs;
+keep concrete backend protocols, wire formats, and deployment configuration out of those interface and inbound
+SPECs. SPECs must define self-contained functionality, constraints, contracts, and acceptance criteria. Check source
+and tests before presenting proposed requirements as implemented behavior.
 
 Magent is a general-purpose reusable library. Do not add or retain SPECs bound to a particular operating system,
 host application, business system, or deployment environment; system-specific integration requirements belong

@@ -12,6 +12,8 @@ proxy implementations remain implementation details of the package.
 - [Model specifications](MODELS_SPEC.md): normative NetworkAddress, HttpProtocol,
   ProxyNode, and ProxyRule contracts, associated enums, ownership boundaries, and
   acceptance criteria.
+- [Wire specification](WIRES_SPEC.md): abstract transport, startup readiness,
+  encoding/decoding, ownership, errors, and acceptance criteria.
 - [SOCKS4 specification](SOCKS4_PROXY_SPEC.md): protocol design, packet vectors,
   and acceptance criteria.
 - [SOCKS5 specification](SOCKS5_PROXY_SPEC.md): TCP/UDP protocol design, routing,
@@ -32,6 +34,7 @@ proxy implementations remain implementation details of the package.
 
 This document owns package boundaries, resource ownership, lifecycle, and
 protocol integration constraints. The model SPEC owns mandatory model contracts;
+the Wire SPEC owns the abstract outbound interface;
 the cache SPEC owns proposed cache semantics and algorithm invariants; the
 protocol SPECs own detailed message formats, product profiles, and acceptance
 matrices. Do not maintain a separate per-protocol implementation design document
@@ -223,6 +226,9 @@ protocol.
 
 ### Wire
 
+The target abstract contract is defined in [WIRES_SPEC.md](WIRES_SPEC.md);
+the following describes the current interface and implementation layout.
+
 `Wire/` represents concrete protocols used to communicate with remote proxy
 servers.
 
@@ -335,13 +341,18 @@ different SPEC profile requires corresponding code, model, and regression-test
 changes. Document consolidation does not resolve an implementation gap or prove
 SPEC compliance.
 
-The broader HTTP/SOCKS SPECs describe standalone service profiles with SOCKS5
-upstreams or an external `sslocal` bridge, a REJECT action, first-configured-match
-routing, and configuration snapshots that can outlive an update. The current
-package has native Shadowsocks Wires, direct/proxy decisions, rule ordering by
-`order` then specificity and input position, and restart-scoped Core instances
-that close the old connections. Those differences require explicit design
-changes, not new wrappers or features inferred from an example configuration.
+The HTTP/SOCKS SPECs depend on the abstract interface in [WIRES_SPEC.md](WIRES_SPEC.md).
+They do not define concrete backend protocols, node deployment, or backend
+handshake formats. The Wire SPEC adds explicit startup results, readiness,
+inbound EOF validation, and buffer accounting; it renames the endpoint getter
+to getEndpoint. Channel shutdown and release of Wire references remain with
+Connection/Core. These target contracts still require coordinated migration of
+Wire and its consumers.
+
+The protocol drafts retain broader routing and lifecycle requirements that need
+separate alignment with the model contract and restart-scoped Core ownership.
+Removing backend coupling does not implement those requirements or change the
+current package's direct/proxy decisions, rule ordering, or restart behavior.
 
 `MODELS_SPEC.md` is the mandatory contract for model implementation and use;
 it is not evidence that today's code satisfies that contract. Existing gaps
