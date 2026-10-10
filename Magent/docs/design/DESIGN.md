@@ -36,6 +36,11 @@ functional constraints and acceptance criteria.
 - Focus on component purpose, caller contracts, workflows, integration, and edge cases.
   Keep the component's identity distinct from its internal algorithm. Exclude algorithm explanations,
   data-structure details, and implementation walkthroughs; refer to SPECs for those constraints.
+- Keep designs concise: define resource owners, meaningful states, completion/close ordering, and
+  exact method declarations once. Give each method its caller and responsibility in a compact table;
+  describe lifecycle transitions once instead of repeating the same flow per callback. Link to SPEC
+  limits, parsing rules, error matrices, and acceptance vectors rather than copying them. Do not add
+  types, layers, helpers, state cases, or configuration merely to make the document look complete.
 - SPECs must remain independent of product designs. References flow from design to SPEC;
   SPECs must not reference, depend on, or compare with product-design documents.
 - Keep benchmark scenarios, commands, measurement methods, performance analysis, and results
@@ -66,10 +71,10 @@ Statuses below follow each document's own declaration. A target design does not 
 
 | Document | Status | Scope |
 | --- | --- | --- |
-| [MagentTCPConnection design](MagentTCPConnection-DESIGN.md) | Target design; runtime assembly required | Accepted TCP ownership, bounded protocol detection, constructors aligned with the four Connection contracts, data handoff and lifecycle. |
-| [Socks4Connection design](Socks4Connection-DESIGN.md) | Target design; trailing-dot and runtime contracts require alignment | SOCKS4 / SOCKS4a CONNECT entry ownership, reply barrier, Wire integration, relay and lifecycle boundaries, governed by the [SOCKS4 SPEC](../SOCKS4_PROXY_SPEC.md) and [Wire SPEC](../WIRES_SPEC.md). |
-| [Socks5Connection design](Socks5Connection-DESIGN.md) | Target design; model/Core and runtime contracts require alignment | No-auth method negotiation, TCP CONNECT and per-control-connection UDP associations; fixed method contracts and lifecycle under the current SOCKS5 scope and Wire SPEC. |
-| [HttpConnectConnection design](HttpConnectConnection-DESIGN.md) | Target design; model/Core and listener contracts require alignment | CONNECT validation without inbound authentication, success barrier, bidirectional remainder and half-close; shared ProxyConnection contract and current HTTP/Wire scope. |
-| [HttpForwardConnection design](HttpForwardConnection-DESIGN.md) | Target design; full HTTP model and service contracts require alignment | HTTP transactions without inbound authentication, chunked/trailers, Expect, ordered keep-alive/pipelining, WebSocket and subsequent CONNECT handoff. |
+| [MagentTCPConnection design](MagentTCPConnection-DESIGN.md) | Target design; implementation verification pending | Mixed-protocol accepted TCP ownership, unique dispatch and restart-scoped cleanup. |
+| [Socks4Connection design](Socks4Connection-DESIGN.md) | Target design; implementation verification pending | Strict SOCKS4/4a CONNECT, reply barrier, Wire integration and half-close under the [SOCKS4 SPEC](../SOCKS4_PROXY_SPEC.md). |
+| [Socks5Connection design](Socks5Connection-DESIGN.md) | Target design; implementation verification pending | No-auth negotiation, TCP CONNECT and UDP resources owned by each control connection. |
+| [HttpConnectConnection design](HttpConnectConnection-DESIGN.md) | Target design; implementation verification pending | Model-based CONNECT validation, strict request ordering, success barrier and half-close. |
+| [HttpForwardConnection design](HttpForwardConnection-DESIGN.md) | Target design; implementation verification pending | One complete request, model-based rewrite, transparent response relay and cleanup. |
 | [MagentCache design](MagentCache_Design.md) | Target design; source migration is pending | Cache caller contracts, Core integration, expiration, invalidation, and shutdown boundaries, governed by the [Cache SPEC](../W-TinyLFU_CACHE_SPCE.md). |
 | [Routing and access control design](MagentAccessControl_Design.md) | Current implementation | Rule matching, node selection, runtime ownership, and decision caching, with current routing boundaries defined alongside the architecture. |

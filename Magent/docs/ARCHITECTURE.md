@@ -349,10 +349,10 @@ to getEndpoint. Channel shutdown and release of Wire references remain with
 Connection/Core. These target contracts still require coordinated migration of
 Wire and its consumers.
 
-The protocol drafts retain broader routing and lifecycle requirements that need
-separate alignment with the model contract and restart-scoped Core ownership.
-Removing backend coupling does not implement those requirements or change the
-current package's direct/proxy decisions, rule ordering, or restart behavior.
+The protocol SPECs use the model's direct/proxy decisions and rule ordering,
+and the restart-scoped Core lifecycle described here. They do not require hot
+configuration replacement, REJECT/port/transport rules, or additional service
+configuration. Future scope changes must revise the owning contract first.
 
 `MODELS_SPEC.md` is the mandatory contract for model implementation and use;
 it is not evidence that today's code satisfies that contract. Existing gaps
@@ -397,16 +397,15 @@ own status and verification requirements.
 Current SOCKS4, SOCKS5, and HTTP CONNECT parsers reject bytes after a complete
 handshake message and before its success reply, including same-read remainder.
 SOCKS5 also rejects a greeting coalesced with the following request. The protocol
-SPECs' bounded early-data/remainder handling is a different, unimplemented
-profile. The current frontends have 64 KiB request guards; HTTP forward counts
-the whole buffered request including its body. NIOHTTP1 may impose smaller
-syntax limits. These guards do not implement the SPECs' global resource budgets,
-inbound handshake deadlines, or TCP idle timers.
+SPECs use this strict ordering. The current frontends have 64 KiB request guards;
+HTTP forward counts the whole buffered request including its body. NIOHTTP1 may
+impose smaller syntax limits. Wire's bounded input/output contract does not imply
+a new global budget service, inbound deadline API, or TCP idle timer.
 
 The current frontends use no local authentication; SOCKS4 USERID is not an
 identity check and SOCKS5 only negotiates no-auth. The application chooses
-listener exposure, including non-loopback addresses. Authentication and access
-policies described in a broader SPEC are not implicitly provided by the package.
+listener exposure, including non-loopback addresses. The protocol SPECs require
+neither inbound credentials nor a new application access-policy subsystem.
 
 Source and existing test vectors: [protocol probe and accepted-channel owner](../Sources/Connection/MagentTCPConnection.swift),
 [probe tests](../Tests/Connection/MagentTCPConnectionTests.swift), and the
@@ -423,8 +422,8 @@ not substitute USERID for a missing domain or forward it as node authentication.
 
 Current replies are local granted (`0x5A`) or rejected (`0x5B`), with zero bound
 address/port fields. They are not replies received from a Shadowsocks node.
-Detailed packet layouts, field limits, and the broader remainder-preserving
-parser target remain in the [SOCKS4 SPEC](SOCKS4_PROXY_SPEC.md).
+Detailed packet layouts, field limits, strict request ordering and EOF acceptance
+remain in the [SOCKS4 SPEC](SOCKS4_PROXY_SPEC.md).
 
 Implementation: [Socks4Connection](../Sources/Connection/Socks4Connection.swift).
 Existing vectors: [Socks4ConnectionTests](../Tests/Connection/Socks4ConnectionTests.swift).
@@ -482,13 +481,15 @@ have been satisfied:
   is retained. Do not infer the Wire later from a global node table or treat an
   unknown response source as direct. Sharing one endpoint between direct and
   proxy traffic cannot independently distinguish their return paths in this map;
-  the SPEC's per-flow channel isolation is not implemented.
+  ambiguous endpoint reuse must be rejected under the SPEC; it does not require
+  a new socket for every logical flow.
 - Direct IP needs no DNS. Direct domain uses the single server configured by
   `MagentConfig.dnsListener`; missing configuration fails the operation. A and AAAA
   queries must both complete successfully, then the first A is preferred over
   the first AAAA. The query timeout is `core.defaultTimeout`; there is no resolver
   fallback. Results are cached per association by target including port, without
-  DNS TTL refresh. This is different from the SPEC's system-resolver design.
+  DNS TTL refresh. The SPEC keeps the configured DNS-client boundary rather than
+  requiring a new system-resolver pool.
 - Invalid packets, nonzero FRAG, unknown remote endpoints, and route/DNS/Wire
   failures currently enter the control error path and close the association.
   Packet-drop and flow-local failure isolation in the SPEC remain unimplemented.
@@ -513,8 +514,9 @@ The current request profile accepts HTTP/1.0 and HTTP/1.1 authority-form with an
 explicit nonzero port and bracketed IPv6. HTTP/1.1 requires exactly one Host;
 HTTP/1.0 allows at most one; a supplied Host must agree with the target. All
 Content-Length fields, including zero, and Transfer-Encoding are rejected, as
-are bodies and trailers. These differ from the broader HTTP SPEC's version and
-CONNECT framing choices.
+are bodies and trailers. The model and HTTP SPEC additionally allow a single
+CL=0 and Host without an explicit port when it can borrow the CONNECT target's
+port; these model migrations still need implementation and tests.
 
 The frontend generates its own `200 Connection Established` after the shared
 TCP startup sequence; the CONNECT request itself is consumed locally and never
@@ -533,7 +535,8 @@ request through NIOHTTP1 before routing or dialing. The 64 KiB aggregate limit
 includes headers and body. It supports no body or a single Content-Length body;
 Transfer-Encoding, duplicate Content-Length/Host, Expect, Upgrade, trailers,
 pipelining, and subsequent keep-alive requests are rejected. It does not provide
-streaming upload or the response parser required by the full HTTP SPEC.
+streaming upload or a complete HTTP response parser. The HTTP SPEC retains this
+single-request scope and transparent response path.
 
 Current target extraction accepts `http://` absolute-form and Host-based
 origin-form, with port 80 as the default; `OPTIONS *` is forwarded to the Host
@@ -555,8 +558,9 @@ current frontend does not parse status, headers, framing, or response completion
 for connection reuse. It reads the next downstream batch after the client write
 completes. A complete request followed by client input EOF still allows the
 reverse response direction. Local request/setup/timeout failures use 400/502/504
-and close. Chunked transfer, response validation, ordered keep-alive, pipelining,
-and Upgrade in the broader HTTP SPEC remain future work.
+and close. Chunked requests, request pipelining, connection reuse and Upgrade
+are outside the specified scope. Transparent response relay does not claim
+response-framing validation or message rewriting.
 
 Implementation: [HttpForwardConnection](../Sources/Connection/HttpForwardConnection.swift).
 Existing vectors: [HttpForwardConnectionTests](../Tests/Connection/HttpForwardConnectionTests.swift).
