@@ -1,6 +1,6 @@
 # MagentCache 产品设计
 
-更新日期：2026-09-22。
+更新日期：2026-10-10。
 
 状态：目标设计，当前源码尚未完成迁移。
 约束来源：[W-TinyLFU Cache SPEC](../W-TinyLFU_CACHE_SPCE.md)；
@@ -14,6 +14,10 @@
 缓存负责容量、有效期、同步加载、失效和移除通知；调用方负责 key 的业务含义及规范化、
 值的计算和错误处理。W-TinyLFU 是内部策略，其算法与验收约束由 SPEC 定义。
 MagentCache 不属于应用侧 public API，也不拥有网络连接、规则配置或服务生命周期。
+
+[Core 当前接入设计](MagentCore-DESIGN.md#初始化与运行周期)仍使用现有缓存的非抛错查询与引用释放。
+本文的 `close` / `CacheClosed` 是待迁移的目标契约；实施时须同步 Core 的查询错误传播和缓存终止边界，
+不能直接替换现有接入，也不能据此认为 Core 已有独立关闭入口。
 
 ## Contract
 

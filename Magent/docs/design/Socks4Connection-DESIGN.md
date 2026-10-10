@@ -1,279 +1,225 @@
----
-desc: SOCKS4 和 SOCKS4a CONNECT 的组件边界、固定方法与连接生命周期
-updated_at: 2026-10-09
-baseline: target-design
----
+# Socks4Connection Product Design
 
-# Socks4Connection 产品设计
-
-状态：目标设计，不表示实现已完成。规范基线为
-[SOCKS4 SPEC v0.3.0（2026-10-09）](../SOCKS4_PROXY_SPEC.md) 与
-[Wire SPEC v0.3.1（2026-10-09）](../WIRES_SPEC.md)。
-范围遵循现有模型、严格请求/回复顺序和 `start` / `restart` / `close` 生命周期。
-
-相关边界：[架构](../ARCHITECTURE.md) ·
-[ProxyConnection](MagentTCPConnection-DESIGN.md#下游-connection-协议proxyconnection) ·
-[模型](../MODELS_SPEC.md) · [路由](MagentAccessControl_Design.md)。
+更新日期：2026-10-10。状态：**职责与成员设计提案；请求交接接口待确认，尚不能据此直接迁移源码**。
+行为基线：[SOCKS4 SPEC](../SOCKS4_PROXY_SPEC.md)、[Wire SPEC](../WIRES_SPEC.md)、
+[MODELS SPEC](../MODELS_SPEC.md)。
 
 ## Context
 
-`MagentTCPConnection` 识别 SOCKS4 后创建 `Socks4Connection`，并继续拥有 accepted Channel。
-本组件拥有一次 SOCKS4/4a CONNECT 的解析、本地回复、下游 Channel、可选独立 TCP Wire、
-双向余量与清理。每条会话只有一个逻辑目标，只作一次路由和 Wire 选择。
+上游前置步骤见 [MagentTCPConnection 的 Core Logic](MagentTCPConnection-DESIGN.md#core-logic)：
+主 handler 识别 SOCKS4 后只安装一个 `Socks4Connection`，进入 `.socks4`，通过
+[ProxyConnection 三个入口](MagentTCPConnection-DESIGN.md#下游-connection-协议proxyconnection)
+交付客户端输入、EOF 和关闭通知，并拥有 accepted Channel 的最终关闭。
+当前主设计只保证累计探测字节交付一次；选定协议不等于收到完整请求，也不等于允许业务转发。
 
-Core 拥有规则、节点选择和下游创建；Wire 拥有出站启动和编解码，不拥有 Channel 或本地回复。
-`Socks4Connection.closeConnection` 只关闭下游；accepted Channel 的最终关闭由主 handler 完成。
-本组件不执行客户端认证、IDENT、BIND、UDP、业务协议解析或 PROXY 到 DIRECT 回退。
+本篇保留“上游处理完整请求与本地回复，本类建立下游并转发”的目标职责。
+下面流程的交接前置条件是：主 handler 已收齐并验证 SOCKS4/4a 请求，拒绝不支持命令和完整请求后的额外字节，
+一次性交付已验证的 CONNECT 逻辑目标。之后由本类通过 Core 选路并建立下游、完成 Wire 启动，
+再由上游写成完整 SOCKS4 成功回复，最后进入双向转发及 EOF/关闭处理。
+SOCKS4/4a 的报文、严格请求/回复顺序及错误结果仍遵守 SPEC。
+
+**完整请求交接、建立结果与回复后激活的接口尚待确认。** 主 handler 设计已标明这一缺口；
+其现有三入口不能直接承载目标交接，[架构](../ARCHITECTURE.md)、协议 SPEC 与源码也尚未迁移解析和回复归属。
+本篇不把当前探测字节当成已解析请求，不另建第二份请求缓冲，也不据此宣称整条目标流程已经落地。
+
+四份文档对应五个业务 Connection 类：本类、`Socks5Connection`、其持有的 `Socks5UDPConnection`、
+`HttpConnectConnection`、`HttpForwardConnection`。每个类都使用同一运行周期的 Core；
+TCP 按连接选路一次，UDP 子对象按数据报目标选路。Core 负责规则和下游创建，Wire 负责远端协议状态。
 
 ## Contract
 
-### 受限类型与方法集合
+### 受限范围与执行边界
 
-受限类型为 `Sources/Connection/Socks4Connection.swift` 中的 `Socks4Connection`。
-允许的 extension 范围为无；主声明与 extension 都不得增加未列方法、回调、重载、默认参数、
-wrapper、protocol 或源文件来绕开本表。`Socks4Command` 沿用现有类型，不增加成员。
-除静态完整头校验器外均为实例方法；未标 `private` 的 `func` 是 `internal`，未标
-`throws` / `async` 即不具有该属性。所有调用由 accepted EventLoop 串行执行，
-`@unchecked Sendable` 不放宽这一约束。
+本类留在现有 `Socks4Connection.swift`，不引入基类、转发包装类或新的源文件。
+accepted Channel 只借用；本类拥有 `wireChannel` 和独占 TCP Wire。
+所有状态、路由衔接与回调在 accepted EventLoop 上串行执行；不创建独立 Task 或线程池。
 
-下列构造、引用入口、回调和内部阶段构成本组件的方法集合；声明及引用均为实现约束，
-不通过未列 helper 扩展责任。
+### 全部实例成员
 
-### 构造与入口
+下面是责任拆分后的 **5 个基础成员**。这是本轮成员提案，不是强制上限或上线完备性证明；
+正常 EOF 与在途写的协调尚需在接口定稿时验证，不能为维持数字而隐藏额外状态。
 
-```swift
-/// Owns one SOCKS4 session after the accepted Channel has been classified.
-internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @unchecked Sendable {
-  /// Declares the SwiftNIO inbound payload type for this handler.
-  typealias InboundIn = ByteBuffer
-}
-
-/// Creates the connection with its accepted Channel and immutable runtime Core.
-internal init(proxyChannel: Channel, core: MagentCore)
-```
-
-`MagentTCPConnection.installProxyConnection` 在 `ProxyProbe.socks4` 后调用构造，随后提交已有字节。
-构造只保存 accepted Channel 与本运行周期 Core；不读写网络、不路由、不创建 Wire。
-
-三个 `ProxyConnection` 声明、参数语义和默认 EOF 行为以
-[主 handler 设计的协议及调用映射](MagentTCPConnection-DESIGN.md#下游-connection-协议proxyconnection)
-为唯一来源。本组件的实现职责如下。
-
-| 引用入口 | 调用责任 |
+| 声明 | 用途与生命周期 |
 | --- | --- |
-| `upstream` | 请求未完成时调用 `paserLength`；完整后先确认输入恰好等于请求长度，再调用 `paserSocks4`、`installWireChannel`。同 read 余量、请求已接受但成功回复未完成时的额外字节立即 `fail`，不缓冲或转发。回复完成后才调用 `outbound`；不二次解析/路由。同步错误和写 future 失败交给 `fail`。 |
-| `proxyInputClosed` | 只在**请求头未完成**时以截断错误调用 `fail`。完整无余量请求后的 FIN 记录为方向结束，等待建立与成功回复后半关闭下游输出，保留反向读取；转发阶段先排空已有上行业务。 |
-| `closeConnection` | 进入终态，幂等关闭下游并释放 Wire 及用户态余量；不写回复，不关闭 accepted Channel。 |
+| `private let proxyChannel: Channel` | 借用 accepted Channel，写回业务并向其 owner 报告错误；不在清理中关闭它。 |
+| `private let core: MagentCore` | 构造时注入当前 runtime 的实例；选路及创建下游都经它完成，不切换或关闭 Core。 |
+| `private var wireChannel: Channel?` | 初始 nil；保存唯一 TCP 下游；关闭时释放。关闭后迟到建连结果直接关闭。 |
+| `private var wire: Wire?` | 初始 nil；PROXY 保存一次选出的独占 Wire；DIRECT 保持 nil。端点、超时与编码始终来自同一实例。 |
+| `private var state: State = .handshaking` | 建立与等待本地成功回复合属 `.handshaking`，另区分转发和终止；终态不可恢复。不携带缓冲、Future 或资源包。 |
 
-### 下游 Channel 回调
+不新增 struct、tuple、字典或闭包容器来合并无关成员。也不在适配器或 Channel 属性中藏一份会话状态。
 
-以下四项是本类型唯一允许实现的 SwiftNIO `ChannelInboundHandler` 回调；均由所属 EventLoop
-调用，不 `throws`、不 `async`。
+完整请求及分片缓冲归主 handler；目标、命令校验结果、拨号 Future、启动报文及单批写 Future
+只在相应方法和回调链内使用。回调捕获的字节仍占用内存，必须有界并在操作完成后释放。
+业务转发不另存完整数据流；Wire 自己保存远端帧解码所需的分片。
 
-```swift
-/// Consumes one downstream Channel payload after a successful downstream connection.
-func channelRead(context: ChannelHandlerContext, data: NIOAny)
+### State 定义与转换
 
-/// Handles a downstream input-close event without closing the still-writable opposite direction.
-func userInboundEventTriggered(context: ChannelHandlerContext, event: Any)
-
-/// Completes downstream cleanup after the downstream Channel becomes inactive.
-func channelInactive(context: ChannelHandlerContext)
-
-/// Routes a downstream pipeline error to the accepted-Channel owning error boundary.
-func errorCaught(context: ChannelHandlerContext, error: Error)
-```
-
-| 回调 | 调用责任 |
-| --- | --- |
-| `channelRead` | 将下游字节交给 `inbound`。Wire 初始化前仅有界保留原始输入或不读；初始化后可解码，业务交付仍受成功回复屏障约束。同步错误和写 future 失败调用 `fail`。 |
-| `userInboundEventTriggered` | `.inputClosed` 记录下游 EOF；处理先前输入后，PROXY 调用 `finishInbound`，截断错误交给 `fail`。正常 EOF 必须等启动写、完整本地成功回复及反向写队列排空后再传播，零业务流也如此。其他事件向 pipeline 传递。 |
-| `channelInactive` | 正常全关闭且尚未检查 EOF 时补做同一流程；不能越过回复或业务排空。已知错误和取消不以截断覆盖。最终关闭交给 accepted owner。 |
-| `errorCaught` | 将原始错误交给 `fail`，由它完成条件性失败回复后向 accepted pipeline 上报。 |
-
-### 内部产品阶段
-
-以下阶段不可供其他类型调用，也不再用未列 helper 分拆。同步错误原样抛到 `upstream` / `channelRead`
-等调用边界后进入 `fail`；所属 future 的失败回调直接进入 `fail`。
+沿用既有状态名与无关联值枚举，恢复明确初值。`handshaking` 在完整请求交接方案中表示
+下游建立及本地成功回复尚未完成，不再表示本类累计协议分片。
 
 ```swift
-/// Advances this connection's incremental SOCKS4 header scan without counting trailing business bytes.
-private func paserLength(_ input: ByteBuffer) throws -> Int?
-
-/// Validates exactly one complete request and returns its command and logical target.
-private static func paserSocks4(_ input: ByteBuffer)
-  throws -> (command: Socks4Command, address: NetworkAddress)
-
-/// Routes the validated target and begins the selected DIRECT or PROXY downstream connection.
-private func installWireChannel(command: Socks4Command, address: NetworkAddress) throws
-
-/// Writes the local success reply before enabling tunnel reads and draining early downstream data.
-private func startTunnel(_ channel: Channel) -> EventLoopFuture<Void>
-
-/// Preserves the first protocol failure, optionally writes one failure reply, and then reports the original error.
-private func fail(_ error: Error)
-
-/// Encodes or transparently forwards one client tunnel payload to the downstream Channel.
-private func outbound(_ data: ByteBuffer) throws
-
-/// Decodes or transparently forwards one downstream payload to the accepted Channel.
-private func inbound(_ data: ByteBuffer) throws
-
-/// Writes optional startup or already encoded downstream business bytes in source order.
-private func requestWireChannel(_ data: Data) -> EventLoopFuture<Void>
-
-/// Writes a SOCKS4 reply or decoded business bytes to the accepted Channel in source order.
-private func respondProxyChannel(_ data: Data) -> EventLoopFuture<Void>
-
-/// Starts at most one SOCKS4 reply write and returns nil after any prior reply has started.
-private func respondProxyChannelOnce(_ data: Data) -> EventLoopFuture<Void>?
-```
-
-| 方法 | 调用者与后继 |
-| --- | --- |
-| `paserLength` | `upstream` 的请求阶段调用。增量确定实际头部长度，`nil` 表示等待分片；业务尾部不计入头长。完整后调用静态校验器。 |
-| `paserSocks4` | `upstream` 仅在完整请求且无额外字节时调用一次，校验命令与目标；不 DNS、路由或写网络。随后保存请求并调用 `installWireChannel`。 |
-| `installWireChannel` | `upstream` 对有效 CONNECT 调用一次 Core 路由。DIRECT 建连后进入 `startTunnel`；PROXY 建连后调用一次 `Wire.start`，`nil` 直接进入，非空结果经 `requestWireChannel` 写成后进入。同步错误原样抛回，异步失败交 `fail`；终态的迟到成功 Channel 立即关闭。 |
-| `startTunnel` | 只由建立流程调用，参数必须是活跃的非可选 Channel。通过 `respondProxyChannelOnce` 写唯一 `0x5A`；future 只在完整八字节写成后成功，随后排空已接收的下游业务并独立启用两个方向的读取。失败调用 `fail`，不能追加 `0x5B`。 |
-| `fail` | 统一接收入口、NIO 和 future 的失败。保留首次原始终因并进入终态；未开始任何回复且 accepted 仍可写时，通过 `respondProxyChannelOnce` 尽力写 `0x5B`，其写完成后上报原始错误。无回复可写则直接上报；回复写错不能覆盖首因，accepted 关闭仍可触发幂等清理。 |
-| `outbound` | 只由 `upstream` 的转发阶段调用。DIRECT 透明传递；PROXY 等启动写和本地回复完成后，以 `address: nil` 编码，再经 `requestWireChannel` 有序写出。同步错误原样抛回，写失败交 `fail`。 |
-| `inbound` | `channelRead` 和启动后的原始余量排空调用。DIRECT 透明传递；PROXY 初始化后解码，空 `data` 不是 EOF。非空业务在屏障前有界保存，屏障后按序交给 `respondProxyChannel`；已解码余量不再次解码。错误按调用边界进入 `fail`。 |
-| `requestWireChannel` | `installWireChannel` / `outbound` 写启动或已编码业务时调用，返回可排序 future；下游缺失返回 `connectionClosed` 失败 future，由调用者交 `fail`。 |
-| `respondProxyChannel` | `startTunnel`、`inbound`、`respondProxyChannelOnce` 写本地回复或已解码业务时调用，返回写完成 future；不占用回复权。正常写失败交 `fail`，失败回复自身的写错保留原始终因。 |
-| `respondProxyChannelOnce` | `startTunnel` / `fail` 原子取得同一个回复写权，调用 `respondProxyChannel`。回复已开始则返回 `nil`，不能重新写回复。 |
-
-### 协作者与数据契约
-
-Wire 的精确声明、`InboundData` 及语义引用
-[Wire v0.3.1 抽象接口](../WIRES_SPEC.md#抽象接口草图)、[启动](../WIRES_SPEC.md#启动与状态转换)、
-[EOF](../WIRES_SPEC.md#eof-与半关闭) 和[缓冲](../WIRES_SPEC.md#缓冲和进度)。
-同一 TCP Wire 由本连接独占且串行调用；初始化前不编解码，编码还须等待启动写与本地成功屏障。
-正常 EOF 先解码全部已读输入再检查一次；EOF 早于初始化时保留事实，初始化后续接检查。
-
-Core 当前消费声明如下；不在此新增服务级 API。
-
-```swift
-/// Routes one logical TCP target and returns nil only for the selected DIRECT route.
-internal func routeTCPWire(_ address: NetworkAddress) throws -> Wire?
-
-/// Provides the runtime DIRECT TCP connection timeout in milliseconds.
-internal let defaultTimeout: Int64
-
-/// Opens a direct logical-target TCP Channel with manual-read and half-close behavior.
-internal func createTCPClientChannel(
-  group: EventLoopGroup, address: NetworkAddress, timeout: Int64,
-  handler: ChannelHandler & Sendable
-) -> EventLoopFuture<Channel>
-
-/// Opens a proxy-node TCP Channel at an already resolved actual endpoint.
-internal func createTCPClientChannel(
-  group: EventLoopGroup, address: SocketAddress, timeout: Int64,
-  handler: ChannelHandler & Sendable
-) -> EventLoopFuture<Channel>
-```
-
-`installWireChannel` 对同一逻辑目标调用一次 `routeTCPWire`：`nil` 为 DIRECT，非 nil 为独立 TCP
-Wire；节点缺失或能力不符直接失败。DIRECT 通过逻辑目标重载建立下游；PROXY 仅用 Wire 的实际节点
-端点与毫秒超时调用数值重载，不把节点重新路由，也不以节点覆盖业务目标。
-DIRECT 域名解析由 Core 的 TCP 工厂负责，入口不新增 Resolver、候选竞速或安全配置。
-调用方只使用完成后的下游；解析、节点端点与超时遵循
-[地址与出站契约](../SOCKS4_PROXY_SPEC.md#doc-05-dns-and-addresses)。
-
-SOCKS4/4a 输入、USERID、域名及数值地址限制引用
-[入口报文](../SOCKS4_PROXY_SPEC.md#doc-02-inbound-wire-protocol) 和
-[目标规范化](../SOCKS4_PROXY_SPEC.md#doc-03-incremental-parser)。目标保留根点，Core 的路由匹配视图
-可以去点，Wire 收到原逻辑目标。回复为固定八字节成功 `00 5A 00 00 00 00 00 00`
-或失败 `00 5B 00 00 00 00 00 00`；未知版本不写 SOCKS4 回复。
-
-请求缓冲沿用 64 KiB 上限；隧道以有限队列和每方向有序写入实施背压。
-按 [Wire 容量契约](../WIRES_SPEC.md#缓冲和进度)在调用前预留输入及最坏输出空间，
-输出预留不能被后续读取占用；不增加 getter、全局配额、服务计数器或新配置。
-关闭订阅沿用主 handler 的运行周期通知，本组件不新增时钟/停止 API、线程或 Task。
-
-### 状态与生命周期事实
-
-主状态只区分握手、业务转发和终结；解析、建连、启动与回复是方法流程，不另加阶段状态枚举。
-
-```swift
-/// 区分握手、业务转发和逻辑终结，不表示每个异步操作的进度。
 private enum State {
     case handshaking
     case forwarding
     case closed
 }
 
-/// 构造后等待 SOCKS4 请求，尚未允许业务转发。
 private var state: State = .handshaking
 ```
 
-| 状态 | 输入与退出条件 |
-| --- | --- |
-| `.handshaking` | 接受一次严格请求、建立下游；客户端额外字节失败，早到下游业务有界保留。`startTunnel` 的完整成功回复写成后进入 `.forwarding`，失败或取消进入 `.closed`。 |
-| `.forwarding` | 两方向独立有序转发；单侧 EOF 只结束相应方向，两侧结束或错误/取消进入 `.closed`。 |
-| `.closed` | 不再解析、建连、调用 Wire 或恢复业务；只完成已经安排的失败回复及幂等清理。 |
+| 当前状态 | 允许的输入与操作 | 转换条件及推进者 |
+| --- | --- | --- |
+| `.handshaking` | 完整目标只接收一次；建立链可拨号并写 Wire 启动数据；不转发客户端或下游业务。 | 主 handler 的完整成功回复写成通知将状态置为 `.forwarding`；建连成功本身不切状态。 |
+| `.forwarding` | `upstream` / `channelRead` 转发业务；对应 EOF 入口处理方向结束，另一方向仍可继续。 | 正常双向结束协调完成，或 `fail` / `closeConnection` 终止时进入 `.closed`。 |
+| `.closed` | 禁止业务、重复响应及续读；只允许关闭并释放未清理资源、回收迟到 Channel。 | 终态，无回退；重复清理仍检查并释放实际资源。 |
 
-连接还须保存请求是否接受、回复是否提交、两侧 EOF/输出结束、正常下游 EOF 是否检查，以及首因、
-是否上报和是否清理。它们是现有流程的事实，不再新增回复或方向状态枚举。
-`fail` 先置终态再完成已有回复收尾；因此 `closeConnection` 不能仅因状态已关闭就跳过尚未完成的资源清理。
+构造设置初态，`fail` 和 `closeConnection` 可从任何非终态进入 `.closed`。
+启动与成功回复是一条有序流程；成功回复后启读的跨组件入口仍须确认，不能由普通下游回调擅自激活。
+上述枚举定义协议阶段；双向 EOF 和在途写排空的协调要求继续保留，不能据此把单方向 FIN 直接视为整连接关闭。
+
+### 方法契约与待确认交接
+
+保留 [ProxyConnection 的三个共享声明](MagentTCPConnection-DESIGN.md#下游-connection-协议proxyconnection)。
+其在本提案中的调用责任如下；启动交接尚未定义，不能把目标伪装成 `NIOAny` 或重放握手字节填补接口。
+
+| 入口 | 调用者及责任 |
+| --- | --- |
+| `upstream(context:data:)` | 主 handler 只在允许转发后交业务字节；本类按 DIRECT / Wire 编码写向下游。 |
+| `proxyInputClosed(context:)` | 主 handler 交付客户端 EOF；按正常半关闭顺序处理已接收数据。 |
+| `closeConnection(error:)` | accepted owner 调用；先置终态，再幂等关闭自有下游，不回复、不重入错误路径。 |
+
+下游回调仍使用 SwiftNIO `ChannelInboundHandler` 的既有声明：
+
+```swift
+internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+}
+
+func channelRead(context: ChannelHandlerContext, data: NIOAny)
+func userInboundEventTriggered(context: ChannelHandlerContext, event: Any)
+func channelInactive(context: ChannelHandlerContext)
+func errorCaught(context: ChannelHandlerContext, error: Error)
+```
+
+| 回调 | 本类责任 |
+| --- | --- |
+| `channelRead` | DIRECT 直接写回；PROXY 解码后写回。解码未产生业务字节时继续读取。 |
+| `userInboundEventTriggered` | 正常下游 EOF 检查 Wire 并进入方向结束流程；其他事件继续传播。 |
+| `channelInactive` | 已在清理中只传播事件；正常失效若尚未处理输入结束，汇入同一 EOF/Wire 检查及排空流程；异常失效报告 owner，不能递归关闭或用完整性检查覆盖原始错误。 |
+| `errorCaught` | 将原始错误交统一拥有者；不包装或改写首因。 |
+
+以下是需要确认的接口责任，**不在本轮自拟 Swift 方法签名**：
+
+| 交接 | 调用方 → 拥有者 | 完成条件 / 原因 |
+| --- | --- | --- |
+| 完整目标与建立结果 | 主 handler → 本类 → 主 handler | 已验证目标进入建立流程；下游连接及 Wire 启动写入完成，才允许主 handler 回复成功。 |
+| 开始转发 | 主 handler → 本类 | 完整本地成功回复写成，才允许两侧业务读取；零业务时也必须发生。 |
+| 正常方向结束 / 最终结束 | 主 handler ↔ 本类 | 明确 EOF、最后一次写入和最终 accepted 关闭的先后关系。 |
+
+原 `paserLength` / `paserSocks4` 的解析责任和 `respondProxyChannelOnce` 的本地回复责任移出本类。
+已有声明完整保留在下节；本轮只标明迁移归属，跨组件衔接须先确认，再实施，不能直接删除源码方法。
+
+### 构造与私有方法定义
+
+以下列出完整的构造及私有方法签名，并逐项注明职责。私有方法同样属于 Contract，
+不能在精简成员时一并省略、合并或擅自改签名。涉及职责迁移的方法仍保留原声明和去向，
+其新归属及调用接口确认前不删除；新增跨组件入口单独确认。
+除注明的迁移项外，不通过 extension、helper、wrapper、重载或新文件扩充方法集合；
+同步错误原样抛至拥有入口，Future 失败交统一错误边界，不在细节方法包装错误。
+
+```swift
+/// 主 handler 注入 accepted 与当前 Core；初始化状态，不读写网络。
+internal init(proxyChannel: Channel, core: MagentCore)
+
+/// 确定 SOCKS4/4a 请求长度，不足返回 nil；解析责任拟随完整请求处理迁移。
+private func paserLength(_ input: ByteBuffer) throws -> Int?
+
+/// 校验一个完整请求并返回命令与逻辑目标；无 DNS、路由或网络副作用，归属随解析迁移。
+private static func paserSocks4(_ input: ByteBuffer)
+  throws -> (command: Socks4Command, address: NetworkAddress)
+
+/// 对已验证目标路由一次并开始建连；PROXY 使用同一 Wire 的端点、超时和启动状态。
+private func installWireChannel(command: Socks4Command, address: NetworkAddress) throws
+
+/// 原成功回复及启读阶段；保留原声明，回复与激活拆分后的调用衔接需确认。
+private func startTunnel(_ channel: Channel) -> EventLoopFuture<Void>
+
+/// 统一处理首次原始错误并封闭状态；本地错误回复由主 handler 选择，清理不覆盖首因。
+private func fail(_ error: Error)
+
+/// 转发态 upstream 调用；DIRECT 透传，PROXY 以 address:nil 编码后写向下游。
+private func outbound(_ data: ByteBuffer) throws
+
+/// 下游 channelRead 调用；DIRECT 透传或 Wire 解码一次，空解码结果不作为 EOF。
+private func inbound(_ data: ByteBuffer) throws
+
+/// 有序写入启动数据或已编码上行业务；返回实际网络写完成的 Future。
+private func requestWireChannel(_ data: Data) -> EventLoopFuture<Void>
+
+/// 按序写回已解码业务字节；返回实际网络写完成的 Future，不自行占用本地回复资格。
+private func respondProxyChannel(_ data: Data) -> EventLoopFuture<Void>
+
+/// 原一次本地回复入口；已提交回复时返回 nil，该回复资格随主 handler 迁移。
+private func respondProxyChannelOnce(_ data: Data) -> EventLoopFuture<Void>?
+```
+
+| 方法 | 归属与调用责任 |
+| --- | --- |
+| `init` | 保留构造声明；主 handler 注入 accepted 与 Core，初始化 `.handshaking`，不在构造中读写网络。 |
+| `paserLength` / `paserSocks4` | 解析责任随完整请求处理迁移；原入口是 `upstream`。长度扫描、完整校验和目标规范化要求继续保留。 |
+| `installWireChannel` | 保留本类选路/建连责任与原声明；对一个目标路由一次，迟到 Channel 只释放；由新交接如何进入该私有阶段需确认。 |
+| `startTunnel` | 原阶段同时写本地成功回复并启读；拆分后的回复归主 handler、激活归本类。保留原声明，精确衔接待确认。 |
+| `outbound` / `inbound` | 保留；分别由转发态 `upstream` / `channelRead` 调用。DIRECT 透传；TCP PROXY 后续编码的 address 为 nil，解码一次，空结果不是 EOF。 |
+| `requestWireChannel` / `respondProxyChannel` | 保留字节写入；启动/上行和下行分别调用，Future 表示实际网络写成。下游缺失失败，不吞掉写错或自行结束 accepted。 |
+| `respondProxyChannelOnce` | 一次本地回复责任随主 handler 迁移；原 `startTunnel` / `fail` 共用回复资格，提交后即占用，不能因写失败追加另一回复。 |
+| `fail` | 保留声明及统一错误出口；本地失败回复由主 handler 选择，原始首因由操作链保留，清理错误不覆盖首因。 |
+
+### 协作者与容量契约
+
+Core 的精确接口引用 [Core Contract](MagentCore-DESIGN.md#contract)，Wire 方法与结果类型引用
+[Wire 抽象接口](../WIRES_SPEC.md#抽象接口草图)。TCP 路由一次，DIRECT 返回 nil Wire，PROXY 使用独占 TCP Wire；
+代理端点与超时来自同一 Wire。规则失败或节点缺失不回退 DIRECT，Connection 不再自行匹配规则。
+全部下游复用 accepted EventLoop；`@unchecked Sendable` 不允许跨 EventLoop 并发访问。
+
+调用 Wire 前按 [容量契约](../WIRES_SPEC.md#缓冲和进度)预留输入和最坏输出空间；
+当前输入、Wire 内部分片、编码输出和在途写都计入有界内存，方法局部捕获也不能例外。
+启动流程遵守 [TCP 启动约束](../WIRES_SPEC.md#启动与状态转换)，正常下游 EOF 遵守
+[完整性与半关闭](../WIRES_SPEC.md#eof-与半关闭)。不通过新增全局配额、公共配置或无归属任务实现这些要求。
 
 ## Core Logic
 
-### 请求到成功回复
+1. 承接 Context 的完整请求交接前置步骤，本类在 `.handshaking` 接收一次已验证的 CONNECT 逻辑目标；
+   不重复上游协议探测或请求解析，保持业务读取暂停。
+2. 本类调用 Core 选路一次。DIRECT 由 Core 连接目标；PROXY 用同一 Wire 的端点和超时建连，
+   调用一次 `start(handshake:)` 并写完启动数据。逻辑目标和节点端点不能混用。
+3. 建立成功交回主 handler，由其写完整 SOCKS4 成功回复。此时下游保持暂停读取，避免产生第二份早到业务缓冲。
+   回复写成后才开启转发；回复失败由 accepted owner 结束连接。
+4. 每个方向按“读取一批 → 编码或解码 → 写入完成 → 续读来源”推进；Future 属于当前操作链，
+   不为每次写入增加 `toWireWrite` / `toProxyWrite` 成员。单批多次回调必须有序收敛，不能各自无条件续读。
+5. 正常 EOF 先处理已读字节，PROXY 的正常下游 EOF 调用一次 `finishInbound()`；
+   该方向写入完成后才半关闭对端输出，另一方向仍可继续。只有正常完成条件满足后，才通知 accepted owner 最终结束。
+6. 错误、外部关闭及 restart 可中断转发；清理先封闭状态，迟到回调只释放资源。旧连接一直使用旧 Core。
 
-```text
-init → upstream → paserLength → paserSocks4 → installWireChannel
-  → Core.routeTCPWire
-  → DIRECT: 目标 Channel 建立
-  → PROXY: 节点 Channel 建立 → Wire.start → requestWireChannel? 写成
-  → startTunnel → respondProxyChannelOnce → 完整成功回复写成
-  → .forwarding：排空早到下游业务，启用两方向各自的读取
-```
-
-`upstream` 在路由前拒绝完整请求后的同批余量。建立或回复期间若收到额外客户端字节也立即失败，
-不保存 `clientRemainder`。下游初始化后可解码早到业务，但必须等完整成功回复后按序交付；
-后到下游业务不得越过已有余量。
-
-### 转发与方向结束
-
-`upstream → outbound → requestWireChannel` 负责上行，
-`channelRead → inbound → respondProxyChannel` 负责下行；每方向前一批写成后按额度续读，互不等待。
-空解码结果继续受读许可控制，不是 EOF。
-
-客户端 FIN：请求头不完整则 `fail`；完整无余量请求则等待建立与成功回复，再半关闭下游输出。
-转发阶段先排空已收到的客户端业务。
-下游正常 FIN：处理已读输入，PROXY 调用 `finishInbound`；等待启动写、完整成功回复、反向余量与
-客户端写队列排空，再关闭客户端输出。零业务流也执行该屏障，另一方向继续。
-全关闭但没有 `.inputClosed` 时补做同一 EOF 检查；已有网络错误或取消保留原错误。
-
-### 失败、清理与运行周期
-
-所有错误进入 `fail`，由它条件性写一次 `0x5B` 后向 accepted pipeline 上报原始终因。
-主 handler 最终关闭 accepted 并调用 `closeConnection`；正常双方结束也由 accepted owner 完成最终关闭。
-终态后迟到建连只关闭所得 Channel，迟到业务及写回调不能恢复读写或重复归还资源。
-
-Core、缓存和 Wire 固定属于接入时的运行周期。`restart` 先完成新配置验证和新 Core 构造，
-再关闭旧运行周期及旧会话；`close` 终结服务实例。活动连接不切换配置、不跨 restart 保活，
-也不增加热更新、快照或优雅排空接口。
-
-路由完全交给 Core：遵循 MODELS 的 `order`、具体性和稳定位置，只消费 `.direct` / `.proxy(UUID)`；
-无端口/transport 规则或 `REJECT` 动作。失败不回退 DIRECT，不在本组件新增路由层。
+“需要观察写入结果”是转发桥的背压和关闭责任，并不推出“必须保存两个写 Future 成员”。
+不过，单靠 `.forwarding/.closed` 也不能证明 EOF 排空：当前 NIO 在输入已关闭时可能把输出关闭升级成完整关闭。
+**具体协调方式仍待接口确认；不能把 `close(.output)` 当成任何情形都安全的排空操作。**
 
 ## Corners
 
-| 场景 | 必须保持的可观察行为 |
+| 场景 | 必须保持的结果 |
 | --- | --- |
-| 任意分片、边界 NUL | 按 SPEC 保留请求边界；未完整不产生 DNS/下游，已完整不二次解析或路由。 |
-| 完整头同批附带业务、成功前后续字节 | 立即失败，不保存/转发客户端余量；同批余量在路由前拒绝。 |
-| 完整无余量请求紧跟 FIN | 不报握手截断；先完成建立与成功回复，再结束下游输出。 |
-| 根点或严格数值地址 | Wire 保留合法域名根点；数字地址不删除根点后重试，不隐式 DNS。 |
-| 无启动字节、服务器先发 | 无启动字节不等首包；早到业务及正常 EOF 都不能越过成功回复屏障。 |
-| 空解码结果、零业务 EOF、协议截断 | 分别继续读、屏障后传播 EOF、以 Wire 原始错误失败；不混为一类。 |
-| 成功回复部分写入后失败 | 不再写失败包；首因与资源归属保持不变。 |
-| 额度不足或一方向慢写 | 调用前预留输入/最坏输出，暂停对应方向；不阻塞另一方向或无界排队。 |
-| 错误、取消与迟到完成竞争 | 首因一次、回复至多一次、资源归还一次；终态不恢复。 |
-| PROXY 失败或安全边界拒绝 | 不改 DIRECT、不重放、不旁路 DNS；日志不记录 USERID、载荷或节点凭据。 |
-| 不支持的能力 | BIND、IDENT、UDP、IPv6 字面量、第二次 CONNECT、客户端认证、业务解析、多轮 Wire 协商均不进入隐含路径。 |
+| 请求分片、非法请求、握手余量 | 由主 handler 在交接前处理；本类不再建第二份请求缓冲。 |
+| 完整请求后立即客户端 FIN | 建立和本地成功回复仍按顺序完成，再传播 EOF；不能漏回复。 |
+| 启动写失败或回复失败 | 保留原始错误；不进入转发，不重复回复。 |
+| 正常下游 EOF、零业务或截断帧 | 零业务也等成功回复；完整性错误走错误边界，正常结束不提前丢在途写。 |
+| 建连未完成时关闭 / restart | 迟到 Channel 立即关闭；不回复、不续读、不使用新 Core。 |
 
-验收用例以 [SOCKS4 验收](../SOCKS4_PROXY_SPEC.md#doc-10-tests-and-acceptance) 与
-[Wire 验收](../WIRES_SPEC.md#验收) 为准。本组件覆盖 TCP 入口、启动、双向背压、EOF 与清理；
-DNS、模型路由和运行周期与其 owner 联合验证，不把静态文档检查视为实现通过。
+文档验收检查责任唯一、Core 路由一次、回复后启读、accepted 关闭所有权和错误首因。
+本轮只验证文档；完整请求交接、方法声明及 EOF 协调定稿前，不视为可上线设计或实现。
+
+### 实施验收引用
+
+恢复 [SOCKS4 报文与生命周期验收](../SOCKS4_PROXY_SPEC.md#doc-10-tests-and-acceptance) 及
+[Wire 验收](../WIRES_SPEC.md#验收)。完整请求交接后，任意分片、同批余量、根点与数值地址、固定八字节回复、
+成功回复部分写入、零业务 EOF、双向背压和 restart 迟到回调仍需分别验证，不能因改变 owner 而删除用例。

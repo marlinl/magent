@@ -343,8 +343,8 @@ SPEC compliance.
 
 The HTTP/SOCKS SPECs depend on the abstract interface in [WIRES_SPEC.md](WIRES_SPEC.md).
 They do not define concrete backend protocols, node deployment, or backend
-handshake formats. The Wire SPEC adds explicit startup results, readiness,
-inbound EOF validation, and buffer accounting; it renames the endpoint getter
+handshake formats. The Wire SPEC defines startup write ordering,
+inbound EOF validation, and bounded buffering; it renames the endpoint getter
 to getEndpoint. Channel shutdown and release of Wire references remain with
 Connection/Core. These target contracts still require coordinated migration of
 Wire and its consumers.

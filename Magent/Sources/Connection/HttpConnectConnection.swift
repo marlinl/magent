@@ -1,486 +1,647 @@
-import Atomics
+//
+//  HttpConnectConnection.swift
+//  Magent
+//
+//  Created by MarlinL on 2026/8/27.
+//
+
 import Foundation
 import NIOCore
 import NIOHTTP1
 
-/// NIOHTTP1 握手阶段的临时 handler；移除 decoder 后，accepted channel 恢复传递 `ByteBuffer`。
-private final class HTTPConnectHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler,
-  @unchecked Sendable
-{
+// MARK: - HTTP 编解码适配器
+
+/// 同一 EventLoop 上的 NIO 解码结果暂存；协议语义和失败处理仍由 Connection 决定。
+/// CONNECT 和 Forward 共用此适配器，每次请求各自创建实例，不共享可变状态。
+internal final class HTTPRequestPartsHandler: ChannelInboundHandler, @unchecked Sendable {
   typealias InboundIn = HTTPServerRequestPart
 
-  weak var connection: HttpConnectConnection?
-  var decoder: ByteToMessageHandler<HTTPRequestDecoder>?
-  var address: NetworkAddress?
-  var hasFailed = false
+  // Connection 在同步解码返回后读取这些结果，并负责消耗或清理 body。
+  var head: HTTPRequestHead?
+  var body: ByteBuffer?
+  var ended = false
+  var trailers: HTTPHeaders?
+  /// 保留首个解析失败，避免后续报文事件掩盖原始原因。
+  var failure: Error?
 
-  func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-    guard let connection, connection.state != .closed else {
-      return
-    }
-    guard connection.isReadingInitialRequest else {
-      errorCaught(
-        context: context,
-        error: MagentError.malformedRequest("HTTP CONNECT payload received before established")
-      )
-      return
-    }
-
-    do {
-      switch unwrapInboundIn(data) {
-      case .head(let request):
-        guard address == nil else {
-          throw MagentError.malformedRequest("HTTP CONNECT request head is duplicated")
-        }
-        guard request.headers["Content-Length"].isEmpty,
-          request.headers["Transfer-Encoding"].isEmpty
-        else {
-          throw MagentError.malformedRequest("HTTP CONNECT request body framing is not supported")
-        }
-        let request = HttpProtocol(
-          address: try HttpProtocol.parseAuthority(request.uri),
-          version: "HTTP/\(request.version.major).\(request.version.minor)",
-          headers: request.headers.map { ($0.name, $0.value) }
-        )
-        try request.checkConnect()
-        address = request.address
-
-      case .body:
-        throw MagentError.malformedRequest("HTTP CONNECT request body is not supported")
-
-      case .end(let trailers):
-        guard trailers?.isEmpty != false, let address else {
-          throw MagentError.malformedRequest("HTTP CONNECT request is incomplete")
-        }
-        let loopBoundContext = context.loopBound
-        connection.isReadingInitialRequest = false
-        // 等当前 decode 调用处理完同一输入缓冲区，再移除 decoder，才能可靠识别紧随 request 的字节。
-        context.eventLoop.submit {}.flatMap {
-          guard let decoder = self.decoder else {
-            return loopBoundContext.value.eventLoop.makeFailedFuture(MagentError.connectionClosed)
-          }
-          return loopBoundContext.value.pipeline.syncOperations.removeHandler(decoder)
-        }.flatMap {
-          loopBoundContext.value.pipeline.syncOperations.removeHandler(self)
-        }.flatMapThrowing {
-          guard !self.hasFailed else {
-            throw MagentError.connectionClosed
-          }
-          try connection.installWireChannel(address: address)
-        }.whenFailure { error in
-          self.errorCaught(context: loopBoundContext.value, error: error)
-        }
+  /// 只收集有序的单请求报文事件；错误暂存后由 Connection 的统一失败入口处理。
+  internal func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+    guard failure == nil else { return }
+    switch unwrapInboundIn(data) {
+    case .head(let head):
+      guard self.head == nil, !ended else {
+        failure = MagentError.malformedRequest("HTTP request head is duplicated")
+        return
       }
-    } catch {
-      errorCaught(context: context, error: error)
+      self.head = head
+    case .body(var bytes):
+      guard head != nil, !ended,
+        bytes.readableBytes <= 64 * 1024 - (body?.readableBytes ?? 0)
+      else {
+        failure = MagentError.malformedRequest("HTTP request body exceeds its boundary")
+        return
+      }
+      if body == nil { body = context.channel.allocator.buffer(capacity: bytes.readableBytes) }
+      body?.writeBuffer(&bytes)
+    case .end(let trailers):
+      guard head != nil, !ended else {
+        failure = MagentError.malformedRequest("HTTP request end is out of order")
+        return
+      }
+      ended = true
+      self.trailers = trailers
     }
   }
 
-  func errorCaught(context: ChannelHandlerContext, error: Error) {
-    guard let connection, connection.state != .closed, !hasFailed else {
+  /// NIO 解码错误不在适配器内关闭 Channel，由持有请求状态的 Connection 决定响应。
+  internal func errorCaught(context: ChannelHandlerContext, error: Error) {
+    if failure == nil { failure = error }
+  }
+}
+
+/// 捕获真实 NIO 编码结果；这里完成的 promise 只代表编码，不能代替网络写入完成。
+internal final class HTTPEncodedBytesHandler: ChannelOutboundHandler, @unchecked Sendable {
+  typealias OutboundIn = IOData
+
+  /// 每次编码调用的输出由 Connection 取走，再纳入真实网络写队列。
+  var bytes: ByteBuffer?
+  var failure: Error?
+
+  /// 有界收集编码字节并完成编码 promise；不透传到 socket，避免绕过 Connection 的写序。
+  internal func write(
+    context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?
+  ) {
+    if let failure {
+      promise?.fail(failure)
       return
     }
-    hasFailed = true
-    connection.isReadingInitialRequest = false
-
-    let response: Data
-    switch error {
-    case MagentError.malformedRequest, MagentError.invalidAddress,
-      is HTTPParserError, is ByteToMessageDecoderError:
-      response = HttpProtocol.badRequest
-    default:
-      response = HttpProtocol.badGateway
-    }
-    let responseFuture =
-      connection.respondProxyChannelOnce(response)
-      ?? connection.proxyChannel.eventLoop.makeSucceededFuture(())
-    responseFuture.whenComplete { _ in
-      connection.proxyChannel.pipeline.fireErrorCaught(error)
+    switch unwrapOutboundIn(data) {
+    case .byteBuffer(var output):
+      guard output.readableBytes <= 64 * 1024 - (bytes?.readableBytes ?? 0) else {
+        let error = MagentError.invalidOptions("HTTP encoded output exceeds buffer limit")
+        failure = error
+        promise?.fail(error)
+        return
+      }
+      if bytes == nil { bytes = context.channel.allocator.buffer(capacity: output.readableBytes) }
+      bytes?.writeBuffer(&output)
+      promise?.succeed(())
+    case .fileRegion:
+      let error = MagentError.invalidOptions("HTTP codec accepts ByteBuffer bodies only")
+      failure = error
+      promise?.fail(error)
     }
   }
 }
 
-/// HTTP CONNECT 代理连接。
-///
-/// 握手阶段等待完整 request，解析目标并创建 wire channel；握手成功后进入 tunnel，
-/// proxy channel 和 wire channel 的后续数据分别通过 `outbound`、`inbound` 双向转发。
-/// tunnel 两端均使用手动读取，每一批数据写入对端成功后才重新读取来源 Channel。
+// MARK: - CONNECT 连接
+
+/// 一个 CONNECT 请求及其固定目标隧道；所有状态均由 accepted EventLoop 串行持有。
+/// accepted 的最终清理由 MagentTCPConnection 负责，本类型只拥有下游和协议缓冲。
 internal final class HttpConnectConnection: ChannelInboundHandler, ProxyConnection,
   @unchecked Sendable
 {
   typealias InboundIn = ByteBuffer
 
-  fileprivate enum State {
-    case handshake
-    case tunnel
+  /// 200 完整写成是进入隧道的唯一条件；closed 是不可恢复的终态。
+  private enum State {
+    case handshaking
+    case forwarding
     case closed
   }
 
-  fileprivate let proxyChannel: Channel
+  // accepted Channel 由 MagentTCPConnection 持有；这里只借用它回复与观察客户端事件。
+  private let proxyChannel: Channel
   private let core: MagentCore
-  private var wireChannel: Channel?
-  fileprivate var state: State = .handshake
-  private var wire: Wire?
-  fileprivate var isReadingInitialRequest = true
-  private var isProxyInputClosed = false
-  private var initialRequestByteCount = 0
-  private var handshakeHandler: HTTPConnectHandshakeHandler?
-  private let hasRespondedHandshake = ManagedAtomic(false)
+  private var state: State = .handshaking
 
+  // 增量请求与临时 NIO 编解码上下文只在本连接使用，清理时一并释放。
+  private var requestBuffer: ByteBuffer
+  private var request: HttpProtocol?
+  private var requestVersion: HTTPVersion = .http1_1
+  private var headScanOffset = 0
+  private var requestContext: ChannelHandlerContext?
+  private var requestParts: HTTPRequestPartsHandler?
+  private var responseEncoder: HTTPResponseEncoder?
+  private var responseBytes: HTTPEncodedBytesHandler?
+  private var responseContext: ChannelHandlerContext?
+  /// 已编码响应和隧道字节从收集器之前写出，避免再次进入 HTTP 编码器。
+  private var rawWriteContext: ChannelHandlerContext?
+
+  // 一次路由决定 Wire 和下游；earlyRemote 在启动前存原始字节，在启动后存解码结果。
+  private var wire: Wire?
+  private var wireChannel: Channel?
+  private var wireStarted = false
+  private var earlyRemote: ByteBuffer
+  private var replyCommitted = false
+
+  // 输入 EOF、输出关闭中和输出关闭完成分别记录，保证在途写入先于半关闭完成。
+  private var proxyInputEnded = false
+  private var remoteInputEnded = false
+  private var remoteFullyClosed = false
+  private var wireInputFinished = false
+  private var proxyOutputClosing = false
+  private var remoteOutputClosing = false
+  private var proxyOutputEnded = false
+  private var remoteOutputEnded = false
+
+  // 首因与幂等清理独立于协议状态，防止错误响应及迟到回调重复收尾。
+  private var firstError: Error?
+  private var didCleanUp = false
+
+  // 两向 future 串联写序；计数覆盖尚未完成的写入，用于限制缓冲和恢复手动读取。
+  private var clientWrite: EventLoopFuture<Void>
+  private var remoteWrite: EventLoopFuture<Void>
+  private var clientWriteBytes = 0
+  private var remoteWriteBytes = 0
+  private static let bufferLimit = 64 * 1024
+
+  /// 仅建立 accepted EventLoop 上的连接状态；解析目标以后才创建下游 Channel。
   internal init(proxyChannel: Channel, core: MagentCore) {
     self.proxyChannel = proxyChannel
     self.core = core
+    requestBuffer = proxyChannel.allocator.buffer(capacity: 0)
+    earlyRemote = proxyChannel.allocator.buffer(capacity: 0)
+    clientWrite = proxyChannel.eventLoop.makeSucceededFuture(())
+    remoteWrite = proxyChannel.eventLoop.makeSucceededFuture(())
   }
 
-  /// 接收 proxy channel 的 HTTP CONNECT request 或 tunnel payload。
-  func upstream(context: ChannelHandlerContext, data: NIOAny) {
-    let input = unwrapInboundIn(data)
-    guard input.readableBytes > 0 else {
-      context.read()
-      return
-    }
+  // MARK: - 客户端输入与清理
 
-    switch state {
-    case .handshake:
-      do {
-        guard isReadingInitialRequest else {
-          throw MagentError.malformedRequest("HTTP CONNECT payload received before established")
+  /// 完整请求后到完整 200 之前不接受任何客户端业务；目标只从一次模型构造取得。
+  internal func upstream(context: ChannelHandlerContext, data: NIOAny) {
+    guard state != .closed, firstError == nil else { return }
+    var input = unwrapInboundIn(data)
+    guard input.readableBytes > 0 else { return }
+    do {
+      switch state {
+      case .handshaking:
+        guard request == nil else {
+          throw MagentError.malformedRequest("CONNECT data arrived before success")
         }
-        if handshakeHandler == nil {
-          let decoder = ByteToMessageHandler(
-            HTTPRequestDecoder(leftOverBytesStrategy: .fireError)
-          )
-          let handler = HTTPConnectHandshakeHandler()
-          handler.connection = self
-          handler.decoder = decoder
-          handshakeHandler = handler
-          try context.pipeline.syncOperations.addHandlers(decoder, handler)
+        guard input.readableBytes <= Self.bufferLimit - requestBuffer.readableBytes else {
+          throw MagentError.malformedRequest("CONNECT request exceeds 64 KiB")
         }
-
-        let (requestByteCount, overflow) = initialRequestByteCount.addingReportingOverflow(
-          input.readableBytes
-        )
-        guard !overflow, requestByteCount <= Self.maximumRequestSize else {
-          throw MagentError.malformedRequest("HTTP CONNECT request is too large")
-        }
-        initialRequestByteCount = requestByteCount
-        context.fireChannelRead(data)
-        if isReadingInitialRequest {
+        requestBuffer.writeBuffer(&input)
+        requestContext = context
+        guard let head = try parseRequestHead(&requestBuffer) else {
           context.read()
+          return
         }
-      } catch {
-        handshakeHandler?.errorCaught(context: context, error: error)
-      }
-    case .tunnel:
-      do {
-        try outbound(input)
-      } catch {
-        proxyChannel.pipeline.fireErrorCaught(error)
-      }
-    case .closed:
-      return
-    }
-  }
-
-  /// proxy 输入方向关闭后，只关闭 wire 的输出方向，保留 wire 返回数据的通路。
-  func proxyInputClosed(context: ChannelHandlerContext) {
-    guard !isProxyInputClosed else {
-      return
-    }
-    isProxyInputClosed = true
-
-    switch state {
-    case .handshake:
-      guard !isReadingInitialRequest else {
-        isReadingInitialRequest = false
-        proxyChannel.pipeline.fireErrorCaught(MagentError.connectionClosed)
-        return
-      }
-    case .tunnel:
-      guard let wireChannel else {
-        proxyChannel.pipeline.fireErrorCaught(MagentError.connectionClosed)
-        return
-      }
-      wireChannel.close(mode: .output).whenFailure { error in
-        self.proxyChannel.pipeline.fireErrorCaught(error)
-      }
-    case .closed:
-      return
-    }
-  }
-
-  /// 接收 wire channel 数据。
-  func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-    let input = unwrapInboundIn(data)
-    guard input.readableBytes > 0 else {
-      if state == .tunnel {
+        if head.version == .http1_0 || head.version == .http1_1 {
+          requestVersion = head.version
+        }
+        // TODO: Sources/Model/HttpProtocol.swift 迁移到 MODELS_SPEC 的不可变请求契约。
+        let model = try HttpProtocol(head: head)
+        guard case .connect(let target, _) = model.request,
+          requestBuffer.readableBytes == 0,
+          requestParts?.ended == true,
+          (requestParts?.body?.readableBytes ?? 0) == 0,
+          requestParts?.trailers?.isEmpty != false
+        else {
+          throw MagentError.malformedRequest("CONNECT request contains unexpected data")
+        }
+        request = model
+        // 等待下游和 200 时继续观察提前业务与 FIN；提前业务不能在回复后才被当作隧道载荷。
         context.read()
+        let acceptedContext = context.loopBound
+        let established = openTunnel(target: target).flatMap {
+          self.writeSuccess()
+        }
+        established.whenSuccess {
+          guard self.state == .forwarding, self.firstError == nil else { return }
+          if self.proxyInputEnded {
+            self.proxyInputClosed(context: acceptedContext.value)
+          } else {
+            self.proxyChannel.read()
+          }
+        }
+        established.whenFailure { self.fail($0) }
+      case .forwarding:
+        try relayClient(input)
+      case .closed:
+        break
       }
-      return
-    }
-
-    switch state {
-    case .handshake:
-      return
-    case .tunnel:
-      do {
-        try inbound(input)
-      } catch {
-        proxyChannel.pipeline.fireErrorCaught(error)
-      }
-    case .closed:
-      return
+    } catch {
+      fail(error)
     }
   }
 
-  /// wire 输入方向关闭后，只关闭 proxy 的输出方向，继续接收 proxy 发往 wire 的数据。
-  func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-    guard let channelEvent = event as? ChannelEvent, channelEvent == .inputClosed else {
+  /// 请求结束后的 FIN 等待启动和 200；已排队业务写成后才传播输出半关闭。
+  internal func proxyInputClosed(context: ChannelHandlerContext) {
+    guard state != .closed, firstError == nil else { return }
+    proxyInputEnded = true
+    guard request != nil else {
+      fail(MagentError.malformedRequest("CONNECT request is truncated"))
+      return
+    }
+    if remoteFullyClosed {
+      do { try finishRemoteInput() } catch { fail(error) }
+      return
+    }
+    guard state == .forwarding, !remoteOutputClosing else { return }
+    remoteOutputClosing = true
+    remoteWrite.flatMap {
+      guard self.state != .closed, let channel = self.wireChannel else {
+        return self.proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
+      }
+      return channel.close(mode: .output)
+    }.whenComplete { result in
+      guard self.state != .closed else { return }
+      switch result {
+      case .success:
+        self.remoteOutputEnded = true
+        if self.proxyOutputEnded { self.proxyChannel.close(promise: nil) }
+      case .failure(let error):
+        self.fail(error)
+      }
+    }
+  }
+
+  /// 只释放本连接拥有的下游；先置终态，迟到建连/写回调不得恢复状态。
+  internal func closeConnection(error: Error?) {
+    guard !didCleanUp else { return }
+    state = .closed
+    didCleanUp = true
+    if firstError == nil { firstError = error }
+    wireChannel?.close(promise: nil)
+    wireChannel = nil
+    wire = nil
+    request = nil
+    requestBuffer = proxyChannel.allocator.buffer(capacity: 0)
+    earlyRemote = proxyChannel.allocator.buffer(capacity: 0)
+    requestParts?.head = nil
+    requestParts?.body = nil
+    requestParts?.trailers = nil
+    requestParts?.failure = nil
+    requestParts = nil
+    responseBytes?.bytes = nil
+    responseBytes?.failure = nil
+    responseBytes = nil
+    responseEncoder = nil
+    requestContext = nil
+    responseContext = nil
+    rawWriteContext = nil
+  }
+
+  // MARK: - 下游 Channel 回调
+
+  /// 此 handler 安装在下游；accepted 的输入由 owner 经 upstream 传入。
+  internal func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+    guard state != .closed, firstError == nil else { return }
+    do { try relayRemote(unwrapInboundIn(data)) } catch { fail(error) }
+  }
+
+  /// 下游输入半关闭仍允许反向发送，先执行 Wire EOF 校验再排空客户端写入。
+  internal func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+    guard let event = event as? ChannelEvent, event == .inputClosed else {
       context.fireUserInboundEventTriggered(event)
       return
     }
+    guard state != .closed, firstError == nil else { return }
+    do { try finishRemoteInput() } catch { fail(error) }
+  }
 
-    switch state {
-    case .handshake:
-      proxyChannel.pipeline.fireErrorCaught(MagentError.connectionClosed)
-    case .tunnel:
-      proxyChannel.close(mode: .output).whenFailure { error in
-        self.proxyChannel.pipeline.fireErrorCaught(error)
+  /// 全关闭使在途输出不可继续；无在途写时仍需校验并排空已读入的反向字节。
+  internal func channelInactive(context: ChannelHandlerContext) {
+    defer { context.fireChannelInactive() }
+    guard state != .closed, firstError == nil else { return }
+    remoteFullyClosed = true
+    guard remoteWriteBytes == 0 else {
+      fail(MagentError.connectionClosed)
+      return
+    }
+    do { try finishRemoteInput() } catch { fail(error) }
+  }
+
+  /// 原始下游错误交统一失败入口，已关闭连接不再触发递归清理。
+  internal func errorCaught(context: ChannelHandlerContext, error: Error) {
+    guard state != .closed else { return }
+    fail(error)
+  }
+
+  // MARK: - 请求解析与隧道启动
+
+  /// 先定位有界原始头并严格验证 UTF-8；不能让 NIO 的 String 转换替换非法字节。
+  private func parseRequestHead(_ input: inout ByteBuffer) throws -> HTTPRequestHead? {
+    let bytes = input.readableBytesView
+    let start = max(0, headScanOffset - 3)
+    for offset in start..<max(start, bytes.count - 3) {
+      let index = bytes.index(bytes.startIndex, offsetBy: offset)
+      if bytes[index] == 13, bytes[bytes.index(index, offsetBy: 1)] == 10,
+        bytes[bytes.index(index, offsetBy: 2)] == 13,
+        bytes[bytes.index(index, offsetBy: 3)] == 10
+      {
+        guard String(bytes: bytes.prefix(offset + 4), encoding: .utf8) != nil else {
+          throw MagentError.malformedRequest("CONNECT head is not UTF-8")
+        }
+        guard let context = requestContext,
+          let headBytes = input.readSlice(length: offset + 4)
+        else { throw MagentError.connectionClosed }
+        let parts = HTTPRequestPartsHandler()
+        try context.pipeline.syncOperations.addHandlers(
+          ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .fireError)), parts)
+        requestParts = parts
+        context.fireChannelRead(NIOAny(headBytes))
+        if let failure = parts.failure { throw failure }
+        guard let head = parts.head else {
+          throw MagentError.malformedRequest("NIO did not produce a complete HTTP head")
+        }
+        return head
       }
-    case .closed:
-      break
     }
-    context.fireUserInboundEventTriggered(event)
+    headScanOffset = bytes.count
+    return nil
   }
 
-  /// wire channel 关闭时同步结束 proxy channel。
-  func channelInactive(context: ChannelHandlerContext) {
-    guard state != .closed else {
-      context.fireChannelInactive()
-      return
-    }
-    wireChannel = nil
-    proxyChannel.pipeline.fireErrorCaught(MagentError.connectionClosed)
-    context.fireChannelInactive()
-  }
-
-  /// wire channel 出错时通知上游 proxy pipeline，由 `MagentTCPConnection` 统一关闭两端。
-  func errorCaught(context: ChannelHandlerContext, error: Error) {
-    guard state != .closed else {
-      return
-    }
-    proxyChannel.pipeline.fireErrorCaught(error)
-  }
-
-  /// 仅供上游 `MagentTCPConnection` 释放下游 wire channel；本连接不得用它执行自我关闭。
-  func closeConnection(error: Error?) {
-    guard state != .closed else {
-      return
-    }
-    state = .closed
-    self.wireChannel?.close(promise: nil)
-    self.wireChannel = nil
-  }
-
-  fileprivate func installWireChannel(address: NetworkAddress) throws {
-    guard !address.host.isEmpty, (1...65535).contains(address.port) else {
-      throw MagentError.invalidAddress("invalid HTTP CONNECT destination")
-    }
-
-    if let wire = try core.routeTCPWire(address) {
-      self.wire = wire
-      core.createTCPClientChannel(
-        group: proxyChannel.eventLoop,
-        address: wire.getTargetAddress(),
-        timeout: wire.getTimeout(),
-        handler: self
-      ).flatMap { channel -> EventLoopFuture<Channel?> in
-        guard self.state != .closed,
-          self.proxyChannel.isActive
-        else {
-          channel.close(promise: nil)
-          return channel.eventLoop.makeSucceededFuture(nil)
-        }
-        self.wireChannel = channel
-        do {
-          guard let wire = self.wire else {
-            throw MagentError.connectionClosed
-          }
-          guard let data = try wire.start(handshake: address), !data.isEmpty else {
-            return channel.eventLoop.makeSucceededFuture(Optional(channel))
-          }
-          return self.requestWireChannel(data).map { Optional(channel) }
-        } catch {
-          return channel.eventLoop.makeFailedFuture(error)
-        }
-      }.flatMapError { error -> EventLoopFuture<Channel?> in
-        let response: Data
-        switch error {
-        case MagentError.channelConnectionTimedOut:
-          response = HttpProtocol.gatewayTimeout
-        default:
-          response = HttpProtocol.badGateway
-        }
-        let responseFuture =
-          self.respondProxyChannelOnce(response)
-          ?? self.proxyChannel.eventLoop.makeSucceededFuture(())
-        responseFuture.whenComplete { _ in
-          self.proxyChannel.pipeline.fireErrorCaught(error)
-        }
-        return self.proxyChannel.eventLoop.makeSucceededFuture(nil)
-      }.flatMap { channel in
-        self.startTunnel(channel)
-      }.whenFailure { error in
-        self.proxyChannel.pipeline.fireErrorCaught(error)
+  /// 一次路由固定 Wire 和拨号端点；迟到 Channel 只关闭自身，不继续启动。
+  private func openTunnel(target: NetworkAddress) -> EventLoopFuture<Void> {
+    let loop = proxyChannel.eventLoop
+    return loop.makeCompletedFuture {
+      self.wire = try self.core.routeTCPWire(target)
+    }.flatMap {
+      if let wire = self.wire {
+        return self.core.createTCPClientChannel(
+          eventLoop: loop, address: wire.getEndpoint(), timeout: wire.getTimeout(), handler: self)
       }
-      return
-    }
-
-    core.createTCPClientChannel(
-      group: proxyChannel.eventLoop,
-      address: address,
-      timeout: core.defaultTimeout,
-      handler: self
-    ).flatMap { channel -> EventLoopFuture<Channel?> in
-      guard self.state != .closed,
-        self.proxyChannel.isActive
-      else {
+      return self.core.createTCPClientChannel(
+        eventLoop: loop, address: target, timeout: self.core.defaultTimeout, handler: self)
+    }.flatMap { channel in
+      guard self.state != .closed, self.firstError == nil, self.proxyChannel.isActive else {
         channel.close(promise: nil)
-        return channel.eventLoop.makeSucceededFuture(nil)
+        return loop.makeFailedFuture(MagentError.connectionClosed)
       }
       self.wireChannel = channel
-      return channel.eventLoop.makeSucceededFuture(Optional(channel))
-    }.flatMapError { error -> EventLoopFuture<Channel?> in
-      let response: Data
-      switch error {
-      case MagentError.channelConnectionTimedOut:
-        response = HttpProtocol.gatewayTimeout
-      default:
-        response = HttpProtocol.badGateway
-      }
-      let responseFuture =
-        self.respondProxyChannelOnce(response)
-        ?? self.proxyChannel.eventLoop.makeSucceededFuture(())
-      responseFuture.whenComplete { _ in
-        self.proxyChannel.pipeline.fireErrorCaught(error)
-      }
-      return self.proxyChannel.eventLoop.makeSucceededFuture(nil)
-    }.flatMap { channel in
-      self.startTunnel(channel)
-    }.whenFailure { error in
-      self.proxyChannel.pipeline.fireErrorCaught(error)
-    }
-  }
-
-  /// wire 准备完成后先发送 established，响应写入成功才进入 tunnel 并启动双向读取。
-  private func startTunnel(_ channel: Channel?) -> EventLoopFuture<Void> {
-    guard let channel,
-      state != .closed,
-      proxyChannel.isActive
-    else {
-      channel?.close(promise: nil)
-      return proxyChannel.eventLoop.makeSucceededFuture(())
-    }
-    guard let responseFuture = respondProxyChannelOnce(HttpProtocol.established) else {
-      channel.close(promise: nil)
-      return proxyChannel.eventLoop.makeSucceededFuture(())
-    }
-    return responseFuture.map {
-      guard self.state != .closed,
-        self.proxyChannel.isActive,
-        channel.isActive
-      else {
-        channel.close(promise: nil)
-        return
-      }
-      self.state = .tunnel
-      self.handshakeHandler = nil
-      if self.isProxyInputClosed {
-        channel.close(mode: .output).whenFailure { error in
-          self.proxyChannel.pipeline.fireErrorCaught(error)
+      return loop.makeCompletedFuture {
+        // TODO: 启动写入的绝对期限仍需接入；不把建连 timeout 当作启动写期限。
+        let startup = try self.wire?.start(handshake: target)
+        self.wireStarted = true
+        // 先排空 start 前的原始输入，之后 earlyRemote 只保存已经解码的业务。
+        let early = self.earlyRemote
+        self.earlyRemote = self.proxyChannel.allocator.buffer(capacity: 0)
+        try self.relayRemote(early)
+        if self.remoteInputEnded { try self.finishRemoteInput() } else { channel.read() }
+        if let startup {
+          var output = channel.allocator.buffer(capacity: startup.count)
+          output.writeBytes(startup)
+          return output
         }
-      } else {
-        self.proxyChannel.read()
+        return channel.allocator.buffer(capacity: 0)
+      }.flatMap { startup in
+        self.writeRemote(startup)
+      }.flatMapThrowing {
+        guard self.state != .closed, self.firstError == nil else {
+          throw MagentError.connectionClosed
+        }
+        if self.remoteInputEnded { try self.finishRemoteInput() }
       }
-      channel.read()
     }
   }
 
-  /// 将 tunnel payload 编码后写入 wire channel。
-  private func outbound(_ data: ByteBuffer) throws {
-    guard state == .tunnel, data.readableBytes > 0 else {
-      return
-    }
-
-    let data = Data(data.readableBytesView)
-    let outbound: Data
-    if let wire {
-      outbound = try wire.encodeOutbound(data, address: nil)
-    } else {
-      outbound = data
-    }
-    requestWireChannel(outbound).map {
-      self.proxyChannel.read()
-    }.whenFailure { error in
-      self.proxyChannel.pipeline.fireErrorCaught(error)
+  /// 200 完整写成才进入转发；早到业务已解码，不再通过 Wire 重复解码。
+  private func writeSuccess() -> EventLoopFuture<Void> {
+    let loop = proxyChannel.eventLoop
+    return loop.makeCompletedFuture {
+      guard self.state != .closed, self.firstError == nil, !self.replyCommitted else {
+        throw MagentError.connectionClosed
+      }
+      let collector = HTTPEncodedBytesHandler()
+      var configuration = HTTPResponseEncoder.Configuration()
+      configuration.automaticallySetFramingHeaders = false
+      let encoder = HTTPResponseEncoder(configuration: configuration)
+      try self.proxyChannel.pipeline.syncOperations.addHandlers(collector, encoder)
+      let context = try self.proxyChannel.pipeline.syncOperations.context(handler: encoder)
+      self.responseEncoder = encoder
+      self.responseBytes = collector
+      self.responseContext = context
+      self.rawWriteContext = try self.proxyChannel.pipeline.syncOperations.context(
+        handler: collector)
+      let response = Self.localResponse(version: self.requestVersion, status: .ok)
+      encoder.write(
+        context: context, data: NIOAny(HTTPServerResponsePart.head(response)), promise: nil)
+      encoder.write(context: context, data: NIOAny(HTTPServerResponsePart.end(nil)), promise: nil)
+      if let failure = collector.failure { throw failure }
+      guard let output = collector.bytes, output.readableBytes > 0 else {
+        throw MagentError.connectionClosed
+      }
+      collector.bytes = nil
+      self.replyCommitted = true
+      return output
+    }.flatMap { self.writeClient($0) }.flatMap {
+      guard self.state != .closed, self.firstError == nil else {
+        return loop.makeFailedFuture(MagentError.connectionClosed)
+      }
+      self.state = .forwarding
+      let early = self.earlyRemote
+      self.earlyRemote.clear()
+      return self.writeClient(early)
+    }.flatMapThrowing {
+      guard self.state != .closed, self.firstError == nil else {
+        throw MagentError.connectionClosed
+      }
+      if self.remoteInputEnded { try self.finishRemoteInput() } else { self.wireChannel?.read() }
     }
   }
 
-  /// 将 wire channel 数据解码后写回 proxy channel。
-  private func inbound(_ data: ByteBuffer) throws {
-    guard state == .tunnel, data.readableBytes > 0 else {
-      return
-    }
+  // MARK: - 双向转发与半关闭
 
-    let data = Data(data.readableBytesView)
-    let inbound: Data
-    if let wire {
-      inbound = try wire.decodeInbound(data).data
-    } else {
-      inbound = data
-    }
-
-    guard !inbound.isEmpty else {
-      wireChannel?.read()
-      return
-    }
-    respondProxyChannel(inbound).map {
-      self.wireChannel?.read()
-    }.whenFailure { error in
-      self.proxyChannel.pipeline.fireErrorCaught(error)
-    }
-  }
-
-  /// 写入当前下游 channel，并把完成状态交给调用阶段决定后续响应或关闭顺序。
-  private func requestWireChannel(_ data: Data) -> EventLoopFuture<Void> {
-    guard let wireChannel else {
+  /// 有界串行客户端写队列；每批写成后才释放计数，错误交调用边界处理。
+  private func writeClient(_ data: ByteBuffer) -> EventLoopFuture<Void> {
+    guard !didCleanUp, !proxyOutputClosing,
+      data.readableBytes <= Self.bufferLimit - clientWriteBytes
+    else {
       return proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
     }
-    var output = wireChannel.allocator.buffer(capacity: data.count)
-    output.writeBytes(data)
-    return wireChannel.writeAndFlush(output)
-  }
-
-  /// 将 HTTP CONNECT response 或 tunnel 数据写回 proxy channel，并返回可排序的写入完成状态。
-  private func respondProxyChannel(_ data: Data) -> EventLoopFuture<Void> {
-    var output = proxyChannel.allocator.buffer(capacity: data.count)
-    output.writeBytes(data)
-    return proxyChannel.writeAndFlush(output)
-  }
-
-  /// HTTP CONNECT 每条连接最多发送一次握手响应；后续状态和错误由调用点处理。
-  fileprivate func respondProxyChannelOnce(_ data: Data) -> EventLoopFuture<Void>? {
-    guard
-      hasRespondedHandshake.compareExchange(
-        expected: false,
-        desired: true,
-        ordering: .acquiringAndReleasing
-      ).exchanged
-    else {
-      return nil
+    let count = data.readableBytes
+    clientWriteBytes += count
+    clientWrite = clientWrite.flatMap {
+      guard !self.didCleanUp else {
+        return self.proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
+      }
+      if let context = self.rawWriteContext { return context.writeAndFlush(NIOAny(data)) }
+      return self.proxyChannel.writeAndFlush(data)
     }
-    return respondProxyChannel(data)
+    clientWrite.whenComplete { _ in self.clientWriteBytes -= count }
+    return clientWrite
   }
 
-  private static let maximumRequestSize = 64 * 1024
+  /// 启动字节和编码业务共用同一写序；空启动表示无需网络写入。
+  private func writeRemote(_ data: ByteBuffer) -> EventLoopFuture<Void> {
+    guard state != .closed, firstError == nil, !remoteOutputClosing, let channel = wireChannel,
+      data.readableBytes <= Self.bufferLimit - remoteWriteBytes
+    else {
+      return proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
+    }
+    guard data.readableBytes > 0 else { return remoteWrite }
+    let count = data.readableBytes
+    remoteWriteBytes += count
+    remoteWrite = remoteWrite.flatMap {
+      guard self.state != .closed, self.firstError == nil else {
+        return channel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
+      }
+      return channel.writeAndFlush(data)
+    }
+    remoteWrite.whenComplete { _ in self.remoteWriteBytes -= count }
+    return remoteWrite
+  }
+
+  /// 客户端业务只编码一次；下游写成后再继续读取，以网络写完成约束输入速度。
+  private func relayClient(_ data: ByteBuffer) throws {
+    guard state == .forwarding, data.readableBytes > 0 else { return }
+    guard data.readableBytes <= Self.bufferLimit - remoteWriteBytes else {
+      throw MagentError.invalidOptions("CONNECT outbound buffer is full")
+    }
+    // TODO: 装配固定 Wire 输入/最坏输出上界后，在调用前预留返回值及临时副本容量。
+    var output = data
+    if let wire {
+      let encoded = try wire.encodeOutbound(Data(data.readableBytesView), address: nil)
+      output = proxyChannel.allocator.buffer(capacity: encoded.count)
+      output.writeBytes(encoded)
+    }
+    writeRemote(output).whenComplete { result in
+      guard self.state != .closed, self.firstError == nil else { return }
+      switch result {
+      case .success:
+        if !self.proxyInputEnded { self.proxyChannel.read() }
+      case .failure(let error):
+        self.fail(error)
+      }
+    }
+  }
+
+  /// 初始化前存原始字节；之后仅解码一次，200 之前保存业务结果。
+  private func relayRemote(_ data: ByteBuffer) throws {
+    guard state != .closed, firstError == nil else { return }
+    guard data.readableBytes <= Self.bufferLimit - earlyRemote.readableBytes - clientWriteBytes
+    else {
+      throw MagentError.invalidOptions("CONNECT inbound buffer is full")
+    }
+    guard wireStarted else {
+      var data = data
+      earlyRemote.writeBuffer(&data)
+      return
+    }
+    // TODO: Wire 单次最坏解码输出必须包含历史残留，不能用本次读取大小代替预留上界。
+    var output = data
+    if let wire, data.readableBytes > 0 {
+      let decoded = try wire.decodeInbound(Data(data.readableBytesView)).data
+      output = proxyChannel.allocator.buffer(capacity: decoded.count)
+      output.writeBytes(decoded)
+    }
+    guard state == .forwarding else {
+      guard output.readableBytes <= Self.bufferLimit - earlyRemote.readableBytes else {
+        throw MagentError.invalidOptions("CONNECT early response exceeds buffer limit")
+      }
+      earlyRemote.writeBuffer(&output)
+      return
+    }
+    writeClient(output).whenComplete { result in
+      guard self.state != .closed, self.firstError == nil else { return }
+      switch result {
+      case .success:
+        if !self.remoteInputEnded { self.wireChannel?.read() }
+      case .failure(let error):
+        self.fail(error)
+      }
+    }
+  }
+
+  /// 零业务 FIN 同样等待启动与 200；Wire EOF 不覆盖先前失败，且每条流只检查一次。
+  private func finishRemoteInput() throws {
+    guard state != .closed, firstError == nil else { return }
+    remoteInputEnded = true
+    guard wireStarted else { return }
+    if !wireInputFinished {
+      try wire?.finishInbound()
+      wireInputFinished = true
+    }
+    guard state == .forwarding, !proxyOutputClosing else { return }
+    proxyOutputClosing = true
+    clientWrite.flatMap {
+      guard self.state != .closed else {
+        return self.proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
+      }
+      return self.proxyChannel.close(mode: .output)
+    }.whenComplete { result in
+      guard self.state != .closed else { return }
+      switch result {
+      case .success:
+        self.proxyOutputEnded = true
+        if self.remoteOutputEnded || self.remoteFullyClosed {
+          self.proxyChannel.close(promise: nil)
+        }
+      case .failure(let error):
+        self.fail(error)
+      }
+    }
+  }
+
+  // MARK: - 本地响应与统一失败处理
+
+  /// 只保存首因；错误响应失败不得覆盖原错，最终交 accepted owner 收尾。
+  private func fail(_ error: Error) {
+    guard state != .closed, firstError == nil else { return }
+    firstError = error
+    state = .closed
+    guard !replyCommitted, proxyChannel.isActive, !proxyOutputEnded else {
+      proxyChannel.pipeline.fireErrorCaught(error)
+      return
+    }
+    let status: HTTPResponseStatus
+    switch error {
+    case HttpProtocol.Failure.unsupportedVersion: status = .httpVersionNotSupported
+    case HttpProtocol.Failure.unsupportedFeature: status = .notImplemented
+    case HttpProtocol.Failure.unsupportedExpectation: status = .expectationFailed
+    case HttpProtocol.Failure.invalidRequest, MagentError.malformedRequest,
+      MagentError.invalidAddress, is HTTPParserError, is ByteToMessageDecoderError:
+      status = .badRequest
+    case ChannelError.connectTimeout, MagentError.channelConnectionTimedOut:
+      status = .gatewayTimeout
+    default: status = .badGateway
+    }
+    do {
+      if responseEncoder == nil {
+        let collector = HTTPEncodedBytesHandler()
+        var configuration = HTTPResponseEncoder.Configuration()
+        configuration.automaticallySetFramingHeaders = false
+        let encoder = HTTPResponseEncoder(configuration: configuration)
+        try proxyChannel.pipeline.syncOperations.addHandlers(collector, encoder)
+        responseEncoder = encoder
+        responseBytes = collector
+        responseContext = try proxyChannel.pipeline.syncOperations.context(handler: encoder)
+        rawWriteContext = try proxyChannel.pipeline.syncOperations.context(handler: collector)
+      }
+      guard let encoder = responseEncoder, let context = responseContext,
+        let collector = responseBytes
+      else { throw MagentError.connectionClosed }
+      let response = Self.localResponse(version: requestVersion, status: status)
+      encoder.write(
+        context: context, data: NIOAny(HTTPServerResponsePart.head(response)), promise: nil)
+      encoder.write(context: context, data: NIOAny(HTTPServerResponsePart.end(nil)), promise: nil)
+      if let failure = collector.failure { throw failure }
+      guard let output = collector.bytes else { throw MagentError.connectionClosed }
+      collector.bytes = nil
+      replyCommitted = true
+      writeClient(output).whenComplete { _ in
+        guard !self.didCleanUp else { return }
+        self.proxyChannel.pipeline.fireErrorCaught(error)
+      }
+    } catch {
+      // 响应自身失败时保留 firstError，不用编码/写出失败覆盖首因。
+      if let firstError { proxyChannel.pipeline.fireErrorCaught(firstError) }
+    }
+  }
+
+  /// 唯一共享的无状态响应构造；200 不携带普通响应定界或关闭字段。
+  internal static func localResponse(version: HTTPVersion, status: HTTPResponseStatus)
+    -> HTTPResponseHead
+  {
+    let version = version == .http1_0 ? HTTPVersion.http1_0 : .http1_1
+    var headers = HTTPHeaders()
+    if status != .ok {
+      headers.add(name: "Content-Length", value: "0")
+      headers.add(name: "Connection", value: "close")
+    }
+    return HTTPResponseHead(version: version, status: status, headers: headers)
+  }
 }

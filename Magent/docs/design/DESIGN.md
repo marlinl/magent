@@ -71,10 +71,10 @@ Statuses below follow each document's own declaration. A target design does not 
 
 | Document | Status | Scope |
 | --- | --- | --- |
+| [MagentCore design](MagentCore-DESIGN.md) | Target design; implementation verification pending | Runtime-scoped rules, decision caching, node/Wire selection, and downstream Channel creation for Connection targets. |
 | [MagentTCPConnection design](MagentTCPConnection-DESIGN.md) | Target design; implementation verification pending | Mixed-protocol accepted TCP ownership, unique dispatch and restart-scoped cleanup. |
 | [Socks4Connection design](Socks4Connection-DESIGN.md) | Target design; implementation verification pending | Strict SOCKS4/4a CONNECT, reply barrier, Wire integration and half-close under the [SOCKS4 SPEC](../SOCKS4_PROXY_SPEC.md). |
 | [Socks5Connection design](Socks5Connection-DESIGN.md) | Target design; implementation verification pending | No-auth negotiation, TCP CONNECT and UDP resources owned by each control connection. |
 | [HttpConnectConnection design](HttpConnectConnection-DESIGN.md) | Target design; implementation verification pending | Model-based CONNECT validation, strict request ordering, success barrier and half-close. |
 | [HttpForwardConnection design](HttpForwardConnection-DESIGN.md) | Target design; implementation verification pending | One complete request, model-based rewrite, transparent response relay and cleanup. |
 | [MagentCache design](MagentCache_Design.md) | Target design; source migration is pending | Cache caller contracts, Core integration, expiration, invalidation, and shutdown boundaries, governed by the [Cache SPEC](../W-TinyLFU_CACHE_SPCE.md). |
-| [Routing and access control design](MagentAccessControl_Design.md) | Current implementation | Rule matching, node selection, runtime ownership, and decision caching, with current routing boundaries defined alongside the architecture. |

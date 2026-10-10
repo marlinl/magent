@@ -1,21 +1,29 @@
+//
+//  MagentCore.swift
+//  Magent
+//
+//  Created by MarlinL on 2026/8/27.
+//
+
 import Foundation
 import NIOCore
 import NIOPosix
 
-/// Magent Core 层的 Wire 匹配入口。
-/// A service-owned Core instance. Its lifetime is independent from other Magent instances;
-/// callers must serialize configuration mutations with the owning service lifecycle.
+/// 一个 start / restart 运行周期的规则、节点及下游创建入口。
+///
+/// 配置在初始化后只读；共享缓存自行同步，TCP Wire 由每条 Connection 独占。
+/// Core 创建 Channel 后交回 Connection，不持有 Channel 或另一套关闭状态。
 internal final class MagentCore: @unchecked Sendable {
 
+  /// 路由配置只在本运行周期初始化时装载；缓存仅省略重复匹配，不保存连接或 TCP Wire。
   private let defaultDecision: Decision
   private let routeCache: MagentCache<Decision>
   private let router: MagentRouter
   internal let defaultTimeout: Int64
 
-  /// 以节点 UUID 为 key 保存当前可用的代理节点；相同 UUID 的新配置覆盖旧配置。
-  private var nodes: [UUID: ProxyNode]
-  private var addressNodes: [SocketAddress: UUID]
-  private var udpWires: [UUID: Wire]
+  /// 只读节点和逐包独立的 UDP Wire；关联的客户端与远端记录由 Connection 持有。
+  private let nodes: [UUID: ProxyNode]
+  private let udpWires: [UUID: Wire]
 
   /// 装载当前运行周期的完整节点和规则；没有规则时不缓存默认决策。
   /// 默认代理节点在完整节点列表装载后校验，确保初始化成功的 Core 可直接使用默认决策。
@@ -23,37 +31,19 @@ internal final class MagentCore: @unchecked Sendable {
     defaultDecision: Decision, proxyNodes: [ProxyNode],
     defaultTimeout: Int64, rules: [ProxyRule]
   ) throws {
+    guard (1...(Int64.max / 1_000_000)).contains(defaultTimeout) else {
+      throw MagentError.invalidOptions(
+        "default timeout must be a representable positive millisecond value")
+    }
     self.defaultDecision = defaultDecision
     self.routeCache = MagentCache(capacity: rules.isEmpty ? 0 : 4096)
     self.router = MagentRouter(rules)
     self.defaultTimeout = defaultTimeout
-    self.nodes = [:]
-    self.addressNodes = [:]
-    self.udpWires = [:]
-    try putAllProxyNodes(proxyNodes)
-    if case .proxy(let nodeID) = defaultDecision, nodes[nodeID] == nil {
-      throw MagentError.proxyNodeNotFound(nodeID)
-    }
-  }
+    var nodes: [UUID: ProxyNode] = [:]
+    var addressNodes: [SocketAddress: UUID] = [:]
+    var udpWires: [UUID: Wire] = [:]
 
-  /// 根据代理节点类型创建对应的 UDP Wire；创建失败时原样向上抛出异常。
-  private func createUDPWire(_ node: ProxyNode) throws -> Wire {
-    switch node.type {
-    case .shadowsocks:
-      return try ShadowsocksUDPWire(proxyNode: node)
-    }
-  }
-
-  private func createTCPWire(_ node: ProxyNode) throws -> Wire {
-    switch node.type {
-    case .shadowsocks:
-      return try ShadowsocksTCPWire(proxyNode: node)
-    }
-  }
-
-  /// 批量写入代理节点；相同 UUID 按数组顺序覆盖，未包含的已有节点保持不变。
-  /// 每个 UDP Wire 都经由 `createUDPWire(_:)` 创建，使节点类型与 Wire 的映射只保留在一个位置。
-  internal func putAllProxyNodes(_ proxyNodes: [ProxyNode]) throws {
+    // 按输入顺序校验当前占用，不能先去重再判断地址冲突。失败时这些局部表不会发布。
     for node in proxyNodes {
       if let existingNodeID = addressNodes[node.address], existingNodeID != node.id {
         throw MagentError.invalidPolicy(
@@ -61,7 +51,12 @@ internal final class MagentCore: @unchecked Sendable {
         )
       }
 
-      let udpWire = try createUDPWire(node)
+      let udpWire: Wire
+      switch node.type {
+      case .shadowsocks:
+        // 独立数据报实现仅共享只读节点配置，不保存关联或跨包流状态。
+        udpWire = try ShadowsocksUDPWire(proxyNode: node)
+      }
       if let previousNode = nodes[node.id], previousNode.address != node.address {
         addressNodes.removeValue(forKey: previousNode.address)
       }
@@ -69,15 +64,18 @@ internal final class MagentCore: @unchecked Sendable {
       addressNodes[node.address] = node.id
       udpWires[node.id] = udpWire
     }
+    if case .proxy(let nodeID) = defaultDecision, nodes[nodeID] == nil {
+      throw MagentError.proxyNodeNotFound(nodeID)
+    }
+    self.nodes = nodes
+    self.udpWires = udpWires
   }
+
+  // MARK: - Route selection
 
   /// 地址已在模型边界规范化；规则为空或未命中时使用默认决策。
   private func routeDecision(_ address: NetworkAddress) -> Decision {
     let key = Self.routeCacheKey(address)
-    if let decision = routeCache.get(key) {
-      return decision
-    }
-
     return routeCache.getOrLoad(key) { _ in
       return router.match(address) ?? defaultDecision
     }
@@ -98,7 +96,11 @@ internal final class MagentCore: @unchecked Sendable {
       guard let node = nodes[nodeID] else {
         throw MagentError.proxyNodeNotFound(nodeID)
       }
-      return try createTCPWire(node)
+      // 每次路由创建独立流状态；缓存只保存 Decision，不保存此 Wire。
+      switch node.type {
+      case .shadowsocks:
+        return try ShadowsocksTCPWire(proxyNode: node)
+      }
     }
   }
 
@@ -133,25 +135,27 @@ internal final class MagentCore: @unchecked Sendable {
     }
   }
 
-  /// 使用指定 EventLoopGroup 创建下游 TCP client Channel。
+  // MARK: - Downstream Channel creation
+
+  /// 使用 accepted Channel 的 EventLoop 创建 DIRECT 下游。
   ///
   /// handler 在 Channel 激活前安装，避免连接成功后先收到数据再补装 handler。
   /// 返回的 Channel 关闭自动读取、允许远端 half-close，且每次显式读取最多产生一条消息，
   /// 由具体协议连接在下游写入完成后发起下一次读取并处理输入方向关闭。
   internal func createTCPClientChannel(
-    group: EventLoopGroup, address: NetworkAddress, timeout: Int64,
+    eventLoop: EventLoop, address: NetworkAddress, timeout: Int64,
     handler: ChannelHandler & Sendable
   ) -> EventLoopFuture<Channel> {
     guard !address.host.isEmpty, (1...65535).contains(address.port) else {
-      return group.next().makeFailedFuture(MagentError.invalidAddress("Invalid TCP destination"))
+      return eventLoop.makeFailedFuture(MagentError.invalidAddress("Invalid TCP destination"))
     }
-    guard timeout > 0 else {
-      return group.next().makeFailedFuture(
-        MagentError.invalidOptions("TCP connection timeout must be greater than zero")
+    guard (1...(Int64.max / 1_000_000)).contains(timeout) else {
+      return eventLoop.makeFailedFuture(
+        MagentError.invalidOptions("TCP timeout must be a representable positive millisecond value")
       )
     }
 
-    let bootstrap = ClientBootstrap(group: group)
+    let bootstrap = ClientBootstrap(group: eventLoop)
       .connectTimeout(.milliseconds(timeout))
       .channelOption(ChannelOptions.autoRead, value: false)
       .channelOption(ChannelOptions.maxMessagesPerRead, value: 1)
@@ -159,19 +163,12 @@ internal final class MagentCore: @unchecked Sendable {
       .channelInitializer { channel in
         channel.pipeline.addHandler(handler)
       }
-    let connection: EventLoopFuture<Channel>
     switch address.address {
     case .ip(let socket):
       // 数值目标直接使用已存储端点，禁止重新进入主机名解析。
-      connection = bootstrap.connect(to: socket)
+      return bootstrap.connect(to: socket)
     case .domain(let host, let port):
-      connection = bootstrap.connect(host: host, port: Int(port))
-    }
-    return connection.flatMapErrorThrowing { error in
-      if let channelError = error as? ChannelError, case .connectTimeout = channelError {
-        throw MagentError.channelConnectionTimedOut
-      }
-      throw MagentError.channelCreationFailed(String(describing: error))
+      return bootstrap.connect(host: host, port: Int(port))
     }
   }
 
@@ -181,19 +178,20 @@ internal final class MagentCore: @unchecked Sendable {
   /// 避免重新转换成 NetworkAddress。
   /// 返回的 Channel 使用和 NetworkAddress 重载相同的手动读取约束。
   internal func createTCPClientChannel(
-    group: EventLoopGroup, address: SocketAddress, timeout: Int64,
+    eventLoop: EventLoop, address: SocketAddress, timeout: Int64,
     handler: ChannelHandler & Sendable
   ) -> EventLoopFuture<Channel> {
-    if let port = address.port, !(1...65535).contains(port) {
-      return group.next().makeFailedFuture(MagentError.invalidAddress("Invalid TCP destination"))
+    guard let port = address.port, (1...65535).contains(port) else {
+      return eventLoop.makeFailedFuture(MagentError.invalidAddress("Invalid TCP destination"))
     }
-    guard timeout > 0 else {
-      return group.next().makeFailedFuture(
-        MagentError.invalidOptions("TCP connection timeout must be greater than zero")
+    guard (1...(Int64.max / 1_000_000)).contains(timeout) else {
+      return eventLoop.makeFailedFuture(
+        MagentError.invalidOptions("TCP timeout must be a representable positive millisecond value")
       )
     }
 
-    return ClientBootstrap(group: group)
+    // 与逻辑目标入口保持相同 Channel 契约，但不转换实际端点，以保留地址族和 IPv6 scope。
+    return ClientBootstrap(group: eventLoop)
       .connectTimeout(.milliseconds(timeout))
       .channelOption(ChannelOptions.autoRead, value: false)
       .channelOption(ChannelOptions.maxMessagesPerRead, value: 1)
@@ -202,20 +200,18 @@ internal final class MagentCore: @unchecked Sendable {
         channel.pipeline.addHandler(handler)
       }
       .connect(to: address)
-      .flatMapErrorThrowing { error in
-        if let channelError = error as? ChannelError, case .connectTimeout = channelError {
-          throw MagentError.channelConnectionTimedOut
-        }
-        throw MagentError.channelCreationFailed(String(describing: error))
-      }
   }
 
-  /// 使用指定 EventLoopGroup 和本地 SocketAddress 绑定 UDP Channel。
+  /// 在 control connection 的 EventLoop 绑定关联自有 UDP Channel；端口 0 由系统分配。
+  /// 返回的失败保持原始错误，部分成功与迟到资源由 Connection 的建立流程回收。
   internal func createUDPClientChannel(
-    group: EventLoopGroup, address: SocketAddress,
+    eventLoop: EventLoop, address: SocketAddress,
     handler: ChannelHandler & Sendable
   ) -> EventLoopFuture<Channel> {
-    return DatagramBootstrap(group: group)
+    guard let port = address.port, (0...65535).contains(port) else {
+      return eventLoop.makeFailedFuture(MagentError.invalidAddress("Invalid UDP bind address"))
+    }
+    return DatagramBootstrap(group: eventLoop)
       .channelOption(ChannelOptions.autoRead, value: false)
       .channelOption(ChannelOptions.maxMessagesPerRead, value: 1)
       .channelOption(
@@ -226,9 +222,6 @@ internal final class MagentCore: @unchecked Sendable {
         channel.pipeline.addHandler(handler)
       }
       .bind(to: address)
-      .flatMapErrorThrowing { error in
-        throw MagentError.channelCreationFailed(String(describing: error))
-      }
   }
 }
 
@@ -238,6 +231,7 @@ internal final class MagentCore: @unchecked Sendable {
 private struct MagentRouter: Sendable {
   /// 按最后出现的位置保留规则，数组顺序就是相同优先级和具体性时的决胜顺序。
   private let rules: [ProxyRule]
+  /// 索引只保存规则位置；各类命中仍统一比较，不能因精确索引先命中就提前返回。
   private let exactDomains: [String: Int]
   private let domainSuffixes: [String: Int]
   private let domainKeywords: [String: Int]
@@ -275,6 +269,7 @@ private struct MagentRouter: Sendable {
   /// 域名只取匹配视图，保留原目标根点供后续解析和 Wire 使用；IP 不执行 DNS。
   fileprivate func match(_ address: NetworkAddress) -> Decision? {
     var bestIndex: Int?
+    // 不同索引的候选使用同一个比较入口，保证遍历顺序不会改变规则优先级。
     func consider(_ candidate: Int?) {
       guard let candidate else { return }
       if let current = bestIndex, !isPreferred(candidate, over: current) { return }
