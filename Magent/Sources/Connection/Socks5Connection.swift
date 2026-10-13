@@ -40,6 +40,7 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
   private var commandReplyStarted = false
   private var acceptedCommand: UInt8?
   private var firstError: Error?
+  private var errorReported = false
   /// fail 会先封闭状态；独立清理标记确保 accepted owner 随后仍能实际释放资源。
   private var didCleanUp = false
 
@@ -64,19 +65,9 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
   private var earlyRemoteInput: ByteBuffer
   private var pendingRemoteInput: ByteBuffer
   private static let maximumBufferedBytes = 256 * 1024
-  private static let maximumDatagramBytes = 65_507
-  private static let maximumAssociationRecords = 1_024
 
-  /// 关联资源跟随控制 TCP 的生命周期；共享 UDP Wire 不归此处关闭。
-  private var udpV4Channel: Channel?
-  private var udpV6Channel: Channel?
-  private var dnsClient: DNSClient?
-  /// hint 保存经过数值身份比较的 IPv4 IP 和可选端口；client 保留实际回包端点。
-  private var sourceHint: SocketAddress?
-  private var udpClient: SocketAddress?
-  private var resolvedAddresses: [NetworkAddress: SocketAddress] = [:]
-  /// 字典的存在性与可选 value 分开：nil value 是 DIRECT，缺少 key 是未知来源。
-  private var backendWires: [SocketAddress: Wire?] = [:]
+  /// 父对象强持有唯一 UDP 资源 owner；它弱持有父对象，随控制连接一起结束。
+  private var udpConnection: Socks5UDPConnection?
 
   /// 构造只保存当前 runtime 依赖，不创建网络资源。
   internal init(proxyChannel: Channel, core: MagentCore, dnsAddress: SocketAddress?) {
@@ -153,18 +144,10 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
     state = .closed
     if firstError == nil { firstError = error }
     wireChannel?.close(promise: nil)
-    udpV4Channel?.close(promise: nil)
-    udpV6Channel?.close(promise: nil)
-    _ = dnsClient?.close()
+    udpConnection?.closeConnection()
     wireChannel = nil
     wire = nil
-    udpV4Channel = nil
-    udpV6Channel = nil
-    dnsClient = nil
-    sourceHint = nil
-    udpClient = nil
-    backendWires.removeAll()
-    resolvedAddresses.removeAll()
+    udpConnection = nil
     requestBuffer = proxyChannel.allocator.buffer(capacity: 0)
     earlyRemoteInput = proxyChannel.allocator.buffer(capacity: 0)
     pendingRemoteInput = proxyChannel.allocator.buffer(capacity: 0)
@@ -285,7 +268,7 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
     )
   }
 
-  /// 一个完成的消息只推进一个阶段；回复在途继续观察客户端，提前数据统一失败。
+  /// 一个完成的消息只推进一个阶段；回复写成前暂停 accepted 读取，已送达的提前数据仍失败。
   private func consumeHandshake() throws {
     let parsed = try parseHandshake(requestBuffer)
     guard let message = parsed.message else {
@@ -301,7 +284,12 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
       guard methods.contains(0x00) else {
         throw MagentError.invalidOptions("SOCKS5 no-auth method is unavailable")
       }
+      let deadline = proxyChannel.eventLoop.scheduleTask(in: .milliseconds(core.defaultTimeout)) {
+        self.fail(MagentError.channelConnectionTimedOut)
+      }
+      proxyChannel.closeFuture.whenComplete { _ in deadline.cancel() }
       writeReply(ByteBuffer(bytes: [0x05, 0x00])).whenComplete { result in
+        deadline.cancel()
         guard self.state != .closed else { return }
         switch result {
         case .success:
@@ -328,7 +316,15 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
         }
         operation = openAssociation(hint: hint).map { Optional($0) }
       }
+      // UDP 装配使用 Core 期限；TCP 的选定 Wire 期限由 openTCP 独立负责。
+      let deadline: Scheduled<Void>? =
+        command == 0x03
+        ? proxyChannel.eventLoop.scheduleTask(in: .milliseconds(core.defaultTimeout)) {
+          self.fail(MagentError.channelConnectionTimedOut)
+        } : nil
+      proxyChannel.closeFuture.whenComplete { _ in deadline?.cancel() }
       operation.flatMap { bound -> EventLoopFuture<Void> in
+        deadline?.cancel()
         guard self.state != .closed else {
           return self.proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
         }
@@ -338,10 +334,10 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
           switch bound {
           case .v4(let address):
             reply.writeInteger(UInt8(0x01))
-            withUnsafeBytes(of: address.address.sin_addr) { reply.writeBytes($0) }
+            _ = withUnsafeBytes(of: address.address.sin_addr) { reply.writeBytes($0) }
           case .v6(let address):
             reply.writeInteger(UInt8(0x04))
-            withUnsafeBytes(of: address.address.sin6_addr) { reply.writeBytes($0) }
+            _ = withUnsafeBytes(of: address.address.sin6_addr) { reply.writeBytes($0) }
           case .unixDomainSocket:
             return self.proxyChannel.eventLoop.makeFailedFuture(
               MagentError.invalidAddress("SOCKS5 bound address must be numeric"))
@@ -350,8 +346,15 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
         } else {
           reply.writeBytes([UInt8(0x01), 0, 0, 0, 0, 0, 0])
         }
-        return self.writeReply(reply)
+        let written = self.writeReply(reply)
+        let replyDeadline = self.proxyChannel.eventLoop.scheduleTask(
+          in: .milliseconds(self.wire?.getTimeout() ?? self.core.defaultTimeout)
+        ) { self.fail(MagentError.channelConnectionTimedOut) }
+        written.whenComplete { _ in replyDeadline.cancel() }
+        self.proxyChannel.closeFuture.whenComplete { _ in replyDeadline.cancel() }
+        return written
       }.whenComplete { result in
+        deadline?.cancel()
         guard self.state != .closed else { return }
         switch result {
         case .success:
@@ -364,108 +367,94 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
             } catch { self.fail(error) }
           } else {
             self.state = .udpAssociated
-            self.udpV4Channel?.read()
-            self.udpV6Channel?.read()
+            self.udpConnection?.activate()
             self.proxyChannel.read()
           }
         case .failure(let error): self.fail(error)
         }
       }
     }
-    if state != .closed, !proxyInputEnded { proxyChannel.read() }
+    // 当前完整消息的回复或装配 Future 持有推进权；只有成功完成回调恢复读取。
   }
 
   /// 一次选路所得 Wire 同时决定拨号端点、超时和流状态；启动输出写成才完成 future。
   private func openTCP(target: NetworkAddress) -> EventLoopFuture<Void> {
     let eventLoop = proxyChannel.eventLoop
-    let connection: EventLoopFuture<Channel>
-    do {
-      wire = try core.routeTCPWire(target)
-      if let wire {
-        connection = core.createTCPClientChannel(
-          eventLoop: eventLoop, address: wire.getEndpoint(), timeout: wire.getTimeout(),
-          handler: self)
-      } else {
-        connection = core.createTCPClientChannel(
-          eventLoop: eventLoop, address: target, timeout: core.defaultTimeout, handler: self)
-      }
-    } catch { return eventLoop.makeFailedFuture(error) }
-    return connection.flatMap { channel -> EventLoopFuture<Void> in
+    return eventLoop.makeCompletedFuture {
+      self.wire = try self.core.routeTCPWire(target)
+    }.flatMap { _ -> EventLoopFuture<Void> in
+      // 已完成 Future 也可能延后调度；发起拨号前重新确认 accepted 仍属于活动会话。
       guard self.state != .closed, self.proxyChannel.isActive else {
-        channel.close(promise: nil)
         return eventLoop.makeFailedFuture(MagentError.connectionClosed)
       }
-      self.wireChannel = channel
-      do {
-        let startup = try self.wire?.start(handshake: target)
-        self.wireInitialized = true
-        let input = self.earlyRemoteInput
-        self.earlyRemoteInput = self.proxyChannel.allocator.buffer(capacity: 0)
-        try self.relayRemote(input)
-        try self.finishRemoteInput()
-        if let startup {
-          return channel.writeAndFlush(ByteBuffer(bytes: startup))
+      let timeout = self.wire?.getTimeout() ?? self.core.defaultTimeout
+      let connection: EventLoopFuture<Channel>
+      if let wire = self.wire {
+        connection = self.core.createTCPClientChannel(
+          eventLoop: eventLoop, address: wire.getEndpoint(), timeout: timeout, handler: self)
+      } else {
+        connection = self.core.createTCPClientChannel(
+          eventLoop: eventLoop, address: target, timeout: timeout, handler: self)
+      }
+      let established = connection.flatMap { channel -> EventLoopFuture<Void> in
+        guard self.state != .closed, self.proxyChannel.isActive else {
+          channel.close(promise: nil)
+          return eventLoop.makeFailedFuture(MagentError.connectionClosed)
         }
-        return eventLoop.makeSucceededFuture(())
-      } catch { return eventLoop.makeFailedFuture(error) }
-    }.map {
-      guard self.state != .closed else { return }
-      self.startupComplete = true
+        self.wireChannel = channel
+        return eventLoop.makeCompletedFuture {
+          guard 2 * 325 + 2 * self.earlyRemoteInput.readableBytes <= Self.maximumBufferedBytes
+          else {
+            throw MagentError.invalidOptions("SOCKS5 startup capacity reservation failed")
+          }
+          let startup = try self.wire?.start(handshake: target)
+          if let startup, startup.isEmpty || startup.count > 325 {
+            throw MagentError.invalidOptions("Wire exceeded its fixed startup capacity")
+          }
+          self.wireInitialized = true
+          let input = self.earlyRemoteInput
+          self.earlyRemoteInput = self.proxyChannel.allocator.buffer(capacity: 0)
+          try self.relayRemote(input)
+          try self.finishRemoteInput()
+          return startup
+        }.flatMap { startup -> EventLoopFuture<Void> in
+          if let startup { return channel.writeAndFlush(ByteBuffer(bytes: startup)) }
+          return eventLoop.makeSucceededFuture(())
+        }
+      }.map {
+        guard self.state != .closed else { return }
+        self.startupComplete = true
+      }
+      // 期限在 Wire 选定后覆盖连接和启动写，不能提前套用较短的 Core 默认值。
+      let deadline = eventLoop.scheduleTask(in: .milliseconds(timeout)) {
+        self.fail(MagentError.channelConnectionTimedOut)
+      }
+      established.whenComplete { _ in deadline.cancel() }
+      self.proxyChannel.closeFuture.whenComplete { _ in deadline.cancel() }
+      return established
     }
   }
 
-  /// 两个 Channel 和 DNS client 逐个归当前 owner；后续失败由 fail 触发同一个清理入口。
+  /// 规范化来源提示后保存唯一 UDP owner；装配失败只经返回 Future 到统一失败边界。
   private func openAssociation(hint: SocketAddress) -> EventLoopFuture<SocketAddress> {
     let eventLoop = proxyChannel.eventLoop
-    let localIP: String
-    let v4Bind: SocketAddress
-    let v6Bind: SocketAddress
-    do {
-      guard let local = proxyChannel.localAddress, case .v4 = local,
+    return eventLoop.makeCompletedFuture {
+      guard let local = self.proxyChannel.localAddress, case .v4 = local,
         let host = local.ipAddress, host != "0.0.0.0",
-        let peer = proxyChannel.remoteAddress, case .v4 = peer, let peerIP = peer.ipAddress,
+        let peer = self.proxyChannel.remoteAddress, case .v4 = peer, let peerIP = peer.ipAddress,
         let hintIP = hint.ipAddress, let hintPort = hint.port
       else {
         throw MagentError.invalidAddress("SOCKS5 UDP requires a concrete IPv4 control endpoint")
       }
-      // parseHandshake 已通过模型将 mapped IPv6 hint 归一为 IPv4；零 IPv6 hint 同样允许。
       guard hintIP == "0.0.0.0" || hintIP == "::" || hintIP == peerIP else {
         throw MagentError.invalidAddress("SOCKS5 UDP source hint differs from the TCP peer")
       }
-      localIP = host
-      sourceHint = try SocketAddress(ipAddress: peerIP, port: hintPort)
-      v4Bind = try SocketAddress(ipAddress: "0.0.0.0", port: 0)
-      v6Bind = try SocketAddress(ipAddress: "::", port: 0)
-    } catch { return eventLoop.makeFailedFuture(error) }
-    return core.createUDPClientChannel(
-      eventLoop: eventLoop, address: v4Bind, handler: DatagramHandler(owner: self)
-    ).flatMap { channel -> EventLoopFuture<Channel> in
-      guard self.state != .closed, self.proxyChannel.isActive else {
-        channel.close(promise: nil)
-        return eventLoop.makeFailedFuture(MagentError.connectionClosed)
-      }
-      self.udpV4Channel = channel
-      return self.core.createUDPClientChannel(
-        eventLoop: eventLoop, address: v6Bind, handler: DatagramHandler(owner: self))
-    }.flatMap { channel -> EventLoopFuture<Void> in
-      guard self.state != .closed, self.proxyChannel.isActive else {
-        channel.close(promise: nil)
-        return eventLoop.makeFailedFuture(MagentError.connectionClosed)
-      }
-      self.udpV6Channel = channel
-      guard let dnsAddress = self.dnsAddress else { return eventLoop.makeSucceededFuture(()) }
-      return DNSClient.connect(on: eventLoop, config: [dnsAddress]).flatMapThrowing { client in
-        guard self.state != .closed, self.proxyChannel.isActive else {
-          _ = client.close()
-          throw MagentError.connectionClosed
-        }
-        self.dnsClient = client
-      }
-    }.flatMapThrowing {
-      guard self.state != .closed, let port = self.udpV4Channel?.localAddress?.port, port > 0 else {
-        throw MagentError.connectionClosed
-      }
-      return try SocketAddress(ipAddress: localIP, port: port)
+      let connection = Socks5UDPConnection(
+        owner: self, hint: try SocketAddress(ipAddress: peerIP, port: hintPort))
+      self.udpConnection = connection
+      return connection
+    }.flatMap { connection in
+      connection.openAssociation(dnsAddress: self.dnsAddress)
     }
   }
 
@@ -494,27 +483,42 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
   private func relayClient(_ data: ByteBuffer) throws {
     guard state == .tcpRelay, startupComplete, let channel = wireChannel else { return }
     if data.readableBytes > 0 {
-      guard !wireOutputEnded, !remoteChannelInactive,
-        data.readableBytes <= Self.maximumBufferedBytes - pendingClientBytes
-      else { throw MagentError.connectionClosed }
-      // TODO: 与具体 Wire 的固定输入/最坏输出上界一起完成调用前容量预留；不新增预算接口。
-      let output =
-        try wire?.encodeOutbound(Data(data.readableBytesView), address: nil)
-        ?? Data(data.readableBytesView)
-      guard output.count <= Self.maximumBufferedBytes - pendingClientBytes else {
-        throw MagentError.invalidOptions("SOCKS5 outbound buffer limit exceeded")
+      guard !wireOutputEnded, !remoteChannelInactive else { throw MagentError.connectionClosed }
+      let count = data.readableBytes
+      guard count <= 64 * 1024 else {
+        throw MagentError.invalidOptions("SOCKS5 client read exceeds 64 KiB")
       }
+      let chunks = (count + 16 * 1024 - 1) / (16 * 1024)
+      let maximumOutput = wire == nil ? count : chunks * 16_452
+      // 整批预留输入、一个分片副本、编码结果和 I/O 副本，再逐个 16 KiB 调用 Wire。
+      guard
+        count + min(count, 16 * 1024) + 2 * maximumOutput
+          <= Self.maximumBufferedBytes - 2 * pendingClientBytes
+      else { throw MagentError.invalidOptions("SOCKS5 outbound capacity reservation failed") }
+      var input = data
+      var output = proxyChannel.allocator.buffer(capacity: maximumOutput)
+      while input.readableBytes > 0 {
+        let part = input.readSlice(length: min(input.readableBytes, 16 * 1024))!
+        let plain = Data(part.readableBytesView)
+        let encoded = try wire?.encodeOutbound(plain, address: nil) ?? plain
+        guard encoded.count <= 16_452 else {
+          throw MagentError.invalidOptions("Wire exceeded its fixed encode capacity")
+        }
+        output.writeBytes(encoded)
+      }
+      let outputCount = output.readableBytes
       pendingClientWrites += 1
-      pendingClientBytes += output.count
-      channel.writeAndFlush(ByteBuffer(bytes: output)).whenComplete { result in
+      pendingClientBytes += outputCount
+      channel.writeAndFlush(output).whenComplete { result in
         guard self.state != .closed else { return }
         self.pendingClientWrites -= 1
-        self.pendingClientBytes -= output.count
+        self.pendingClientBytes -= outputCount
         switch result {
         case .success:
-          do { try self.relayClient(self.proxyChannel.allocator.buffer(capacity: 0)) } catch {
-            self.fail(error)
-          }
+          do {
+            try self.relayClient(self.proxyChannel.allocator.buffer(capacity: 0))
+            try self.finishRemoteInput()
+          } catch { self.fail(error) }
         case .failure(let error): self.fail(error)
         }
       }
@@ -526,6 +530,9 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
       return
     }
     if proxyInputEnded {
+      // 两个输入都结束时，NIO 的第二次半关闭可能升级为全关闭；先排空反向写。
+      guard !remoteInputEnded || (pendingRemoteWrites == 0 && pendingRemoteInput.readableBytes == 0)
+      else { return }
       guard !wireOutputEnded else { return }
       wireOutputEnded = true
       channel.close(mode: .output).whenComplete { result in
@@ -545,7 +552,7 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
   private func relayRemote(_ data: ByteBuffer) throws {
     guard state != .closed else { return }
     if !wireInitialized {
-      guard data.readableBytes <= Self.maximumBufferedBytes - earlyRemoteInput.readableBytes else {
+      guard data.readableBytes <= 64 * 1024 - earlyRemoteInput.readableBytes else {
         throw MagentError.invalidOptions("SOCKS5 early remote input limit exceeded")
       }
       var input = data
@@ -553,21 +560,28 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
       return
     }
     if data.readableBytes > 0 {
-      guard !remoteInputChecked,
-        data.readableBytes <= Self.maximumBufferedBytes - pendingRemoteBytes
-          - pendingRemoteInput.readableBytes
-      else { throw MagentError.invalidOptions("SOCKS5 remote input limit exceeded") }
-      // TODO: 具体 Wire 尚未声明固定最坏解码返回值；此处只有结果与 owner 队列限额检查。
-      let output =
-        try wire?.decodeInbound(Data(data.readableBytesView)).data
-        ?? Data(data.readableBytesView)
-      guard
-        output.count <= Self.maximumBufferedBytes - pendingRemoteBytes
-          - pendingRemoteInput.readableBytes
-      else {
-        throw MagentError.invalidOptions("SOCKS5 decoded output limit exceeded")
+      let count = data.readableBytes
+      guard !remoteInputChecked, count <= 64 * 1024 else {
+        throw MagentError.invalidOptions("SOCKS5 remote read exceeds its limit")
       }
-      pendingRemoteInput.writeBytes(output)
+      // 解码结果还可能释放上次保留的一个 16383 字节帧，不能只按本批输入估计。
+      let maximumOutput = wire == nil ? count : count + 16_383
+      guard
+        count + min(count, 16 * 1024) + 2 * maximumOutput
+          <= Self.maximumBufferedBytes - 2 * pendingRemoteBytes - 2
+          * pendingRemoteInput.readableBytes
+      else { throw MagentError.invalidOptions("SOCKS5 inbound capacity reservation failed") }
+      let buffered = pendingRemoteInput.readableBytes
+      var input = data
+      while input.readableBytes > 0 {
+        let part = input.readSlice(length: min(input.readableBytes, 16 * 1024))!
+        let encoded = Data(part.readableBytesView)
+        let decoded = try wire?.decodeInbound(encoded).data ?? encoded
+        guard decoded.count <= 32_768,
+          decoded.count <= maximumOutput - (pendingRemoteInput.readableBytes - buffered)
+        else { throw MagentError.invalidOptions("Wire exceeded its fixed decode capacity") }
+        pendingRemoteInput.writeBytes(decoded)
+      }
     }
     guard state == .tcpRelay, startupComplete else { return }
     if pendingRemoteInput.readableBytes > 0 {
@@ -601,7 +615,8 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
       try wire?.finishInbound()
     }
     guard state == .tcpRelay, startupComplete, pendingRemoteInput.readableBytes == 0,
-      pendingRemoteWrites == 0, !proxyOutputEnded
+      pendingRemoteWrites == 0, !proxyOutputEnded,
+      !proxyInputEnded || pendingClientWrites == 0
     else { return }
     proxyOutputEnded = true
     proxyChannel.close(mode: .output).whenComplete { result in
@@ -618,239 +633,6 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
   }
 
   // MARK: - Control-connection-owned UDP association
-
-  /// 单包最高边界：解析/编解码/容量失败丢包；路由、DNS 与不可用资源保留原始失败。
-  /// 三段分别处理来源和解码、路由和解析、登记和写入，保持规范要求的单一 future 生命周期。
-  private func handleDatagram(_ packet: AddressedEnvelope<ByteBuffer>, channel: Channel)
-    -> EventLoopFuture<Void>
-  {
-    let eventLoop = proxyChannel.eventLoop
-    guard state == .udpAssociated else { return eventLoop.makeSucceededFuture(()) }
-    guard packet.data.readableBytes <= Self.maximumDatagramBytes,
-      let hint = sourceHint, let sourcePort = packet.remoteAddress.port, sourcePort > 0
-    else { return eventLoop.makeSucceededFuture(()) }
-    let fromClient: Bool
-    if let udpClient {
-      fromClient = channel === udpV4Channel && packet.remoteAddress == udpClient
-    } else {
-      fromClient =
-        channel === udpV4Channel && packet.remoteAddress.ipAddress == hint.ipAddress
-        && (hint.port == 0 || hint.port == sourcePort)
-    }
-    if !fromClient {
-      guard let client = udpClient, let relay = udpV4Channel,
-        let entry = backendWires.index(forKey: packet.remoteAddress)
-      else { return eventLoop.makeSucceededFuture(()) }
-      let response: ByteBuffer
-      do {
-        if let selectedWire = backendWires[entry].value {
-          let decoded = try selectedWire.decodeInbound(Data(packet.data.readableBytesView))
-          response = try Self.encodeDatagram(
-            payload: ByteBuffer(bytes: decoded.data), source: decoded.address.address)
-        } else {
-          response = try Self.encodeDatagram(
-            payload: packet.data, source: .ip(packet.remoteAddress))
-        }
-      } catch { return eventLoop.makeSucceededFuture(()) }
-      return relay.writeAndFlush(AddressedEnvelope(remoteAddress: client, data: response))
-        .flatMapError { error in
-          // NIO 将底层报文过大错误统一为 ChannelError；只丢本包，关联继续服务。
-          if let channelError = error as? ChannelError, channelError == .writeMessageTooLarge {
-            return eventLoop.makeSucceededFuture(())
-          }
-          return eventLoop.makeFailedFuture(error)
-        }
-    }
-
-    let decoded: (target: NetworkAddress, payload: ByteBuffer)
-    do { decoded = try Self.decodeDatagram(packet.data) } catch {
-      return eventLoop.makeSucceededFuture(())
-    }
-    // 只有完整且合法的首个包才能占用来源；保留它的实际端点用于回包。
-    if udpClient == nil { udpClient = packet.remoteAddress }
-    let selectedWire: Wire?
-    do { selectedWire = try core.routeUDPWire(decoded.target) } catch {
-      return eventLoop.makeFailedFuture(error)
-    }
-    let payload: ByteBuffer
-    let endpoint: EventLoopFuture<SocketAddress>
-    if let selectedWire {
-      do {
-        let output = try selectedWire.encodeOutbound(
-          Data(decoded.payload.readableBytesView), address: decoded.target)
-        guard output.count <= Self.maximumDatagramBytes else {
-          return eventLoop.makeSucceededFuture(())
-        }
-        payload = ByteBuffer(bytes: output)
-      } catch { return eventLoop.makeSucceededFuture(()) }
-      endpoint = eventLoop.makeSucceededFuture(selectedWire.getEndpoint())
-    } else {
-      payload = decoded.payload
-      switch decoded.target.address {
-      case .ip(let address): endpoint = eventLoop.makeSucceededFuture(address)
-      case .domain(let host, let port):
-        if let cached = resolvedAddresses[decoded.target] {
-          endpoint = eventLoop.makeSucceededFuture(cached)
-        } else {
-          guard resolvedAddresses.count < Self.maximumAssociationRecords else {
-            return eventLoop.makeSucceededFuture(())
-          }
-          guard let dnsClient else {
-            return eventLoop.makeFailedFuture(
-              MagentError.invalidOptions("direct UDP domain target requires dnsListener"))
-          }
-          let timeout = TimeAmount.milliseconds(core.defaultTimeout)
-          let v4 = dnsClient.sendQuery(forHost: host, type: .a, timeout: timeout).flatMapThrowing {
-            message in
-            try message.answers.compactMap { answer -> SocketAddress? in
-              guard case .a(let record) = answer else { return nil }
-              return try SocketAddress(ipAddress: record.resource.stringAddress, port: Int(port))
-            }
-          }
-          let v6 = dnsClient.sendQuery(forHost: host, type: .aaaa, timeout: timeout).flatMapThrowing
-          { message in
-            try message.answers.compactMap { answer -> SocketAddress? in
-              guard case .aaaa(let record) = answer else { return nil }
-              return try SocketAddress(ipAddress: record.resource.stringAddress, port: Int(port))
-            }
-          }
-          endpoint = v4.and(v6).flatMapThrowing { v4Addresses, v6Addresses in
-            guard self.state == .udpAssociated else { throw MagentError.connectionClosed }
-            guard let address = v4Addresses.first ?? v6Addresses.first else {
-              throw MagentError.invalidAddress("DNS returned no address for the UDP target")
-            }
-            self.resolvedAddresses[decoded.target] = address
-            return address
-          }
-        }
-      }
-    }
-    return endpoint.flatMap { address -> EventLoopFuture<Void> in
-      guard self.state == .udpAssociated else { return eventLoop.makeSucceededFuture(()) }
-      // 节点保留实际地址族；仅比较方向身份时把 mapped IPv6 与 IPv4 客户端视为同一端点。
-      var isClientEndpoint = address == self.udpClient
-      if case .v6(let backend) = address, case .v4(let client)? = self.udpClient,
-        address.port == self.udpClient?.port
-      {
-        isClientEndpoint = withUnsafeBytes(of: backend.address.sin6_addr) { backendBytes in
-          withUnsafeBytes(of: client.address.sin_addr) { clientBytes in
-            backendBytes.prefix(10).allSatisfy { $0 == 0 }
-              && backendBytes[10] == 0xff && backendBytes[11] == 0xff
-              && backendBytes.suffix(4).elementsEqual(clientBytes)
-          }
-        }
-      }
-      guard !isClientEndpoint, let port = address.port, port > 0 else {
-        return eventLoop.makeSucceededFuture(())
-      }
-      if let entry = self.backendWires.index(forKey: address) {
-        switch (self.backendWires[entry].value, selectedWire) {
-        case (nil, nil): break
-        case (let previous?, let current?) where previous === current: break
-        default: return eventLoop.makeSucceededFuture(())
-        }
-      } else {
-        guard self.backendWires.count < Self.maximumAssociationRecords else {
-          return eventLoop.makeSucceededFuture(())
-        }
-        self.backendWires.updateValue(selectedWire, forKey: address)
-      }
-      let outbound: Channel?
-      switch address {
-      case .v4: outbound = self.udpV4Channel
-      case .v6: outbound = self.udpV6Channel
-      case .unixDomainSocket: return eventLoop.makeSucceededFuture(())
-      }
-      guard let outbound, outbound.isActive else {
-        return eventLoop.makeFailedFuture(MagentError.connectionClosed)
-      }
-      return outbound.writeAndFlush(AddressedEnvelope(remoteAddress: address, data: payload))
-    }.flatMapError { error in
-      // 使用 NIO 的传输错误，不在协议层读取系统 errno 或硬编码平台错误码。
-      if let channelError = error as? ChannelError, channelError == .writeMessageTooLarge {
-        return eventLoop.makeSucceededFuture(())
-      }
-      return eventLoop.makeFailedFuture(error)
-    }
-  }
-
-  /// UDP 保留完整包边界；与 TCP 解析的重复字段逻辑服务于不同的截断/端口/包级错误语义。
-  private static func decodeDatagram(_ data: ByteBuffer)
-    throws -> (target: NetworkAddress, payload: ByteBuffer)
-  {
-    var input = data
-    guard input.readableBytes <= maximumDatagramBytes,
-      input.readInteger(as: UInt16.self) == 0, input.readInteger(as: UInt8.self) == 0,
-      let atyp = input.readInteger(as: UInt8.self)
-    else { throw MagentError.malformedRequest("invalid or fragmented SOCKS5 UDP packet") }
-    let host: String
-    switch atyp {
-    case 0x01, 0x04:
-      guard let packed = input.readSlice(length: atyp == 0x01 ? 4 : 16) else {
-        throw MagentError.invalidAddress("truncated SOCKS5 UDP numeric address")
-      }
-      let socket = try SocketAddress(packedIPAddress: packed, port: 0)
-      guard let numericHost = socket.ipAddress else {
-        throw MagentError.invalidAddress("invalid UDP IP address")
-      }
-      host = numericHost
-    case 0x03:
-      guard let length = input.readInteger(as: UInt8.self), length > 0,
-        let bytes = input.readBytes(length: Int(length)),
-        let name = String(bytes: bytes, encoding: .ascii),
-        !name.contains(":")
-      else { throw MagentError.invalidAddress("invalid SOCKS5 UDP domain") }
-      host = name
-    default: throw MagentError.invalidAddress("unsupported SOCKS5 UDP address type")
-    }
-    guard let port = input.readInteger(as: UInt16.self), port > 0 else {
-      throw MagentError.invalidAddress("SOCKS5 UDP target port must be nonzero")
-    }
-    return (try NetworkAddress(host: host, port: port), input)
-  }
-
-  /// 回复头直接消费实际数值端点或 Wire 提供的逻辑域名；不解析 DNS 或重建逻辑目标。
-  private static func encodeDatagram(payload: ByteBuffer, source: NetworkAddress.Address) throws
-    -> ByteBuffer
-  {
-    var output = ByteBuffer(bytes: [0x00, 0x00, 0x00])
-    let port: UInt16
-    switch source {
-    case .domain(let host, let domainPort):
-      let bytes = Array(host.utf8)
-      guard !bytes.isEmpty, bytes.count <= 255, bytes.allSatisfy({ $0 < 128 }), domainPort > 0
-      else {
-        throw MagentError.invalidAddress("invalid SOCKS5 UDP response domain")
-      }
-      port = domainPort
-      output.writeInteger(UInt8(0x03))
-      output.writeInteger(UInt8(bytes.count))
-      output.writeBytes(bytes)
-    case .ip(let socket):
-      guard let value = socket.port, let numericPort = UInt16(exactly: value), numericPort > 0
-      else {
-        throw MagentError.invalidAddress("invalid SOCKS5 UDP response port")
-      }
-      port = numericPort
-      switch socket {
-      case .v4(let address):
-        output.writeInteger(UInt8(0x01))
-        withUnsafeBytes(of: address.address.sin_addr) { output.writeBytes($0) }
-      case .v6(let address):
-        output.writeInteger(UInt8(0x04))
-        withUnsafeBytes(of: address.address.sin6_addr) { output.writeBytes($0) }
-      case .unixDomainSocket:
-        throw MagentError.invalidAddress("SOCKS5 UDP response source must be numeric")
-      }
-    }
-    output.writeInteger(port)
-    guard payload.readableBytes <= maximumDatagramBytes - output.readableBytes else {
-      throw MagentError.malformedRequest("SOCKS5 UDP response exceeds the packet limit")
-    }
-    var payload = payload
-    output.writeBuffer(&payload)
-    return output
-  }
 
   /// 固定首因与本阶段回复资格；清理后的重复错误不会产生第二个回复或递归关闭。
   private func fail(_ error: Error) {
@@ -878,51 +660,402 @@ internal final class Socks5Connection: ChannelInboundHandler, ProxyConnection, @
     }
     let completion =
       response.map { writeReply($0) } ?? proxyChannel.eventLoop.makeSucceededFuture(())
+    // 尽力失败回复也有有限寿命；超时仍报告原始错误，不改写首因。
+    let deadline = proxyChannel.eventLoop.scheduleTask(in: .milliseconds(core.defaultTimeout)) {
+      guard !self.didCleanUp, !self.errorReported else { return }
+      self.errorReported = true
+      self.proxyChannel.pipeline.fireErrorCaught(error)
+    }
+    proxyChannel.closeFuture.whenComplete { _ in deadline.cancel() }
     completion.whenComplete { _ in
-      guard !self.didCleanUp else { return }
-      // 回复写失败不覆盖首次错误；accepted owner 收到原始错误后调用 closeConnection。
+      deadline.cancel()
+      guard !self.didCleanUp, !self.errorReported else { return }
+      self.errorReported = true
       self.proxyChannel.pipeline.fireErrorCaught(error)
     }
   }
 
-  /// 只适配现有 UDP Channel；资源、路由和生命周期都保存在控制连接 owner。
-  private final class DatagramHandler: ChannelInboundHandler, @unchecked Sendable {
+  /// 一条控制 TCP 专属的 UDP 关联。父对象持有它；Channel 回调不能延长父对象寿命。
+  private final class Socks5UDPConnection: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = AddressedEnvelope<ByteBuffer>
-    private weak var owner: Socks5Connection?
 
-    /// Channel 不延长控制连接寿命；资源归属与关联状态只保留在 owner。
-    init(owner: Socks5Connection) {
-      self.owner = owner
+    private enum State {
+      case preparing
+      case ready
+      case awaitingClient
+      case forwarding
+      case closed
     }
 
-    /// 当前包的 DNS 和写入 future 完成后才续读，避免为同一 Channel 堆积无界操作。
+    private weak var owner: Socks5Connection?
+    private let core: MagentCore
+    private var state: State = .preparing
+    private var ipv4Channel: Channel? = nil
+    private var ipv6Channel: Channel? = nil
+    private var dnsClient: DNSClient? = nil
+    private var clientEndpoint: SocketAddress
+    private var backendWires: [SocketAddress: Wire?] = [:]
+
+    /// hint 已与控制对端比较并规范化；尚未观测客户端，不进行网络操作。
+    init(owner: Socks5Connection, hint: SocketAddress) {
+      self.owner = owner
+      self.core = owner.core
+      self.clientEndpoint = hint
+    }
+
+    /// 父对象保存子对象后立即调用一次；两次 bind 和可选 DNS 都成功才允许回复 BND。
+    func openAssociation(dnsAddress: SocketAddress?) -> EventLoopFuture<SocketAddress> {
+      // 只有强持有本子对象的父对象能开始装配；异步链随后仅依赖控制 Channel 局部引用。
+      guard let owner else {
+        preconditionFailure("The parent must own the association while beginning setup")
+      }
+      let control = owner.proxyChannel
+      let eventLoop = control.eventLoop
+      guard let localIP = control.localAddress?.ipAddress else {
+        return eventLoop.makeFailedFuture(MagentError.connectionClosed)
+      }
+      let addresses = eventLoop.makeCompletedFuture {
+        (
+          try SocketAddress(ipAddress: "0.0.0.0", port: 0),
+          try SocketAddress(ipAddress: "::", port: 0)
+        )
+      }
+      return addresses.flatMap { ipv4, ipv6 -> EventLoopFuture<SocketAddress> in
+        // 在首次 bind 前也检查终态，不能仅依赖 bind 返回后的迟到资源回收。
+        guard self.state == .preparing, control.isActive else {
+          return eventLoop.makeFailedFuture(MagentError.connectionClosed)
+        }
+        return self.core.createUDPClientChannel(eventLoop: eventLoop, address: ipv4, handler: self)
+          .flatMap { channel -> EventLoopFuture<Channel> in
+            guard self.state == .preparing, control.isActive else {
+              channel.close(promise: nil)
+              return eventLoop.makeFailedFuture(MagentError.connectionClosed)
+            }
+            self.ipv4Channel = channel
+            return self.core.createUDPClientChannel(
+              eventLoop: eventLoop, address: ipv6, handler: self)
+          }.flatMap { channel -> EventLoopFuture<Void> in
+            guard self.state == .preparing, control.isActive else {
+              channel.close(promise: nil)
+              return eventLoop.makeFailedFuture(MagentError.connectionClosed)
+            }
+            self.ipv6Channel = channel
+            guard let dnsAddress else { return eventLoop.makeSucceededFuture(()) }
+            return DNSClient.connect(on: eventLoop, config: [dnsAddress]).flatMapThrowing {
+              client in
+              guard self.state == .preparing, control.isActive else {
+                _ = client.close()
+                throw MagentError.connectionClosed
+              }
+              self.dnsClient = client
+            }
+          }.flatMapThrowing {
+            guard self.state == .preparing, let port = self.ipv4Channel?.localAddress?.port,
+              port > 0
+            else { throw MagentError.connectionClosed }
+            let bound = try SocketAddress(ipAddress: localIP, port: port)
+            self.state = .ready
+            return bound
+          }
+      }.flatMapError { error in
+        // 装配错误只通过 Future 返回父对象，避免同时 owner.fail 导致双重上报。
+        self.closeConnection()
+        return eventLoop.makeFailedFuture(error)
+      }
+    }
+
+    /// 完整 ASSOCIATE 成功回复写成后调用一次；资源就绪本身不授予读许可。
+    func activate() {
+      guard state == .ready else { return }
+      state = .awaitingClient
+      ipv4Channel?.read()
+      ipv6Channel?.read()
+    }
+
+    /// 先封闭状态并移除持有关系，再提交资源关闭；回调重入不再次通知父对象。
+    func closeConnection() {
+      guard state != .closed else { return }
+      state = .closed
+      let ipv4 = ipv4Channel
+      let ipv6 = ipv6Channel
+      let client = dnsClient
+      ipv4Channel = nil
+      ipv6Channel = nil
+      dnsClient = nil
+      backendWires.removeAll()
+      ipv4?.close(promise: nil)
+      ipv6?.close(promise: nil)
+      _ = client?.close()
+    }
+
+    /// 当前包的 DNS 和写 Future 完成后才续读，避免为一个 Channel 堆积操作。
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-      guard let owner, owner.state == .udpAssociated else { return }
-      // TODO: 通过 NIO 通用接口识别数据报截断；仅凭接收长度等于容量不能证明包完整。
+      guard state == .awaitingClient || state == .forwarding else { return }
+      // Core 的 65535 字节接收缓冲大于 65507 协议上限；超大包在解析前丢弃。
       let channel = context.channel
-      owner.handleDatagram(unwrapInboundIn(data), channel: channel).whenComplete { result in
-        guard owner.state == .udpAssociated else { return }
+      handleDatagram(unwrapInboundIn(data), channel: channel).whenComplete { result in
+        guard self.state == .awaitingClient || self.state == .forwarding else { return }
         switch result {
         case .success: if channel.isActive { channel.read() }
-        case .failure(let error): owner.fail(error)
+        case .failure(let error):
+          self.closeConnection()
+          self.owner?.fail(error)
         }
       }
     }
 
-    /// 非清理期间的资源失效会终结关联；owner 已关闭时只继续传播事件。
+    /// 活动资源意外失效结束所属关联；正常清理回调不反向报告错误。
     func channelInactive(context: ChannelHandlerContext) {
-      if let owner, owner.state != .closed { owner.fail(MagentError.connectionClosed) }
+      if state != .closed {
+        closeConnection()
+        // 独立资源失效即刻终结；装配链后续失败由父终态去重，不继续等待其他资源。
+        owner?.fail(MagentError.connectionClosed)
+      }
       context.fireChannelInactive()
     }
 
-    /// 报文过大只丢当前包并续读；其他资源错误交控制连接的统一失败边界。
+    /// 报文过大仅丢包，其余不可恢复错误先封闭关联再保留原始错误通知父对象。
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-      guard let owner, owner.state != .closed else { return }
+      guard state != .closed else { return }
       if let channelError = error as? ChannelError, channelError == .writeMessageTooLarge {
-        if owner.state == .udpAssociated { context.read() }
+        if state == .awaitingClient || state == .forwarding { context.read() }
       } else {
-        owner.fail(error)
+        closeConnection()
+        // 即使其他 bind/DNS 仍在途，也先保存独立资源回调的真实首因。
+        owner?.fail(error)
       }
+    }
+
+    /// 单包最高边界：解析/编解码/容量失败丢包；路由、DNS 与不可用资源保留原始失败。
+    /// 三段分别处理来源和解码、路由和解析、登记和写入，保持规范要求的单一 future 生命周期。
+    private func handleDatagram(_ packet: AddressedEnvelope<ByteBuffer>, channel: Channel)
+      -> EventLoopFuture<Void>
+    {
+      let eventLoop = channel.eventLoop
+      guard state == .awaitingClient || state == .forwarding else {
+        return eventLoop.makeSucceededFuture(())
+      }
+      guard packet.data.readableBytes <= 65_507,
+        let sourcePort = packet.remoteAddress.port, sourcePort > 0
+      else { return eventLoop.makeSucceededFuture(()) }
+      let fromClient: Bool
+      if state == .forwarding {
+        fromClient = channel === ipv4Channel && packet.remoteAddress == clientEndpoint
+      } else {
+        fromClient =
+          channel === ipv4Channel && packet.remoteAddress.ipAddress == clientEndpoint.ipAddress
+          && (clientEndpoint.port == 0 || clientEndpoint.port == sourcePort)
+      }
+      if !fromClient {
+        guard state == .forwarding, let relay = ipv4Channel,
+          let entry = backendWires.index(forKey: packet.remoteAddress)
+        else { return eventLoop.makeSucceededFuture(()) }
+        let response: ByteBuffer
+        do {
+          if let selectedWire = backendWires[entry].value {
+            let decoded = try selectedWire.decodeInbound(Data(packet.data.readableBytesView))
+            response = try Self.encodeDatagram(
+              payload: ByteBuffer(bytes: decoded.data), source: decoded.address.address)
+          } else {
+            response = try Self.encodeDatagram(
+              payload: packet.data, source: .ip(packet.remoteAddress))
+          }
+        } catch { return eventLoop.makeSucceededFuture(()) }
+        return relay.writeAndFlush(AddressedEnvelope(remoteAddress: clientEndpoint, data: response))
+          .flatMapError { error in
+            // NIO 将底层报文过大错误统一为 ChannelError；只丢本包，关联继续服务。
+            if let channelError = error as? ChannelError, channelError == .writeMessageTooLarge {
+              return eventLoop.makeSucceededFuture(())
+            }
+            return eventLoop.makeFailedFuture(error)
+          }
+      }
+
+      let decoded: (target: NetworkAddress, payload: ByteBuffer)
+      do { decoded = try Self.decodeDatagram(packet.data) } catch {
+        return eventLoop.makeSucceededFuture(())
+      }
+      // 只有完整且合法的首个包才能占用来源；保留它的实际端点用于回包。
+      if state == .awaitingClient {
+        clientEndpoint = packet.remoteAddress
+        state = .forwarding
+      }
+      let selectedWire: Wire?
+      do { selectedWire = try core.routeUDPWire(decoded.target) } catch {
+        return eventLoop.makeFailedFuture(error)
+      }
+      let payload: ByteBuffer
+      let endpoint: EventLoopFuture<SocketAddress>
+      if let selectedWire {
+        do {
+          let output = try selectedWire.encodeOutbound(
+            Data(decoded.payload.readableBytesView), address: decoded.target)
+          guard output.count <= 65_507 else {
+            return eventLoop.makeSucceededFuture(())
+          }
+          payload = ByteBuffer(bytes: output)
+        } catch { return eventLoop.makeSucceededFuture(()) }
+        endpoint = eventLoop.makeSucceededFuture(selectedWire.getEndpoint())
+      } else {
+        payload = decoded.payload
+        switch decoded.target.address {
+        case .ip(let address): endpoint = eventLoop.makeSucceededFuture(address)
+        case .domain(let host, let port):
+          guard let dnsClient else {
+            return eventLoop.makeFailedFuture(
+              MagentError.invalidOptions("direct UDP domain target requires dnsListener"))
+          }
+          let timeout = TimeAmount.milliseconds(core.defaultTimeout)
+          let v4 = dnsClient.sendQuery(forHost: host, type: .a, timeout: timeout).flatMapThrowing {
+            message in
+            try message.answers.compactMap { answer -> SocketAddress? in
+              guard case .a(let record) = answer else { return nil }
+              return try SocketAddress(ipAddress: record.resource.stringAddress, port: Int(port))
+            }
+          }
+          let v6 = dnsClient.sendQuery(forHost: host, type: .aaaa, timeout: timeout).flatMapThrowing
+          { message in
+            try message.answers.compactMap { answer -> SocketAddress? in
+              guard case .aaaa(let record) = answer else { return nil }
+              return try SocketAddress(ipAddress: record.resource.stringAddress, port: Int(port))
+            }
+          }
+          endpoint = v4.and(v6).flatMapThrowing { v4Addresses, v6Addresses in
+            guard self.state == .forwarding else { throw MagentError.connectionClosed }
+            guard let address = v4Addresses.first ?? v6Addresses.first else {
+              throw MagentError.invalidAddress("DNS returned no address for the UDP target")
+            }
+            return address
+          }
+        }
+      }
+      // Wire 仅在该 EventLoop 的单包完成链中使用，不把共享协议伪装成跨线程 Sendable。
+      let selectedWireOnLoop = NIOLoopBound(selectedWire, eventLoop: eventLoop)
+      return endpoint.flatMap { address -> EventLoopFuture<Void> in
+        guard self.state == .forwarding else { return eventLoop.makeSucceededFuture(()) }
+        // 节点保留实际地址族；仅比较方向身份时把 mapped IPv6 与 IPv4 客户端视为同一端点。
+        var isClientEndpoint = address == self.clientEndpoint
+        if case .v6(let backend) = address, case .v4(let client) = self.clientEndpoint,
+          address.port == self.clientEndpoint.port
+        {
+          isClientEndpoint = withUnsafeBytes(of: backend.address.sin6_addr) { backendBytes in
+            withUnsafeBytes(of: client.address.sin_addr) { clientBytes in
+              backendBytes.prefix(10).allSatisfy { $0 == 0 }
+                && backendBytes[10] == 0xff && backendBytes[11] == 0xff
+                && backendBytes.suffix(4).elementsEqual(clientBytes)
+            }
+          }
+        }
+        guard !isClientEndpoint, let port = address.port, port > 0 else {
+          return eventLoop.makeSucceededFuture(())
+        }
+        if let entry = self.backendWires.index(forKey: address) {
+          switch (self.backendWires[entry].value, selectedWireOnLoop.value) {
+          case (nil, nil): break
+          case (let previous?, let current?) where previous === current: break
+          default: return eventLoop.makeSucceededFuture(())
+          }
+        } else {
+          guard self.backendWires.count < 1_024 else {
+            return eventLoop.makeSucceededFuture(())
+          }
+          self.backendWires.updateValue(selectedWireOnLoop.value, forKey: address)
+        }
+        let outbound: Channel?
+        switch address {
+        case .v4: outbound = self.ipv4Channel
+        case .v6: outbound = self.ipv6Channel
+        case .unixDomainSocket: return eventLoop.makeSucceededFuture(())
+        }
+        guard let outbound, outbound.isActive else {
+          return eventLoop.makeFailedFuture(MagentError.connectionClosed)
+        }
+        return outbound.writeAndFlush(AddressedEnvelope(remoteAddress: address, data: payload))
+      }.flatMapError { error in
+        // 使用 NIO 的传输错误，不在协议层读取系统 errno 或硬编码平台错误码。
+        if let channelError = error as? ChannelError, channelError == .writeMessageTooLarge {
+          return eventLoop.makeSucceededFuture(())
+        }
+        return eventLoop.makeFailedFuture(error)
+      }
+    }
+
+    /// UDP 保留完整包边界；与 TCP 解析的重复字段逻辑服务于不同的截断/端口/包级错误语义。
+    private static func decodeDatagram(_ data: ByteBuffer)
+      throws -> (target: NetworkAddress, payload: ByteBuffer)
+    {
+      var input = data
+      guard input.readableBytes <= 65_507,
+        input.readInteger(as: UInt16.self) == 0, input.readInteger(as: UInt8.self) == 0,
+        let atyp = input.readInteger(as: UInt8.self)
+      else { throw MagentError.malformedRequest("invalid or fragmented SOCKS5 UDP packet") }
+      let host: String
+      switch atyp {
+      case 0x01, 0x04:
+        guard let packed = input.readSlice(length: atyp == 0x01 ? 4 : 16) else {
+          throw MagentError.invalidAddress("truncated SOCKS5 UDP numeric address")
+        }
+        let socket = try SocketAddress(packedIPAddress: packed, port: 0)
+        guard let numericHost = socket.ipAddress else {
+          throw MagentError.invalidAddress("invalid UDP IP address")
+        }
+        host = numericHost
+      case 0x03:
+        guard let length = input.readInteger(as: UInt8.self), length > 0,
+          let bytes = input.readBytes(length: Int(length)),
+          let name = String(bytes: bytes, encoding: .ascii),
+          !name.contains(":")
+        else { throw MagentError.invalidAddress("invalid SOCKS5 UDP domain") }
+        host = name
+      default: throw MagentError.invalidAddress("unsupported SOCKS5 UDP address type")
+      }
+      guard let port = input.readInteger(as: UInt16.self), port > 0 else {
+        throw MagentError.invalidAddress("SOCKS5 UDP target port must be nonzero")
+      }
+      return (try NetworkAddress(host: host, port: port), input)
+    }
+
+    /// 回复头直接消费实际数值端点或 Wire 提供的逻辑域名；不解析 DNS 或重建逻辑目标。
+    private static func encodeDatagram(payload: ByteBuffer, source: NetworkAddress.Address) throws
+      -> ByteBuffer
+    {
+      var output = ByteBuffer(bytes: [0x00, 0x00, 0x00])
+      let port: UInt16
+      switch source {
+      case .domain(let host, let domainPort):
+        let bytes = Array(host.utf8)
+        guard !bytes.isEmpty, bytes.count <= 255, bytes.allSatisfy({ $0 < 128 }), domainPort > 0
+        else {
+          throw MagentError.invalidAddress("invalid SOCKS5 UDP response domain")
+        }
+        port = domainPort
+        output.writeInteger(UInt8(0x03))
+        output.writeInteger(UInt8(bytes.count))
+        output.writeBytes(bytes)
+      case .ip(let socket):
+        guard let value = socket.port, let numericPort = UInt16(exactly: value), numericPort > 0
+        else {
+          throw MagentError.invalidAddress("invalid SOCKS5 UDP response port")
+        }
+        port = numericPort
+        switch socket {
+        case .v4(let address):
+          output.writeInteger(UInt8(0x01))
+          _ = withUnsafeBytes(of: address.address.sin_addr) { output.writeBytes($0) }
+        case .v6(let address):
+          output.writeInteger(UInt8(0x04))
+          _ = withUnsafeBytes(of: address.address.sin6_addr) { output.writeBytes($0) }
+        case .unixDomainSocket:
+          throw MagentError.invalidAddress("SOCKS5 UDP response source must be numeric")
+        }
+      }
+      output.writeInteger(port)
+      guard payload.readableBytes <= 65_507 - output.readableBytes else {
+        throw MagentError.malformedRequest("SOCKS5 UDP response exceeds the packet limit")
+      }
+      var payload = payload
+      output.writeBuffer(&payload)
+      return output
     }
   }
 }

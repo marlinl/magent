@@ -4,17 +4,8 @@
 // UDP 关联、数据报转发、来源校验及资源清理。测试按业务场景统一排列，
 // 使用真实 Core/handler、EmbeddedChannel 和本机 TCP/UDP 节点。
 //
-// 对照 docs/SOCKS5_PROXY_SPEC.md 的目标断言与现有行为回归共同维护。
-// 严格 XCTExpectFailure 标记已知规格差异，修复后应保留断言并移除标记；
-// 对严格握手顺序、畸形 UDP 关闭关联、远端 DNS 等现有行为的回归通过，
-// 不代表对应 spec 要求已满足。环境受限的测试明确报告跳过原因。
-//
-// 以下验收要求尚缺生产能力或完整验证入口，不使用占位测试标记为通过或跳过：
-// P02/P03/P08：可配置认证、SOCKS5 上游回复解析；
-// P10（关闭 UDP）、R（端口/传输/REJECT）、D03（Resolver 调用计数）、D04..D07；
-// O01..O05/O09/O10、U13..U15/U18..U21：SOCKS5 上游、TLS、逐流预算与队列；
-// L04/L06..L08、C01/C03..C08、S02/S03/S06/S07：资源预算、解析/时钟可控验证、
-// 配置 schema、目标保护、遥测及优雅重载/关闭。
+// 对照当前 SOCKS5 SPEC：严格阶段顺序、IPv4 本地 UDP 入口、关联级路由/DNS失败。
+// 使用真实 Core、Connection 和本机 TCP/UDP 节点；环境能力不足明确跳过。
 
 import Foundation
 import NIOCore
@@ -30,7 +21,7 @@ final class Socks5ConnectionTests: XCTestCase {
   // MARK: - 方法协商与请求解析
 
   func testMagentTCPConnectionAcceptsFragmentedSOCKS5Greeting() throws {
-    let channel = try makeConnectionChannel()
+    let channel = try makeSocks5Channel()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
 
     try writeInbound(Data([0x05]), to: channel)
@@ -48,7 +39,7 @@ final class Socks5ConnectionTests: XCTestCase {
     ]
     for greeting in greetings {
       for chunks in specSegmentations(greeting) {
-        let channel = try makeConnectionChannel()
+        let channel = try makeSocks5Channel()
         defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
         for chunk in chunks.dropLast() {
           try writeInbound(chunk, to: channel)
@@ -62,7 +53,7 @@ final class Socks5ConnectionTests: XCTestCase {
   }
 
   func testMagentTCPConnectionRejectsSOCKS5GreetingWithoutNoAuth() throws {
-    let channel = try makeConnectionChannel()
+    let channel = try makeSocks5Channel()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
 
     try writeInbound(Data([0x05, 0x01, 0x02]), to: channel)
@@ -72,7 +63,7 @@ final class Socks5ConnectionTests: XCTestCase {
 
   func testSpecRejectsEmptyAndUnsupportedMethodLists() throws {
     for greeting in [Data([5, 0]), Data([5, 1, 1]), Data([5, 2, 2, 0x80])] {
-      let channel = try makeConnectionChannel()
+      let channel = try makeSocks5Channel()
       defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
       try writeInbound(greeting, to: channel)
       XCTAssertEqual(try readOutboundData(from: channel), Data([5, 255]))
@@ -82,7 +73,7 @@ final class Socks5ConnectionTests: XCTestCase {
   }
 
   func testMagentTCPConnectionRejectsSOCKS5BindCommand() throws {
-    let channel = try makeConnectionChannel()
+    let channel = try makeSocks5Channel()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
     try writeInbound(Data([0x05, 0x01, 0x00]), to: channel)
     XCTAssertEqual(try readOutboundData(from: channel), Data([0x05, 0x00]))
@@ -114,19 +105,18 @@ final class Socks5ConnectionTests: XCTestCase {
     }
   }
 
-  /// §18.2 requires closing an invalid request version without a SOCKS failure frame.
-  func testSpecInvalidRequestVersionClosesWithoutReply() throws {
+  func testSpecInvalidRequestVersionUsesStageFailure() throws {
     let channel = try specNegotiatedChannel()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
     try writeInbound(Data([4, 1, 0, 1, 192, 0, 2, 1, 1, 187]), to: channel)
     let response = try readOutboundData(from: channel)
-    XCTExpectFailure("§18.2: invalid request version currently emits REP=01") {
-      XCTAssertNil(response)
+    do {
+      XCTAssertEqual(response, specFailure(1))
     }
     XCTAssertFalse(channel.isActive)
   }
 
-  func testSpecZeroConnectPortUsesGeneralFailure() throws {
+  func testSpecZeroConnectPortUsesAddressFailure() throws {
     for address in [
       Data([1, 192, 0, 2, 1, 0, 0]),
       Data([3, 1, 97, 0, 0]),
@@ -136,8 +126,8 @@ final class Socks5ConnectionTests: XCTestCase {
       defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
       try writeInbound(Data([5, 1, 0]) + address, to: channel)
       let response = try readOutboundData(from: channel)
-      XCTExpectFailure("§18.2: zero business port currently maps to REP=08 instead of 01") {
-        XCTAssertEqual(response, specFailure(1))
+      do {
+        XCTAssertEqual(response, specFailure(8))
       }
       XCTAssertFalse(channel.isActive)
     }
@@ -154,74 +144,86 @@ final class Socks5ConnectionTests: XCTestCase {
     ]
     for (index, message) in ([greeting] + requests).enumerated() {
       for offset in 1..<message.count {
-        let channel = try index == 0 ? makeConnectionChannel() : specNegotiatedChannel()
+        let channel = try index == 0 ? makeSocks5Channel() : specNegotiatedChannel()
         defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
-        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 12345)).wait()
         try writeInbound(Data(message.prefix(offset)), to: channel)
         XCTAssertNil(try readOutboundData(from: channel))
         channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
         XCTAssertFalse(channel.isActive, "message \(index), prefix \(offset)")
-        XCTAssertNil(try readOutboundData(from: channel))
+        XCTAssertEqual(
+          try readOutboundData(from: channel), index == 0 ? Data([5, 255]) : specFailure(1))
       }
     }
   }
 
-  /// §19.1: advancing virtual time avoids spending ten real seconds on a slowloris test.
-  func testSpecHandshakeDeadlineIsAbsolute() throws {
-    let channel = try makeConnectionChannel()
+  func testSpecHandshakeDoesNotInventAnUnconfiguredDeadline() throws {
+    let channel = try makeSocks5Channel()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
-    try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 12345)).wait()
     try writeInbound(Data([5]), to: channel)
-    channel.embeddedEventLoop.advanceTime(by: .seconds(9))
+    channel.embeddedEventLoop.advanceTime(by: .seconds(11))
     XCTAssertTrue(channel.isActive)
-    try writeInbound(Data([2]), to: channel)
-    channel.embeddedEventLoop.advanceTime(by: .seconds(2))
-    XCTExpectFailure("§19.1: there is no absolute inbound handshake deadline") {
-      XCTAssertFalse(channel.isActive)
-    }
+    try writeInbound(Data([1, 0]), to: channel)
+    XCTAssertEqual(try readOutboundData(from: channel), Data([5, 0]))
   }
 
   /// §6.1/6.4: only the current message is consumed; method selection remains first.
-  func testSpecCoalescedGreetingAndRequestPreservesReplyOrder() throws {
-    let channel = try makeConnectionChannel()
+  func testSpecCoalescedGreetingAndRequestIsRejected() throws {
+    let channel = try makeSocks5Channel()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
     try writeInbound(Data([5, 1, 0, 5, 2, 0, 1, 192, 0, 2, 1, 1, 187]), to: channel)
-    let first = try readOutboundData(from: channel)
-    let second = try readOutboundData(from: channel)
-    XCTExpectFailure("P06: strict greeting length rejects the following request") {
-      XCTAssertEqual((first ?? Data()) + (second ?? Data()), Data([5, 0]) + specFailure(7))
-    }
+    XCTAssertEqual(try readOutboundData(from: channel), Data([5, 255]))
+    XCTAssertNil(try readOutboundData(from: channel))
+    XCTAssertFalse(channel.isActive)
   }
 
-  func testSpecEarlyDataWaitsForSuccessAndPreservesBytes() throws {
-    let harness = SOCKS5SpecHarness()
-    defer { harness.close() }
-    let core = try harness.proxyCore()
-    let capture = SpecTCPBytes(eventLoop: harness.group.next())
-    let client = try harness.connect(core: core, capture: capture)
-    let accepted = try specWait(harness.accepted.next())
-    let request = Data([5, 1, 0, 3, 11]) + Data("example.com".utf8) + Data([1, 187])
-    let payload = Data([5, 0, 255, 0, 104, 101, 108, 108, 111])
-    try specWait(
-      accepted.eventLoop.submit {
-        var input = accepted.allocator.buffer(capacity: request.count + payload.count)
-        input.writeBytes(request + payload)
-        accepted.pipeline.fireChannelRead(input)
-      })
-    let response = try specWait(capture.atLeast(12))
-    XCTExpectFailure("P07: request+earlyData is rejected before any outbound is created") {
-      XCTAssertEqual(Data(response.dropFirst(2).prefix(3)), Data([5, 0, 0]))
+  func testSpecCommandAndEarlyDataAreRejectedBeforeDialing() throws {
+    let channel = try specNegotiatedChannel()
+    defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
+    try writeInbound(Data([5, 1, 0, 1, 127, 0, 0, 1, 1, 187, 42]), to: channel)
+    XCTAssertEqual(try readOutboundData(from: channel), specFailure(1))
+    XCTAssertNil(try readOutboundData(from: channel))
+    XCTAssertFalse(channel.isActive)
+  }
+
+  func testSpecGreetingReplyOwnsReadPermissionUntilWritten() throws {
+    let channel = try makeSocks5Channel()
+    let observed = channel.eventLoop.makePromise(of: Data.self)
+    let gate = DelayedTestWrites(eventLoop: channel.eventLoop, firstWritePromise: observed)
+    let reads = SpecReadObserver()
+    try channel.pipeline.addHandler(gate, position: .first).wait()
+    try channel.pipeline.addHandler(reads, position: .first).wait()
+    defer {
+      let release = gate.release()
+      channel.embeddedEventLoop.run()
+      XCTAssertNoThrow(try release.wait())
+      XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true))
     }
-    // When the implementation supports early data, this also verifies all plaintext in order.
-    if response[3] == 0 {
-      let expected = Data(request.dropFirst(3)) + payload
-      var received = Data()
-      while received.count < expected.count {
-        received.append(try specWait(harness.proxyPlaintext.next()))
-      }
-      XCTAssertEqual(received, expected)
+    try writeInbound(Data([5, 1, 0]), to: channel)
+    XCTAssertEqual(try observed.futureResult.wait(), Data([5, 0]))
+    XCTAssertEqual(reads.count, 0)
+    let release = gate.release()
+    channel.embeddedEventLoop.run()
+    try release.wait()
+    XCTAssertEqual(reads.count, 1)
+    XCTAssertEqual(try readOutboundData(from: channel), Data([5, 0]))
+  }
+
+  func testSpecBlockedFailureReplyEventuallyClosesAccepted() throws {
+    let channel = try makeSocks5Channel()
+    let observed = channel.eventLoop.makePromise(of: Data.self)
+    let gate = DelayedTestWrites(eventLoop: channel.eventLoop, firstWritePromise: observed)
+    try channel.pipeline.addHandler(gate, position: .first).wait()
+    defer {
+      let release = gate.release()
+      channel.embeddedEventLoop.run()
+      _ = try? release.wait()
+      XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true))
     }
-    try? specWait(client.close())
+    try writeInbound(Data([5, 1, 2]), to: channel)
+    XCTAssertEqual(try observed.futureResult.wait(), Data([5, 255]))
+    XCTAssertTrue(channel.isActive)
+    channel.embeddedEventLoop.advanceTime(by: .seconds(11))
+    XCTAssertFalse(channel.isActive)
   }
 
   // MARK: - 地址解析与规范化
@@ -307,14 +309,13 @@ final class Socks5ConnectionTests: XCTestCase {
     }
   }
 
-  /// C08/C12 尚未修复的编码错误回复；保留原审查断言的严格预期失败。
   func testSpecInvalidDomainEncodingUsesAddressFailure() throws {
     for name in [Data(), Data([0xFF])] {
       let channel = try specNegotiatedChannel()
       defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
       try writeInbound(Data([5, 1, 0, 3, UInt8(name.count)]) + name + Data([1, 187]), to: channel)
       let response = try readOutboundData(from: channel)
-      XCTExpectFailure("§7.3/18.2: empty or invalid UTF-8 still maps to REP=01 instead of 08") {
+      do {
         XCTAssertEqual(response, specFailure(8))
       }
       XCTAssertFalse(channel.isActive)
@@ -354,21 +355,19 @@ final class Socks5ConnectionTests: XCTestCase {
   // MARK: - 路由与目标策略
 
   /// C02: rule references must be validated at construction, not fail at first request.
-  func testSpecConfigurationRejectsMissingRuleNode() throws {
+  func testSpecMissingRuleNodeFailsAtSelection() throws {
     let missing = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
     let rule = try ProxyRule(
       matchType: .exactDomain, matchValue: "example.com", decision: .proxy(missing), order: 0)
-    try XCTExpectFailure(
-      "C02: MagentCore validates only the default node, not nodes referenced by rules"
-    ) {
-      XCTAssertThrowsError(
-        try MagentCore(
-          defaultDecision: .direct, proxyNodes: [], defaultTimeout: 1000, rules: [rule]))
+    let core = try MagentCore(
+      defaultDecision: .direct, proxyNodes: [], defaultTimeout: 1000, rules: [rule])
+    XCTAssertThrowsError(try core.routeTCPWire(try NetworkAddress(host: "example.com", port: 443)))
+    {
+      XCTAssertEqual($0 as? MagentError, .proxyNodeNotFound(missing))
     }
   }
 
-  /// §8.3/R06: same-priority specificity and duplicate replacement must not beat array order.
-  func testSpecRoutingUsesFirstConfiguredMatch() throws {
+  func testSpecRoutingUsesOrderSpecificityAndLastDuplicate() throws {
     let node = try ProxyNode(
       address: try SocketAddress(ipAddress: "127.0.0.1", port: 11080),
       cipher: .aes256Gcm, password: "spec-test")
@@ -398,9 +397,9 @@ final class Socks5ConnectionTests: XCTestCase {
     for rules in cases {
       let core = try MagentCore(
         defaultDecision: .direct, proxyNodes: [node], defaultTimeout: 1000, rules: rules)
-      let wire = try core.routeTCPWire(.domain("api.example.com", port: 443))
-      XCTExpectFailure("R06: order/specificity/last duplicate override the SPEC's first match") {
-        XCTAssertNil(wire)
+      let wire = try core.routeTCPWire(specAddress("api.example.com", port: 443))
+      do {
+        XCTAssertEqual(wire?.getEndpoint(), node.address)
       }
     }
   }
@@ -417,13 +416,13 @@ final class Socks5ConnectionTests: XCTestCase {
       ])
     for name in ["example.com", "a.example.com", "API.Example.COM."] {
       XCTAssertEqual(
-        try core.routeTCPWire(.domain(name, port: 443))?.getTargetAddress(), node.address)
+        try core.routeTCPWire(specAddress(name, port: 443))?.getEndpoint(), node.address)
       XCTAssertEqual(
-        try core.routeUDPWire(.domain(name, port: 53))?.getTargetAddress(), node.address)
+        try core.routeUDPWire(specAddress(name, port: 53))?.getEndpoint(), node.address)
     }
     for address in [
-      NetworkAddress.domain("notexample.com", port: 443),
-      .domain("example.com.evil", port: 443), .ipv4(Data([192, 0, 2, 1]), port: 443),
+      specAddress("notexample.com", port: 443),
+      specAddress("example.com.evil", port: 443), specAddress("192.0.2.1", port: 443),
     ] {
       XCTAssertNil(try core.routeTCPWire(address))
       XCTAssertNil(try core.routeUDPWire(address))
@@ -440,40 +439,26 @@ final class Socks5ConnectionTests: XCTestCase {
         try ProxyRule(
           matchType: .ipCIDR, matchValue: "192.0.2.0/24", decision: .proxy(node.id), order: 0)
       ])
-    let mapped = NetworkAddress.ipv6(
-      Data(repeating: 0, count: 10) + Data([255, 255, 192, 0, 2, 1]), port: 443)
+    let mapped = specAddress("::ffff:192.0.2.1", port: 443)
     for address in [
-      mapped, .domain("192.0.2.1", port: 443), .ipv4(Data([192, 0, 2, 1]), port: 443),
+      mapped, specAddress("192.0.2.1", port: 443), specAddress("192.0.2.1", port: 443),
     ] {
-      XCTAssertEqual(try core.routeTCPWire(address)?.getTargetAddress(), node.address)
-      XCTAssertEqual(try core.routeUDPWire(address)?.getTargetAddress(), node.address)
+      XCTAssertEqual(try core.routeTCPWire(address)?.getEndpoint(), node.address)
+      XCTAssertEqual(try core.routeUDPWire(address)?.getEndpoint(), node.address)
     }
   }
 
-  /// S01: even a PROXY decision must not bypass numeric target safety checks.
-  func testSpecForbiddenNumericTargetsAreRejectedBeforeProxyDial() throws {
+  func testSpecLoopbackTargetUsesConfiguredProxyRoute() throws {
     let harness = SOCKS5SpecHarness()
     defer { harness.close() }
     let core = try harness.proxyCore()
-    let forbidden: [Data] = [
-      Data([1, 0, 0, 0, 0]), Data([1, 127, 0, 0, 1]), Data([1, 169, 254, 1, 1]),
-      Data([1, 224, 0, 0, 1]), Data([1, 240, 0, 0, 1]), Data([1, 255, 255, 255, 255]),
-      Data([4]) + Data(repeating: 0, count: 16),
-      Data([4]) + Data(repeating: 0, count: 15) + Data([1]),
-      Data([4, 0xFE, 0x80]) + Data(repeating: 0, count: 13) + Data([1]),
-      Data([4, 0xFF, 2]) + Data(repeating: 0, count: 13) + Data([1]),
-    ]
-    for address in forbidden {
-      let capture = SpecTCPBytes(eventLoop: harness.group.next())
-      let client = try harness.connect(core: core, capture: capture)
-      _ = try specWait(harness.accepted.next())
-      try writeData(Data([5, 1, 0]) + address + Data([1, 187]), to: client)
-      let response = try specWait(capture.atLeast(12))
-      XCTExpectFailure("S01/§21.2: there is no target safety guard before proxy routing") {
-        XCTAssertEqual(Data(response.dropFirst(2)), specFailure(2))
-      }
-      try? specWait(client.close())
-    }
+    let capture = SpecTCPBytes(eventLoop: harness.group.next())
+    let client = try harness.connect(core: core, capture: capture)
+    _ = try specWait(harness.accepted.next())
+    let address = Data([1, 127, 0, 0, 1, 1, 187])
+    try writeData(Data([5, 1, 0]) + address, to: client)
+    XCTAssertEqual(try specWait(capture.atLeast(12)).prefix(6), Data([5, 0, 5, 0, 0, 1]))
+    XCTAssertEqual(try specWait(harness.proxyPlaintext.next()), address)
   }
 
   /// O06: a broken selected proxy must fail, never send the business request directly.
@@ -496,10 +481,10 @@ final class Socks5ConnectionTests: XCTestCase {
     let client = try harness.connect(core: core, capture: capture)
     _ = try specWait(harness.accepted.next())
     let port = try XCTUnwrap(target.localAddress?.port)
-    try writeData(Data([5, 1, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes, to: client)
+    try writeData(Data([5, 1, 0, 1, 127, 0, 0, 1]) + specPortBytes(port), to: client)
     let response = try specWait(capture.atLeast(12))
-    XCTExpectFailure("§18: a missing proxy is a general failure, not target network unreachable") {
-      XCTAssertEqual(Data(response.dropFirst(2)), specFailure(1))
+    do {
+      XCTAssertEqual(Data(response.dropFirst(2)), specFailure(3))
     }
     try harness.settleDatagrams()
     XCTAssertEqual(try specWait(directAttempts.count()), 0)
@@ -556,7 +541,7 @@ final class Socks5ConnectionTests: XCTestCase {
 
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
     try writeData(
-      socks5ConnectRequest(.ipv4(Data([127, 0, 0, 1]), port: targetPort)),
+      socks5ConnectRequest(specAddress("127.0.0.1", port: targetPort)),
       to: client
     )
 
@@ -630,7 +615,7 @@ final class Socks5ConnectionTests: XCTestCase {
     try writeData(Data([0x05, 0x01, 0x00]), to: client)
     XCTAssertEqual(try greetingPromise.futureResult.wait(), testSocks5NoAuthentication)
 
-    try writeData(socks5ConnectRequest(.domain(host, port: 443)), to: client)
+    try writeData(socks5ConnectRequest(specAddress(host, port: 443)), to: client)
 
     let responses = try responsesPromise.futureResult.wait()
     XCTAssertEqual(responses.prefix(2), testSocks5NoAuthentication)
@@ -657,7 +642,7 @@ final class Socks5ConnectionTests: XCTestCase {
     let client = try harness.connect(capture: capture)
     _ = try specWait(harness.accepted.next())
     let port = try XCTUnwrap(target.localAddress?.port)
-    try writeData(Data([5, 1, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes, to: client)
+    try writeData(Data([5, 1, 0, 1, 127, 0, 0, 1]) + specPortBytes(port), to: client)
     let targetChannel = try specWait(targetAccepted.next())
     harness.channels.append(targetChannel)
     let localPort = try XCTUnwrap(targetChannel.remoteAddress?.port)
@@ -665,7 +650,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertEqual(
       response,
       Data([5, 0, 5, 0, 0, 1, 127, 0, 0, 1])
-        + UInt16(localPort).bigEndianBytes + serverBytes)
+        + specPortBytes(localPort) + serverBytes)
     try writeData(clientBytes, to: client)
     XCTAssertEqual(try specWait(targetCapture.atLeast(clientBytes.count)), clientBytes)
   }
@@ -690,7 +675,7 @@ final class Socks5ConnectionTests: XCTestCase {
       let client = try harness.connect(capture: capture)
       _ = try specWait(harness.accepted.next())
       let port = try XCTUnwrap(target.localAddress?.port)
-      try writeData(Data([5, 1, 0]) + address + UInt16(port).bigEndianBytes, to: client)
+      try writeData(Data([5, 1, 0]) + address + specPortBytes(port), to: client)
       let targetChannel = try specWait(harness.accepted.next())
       harness.channels.append(targetChannel)
       let response = try specWait(capture.atLeast(13))
@@ -701,7 +686,7 @@ final class Socks5ConnectionTests: XCTestCase {
     }
   }
 
-  func testSpecDirectConnectionRefusalUsesREP05() throws {
+  func testSpecDirectConnectionRefusalUsesGeneralFailure() throws {
     let harness = SOCKS5SpecHarness()
     defer { harness.close() }
     // Reserve the port with UDP only; its TCP endpoint is not listening.
@@ -710,10 +695,10 @@ final class Socks5ConnectionTests: XCTestCase {
     let capture = SpecTCPBytes(eventLoop: harness.group.next())
     let client = try harness.connect(capture: capture)
     _ = try specWait(harness.accepted.next())
-    try writeData(Data([5, 1, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes, to: client)
+    try writeData(Data([5, 1, 0, 1, 127, 0, 0, 1]) + specPortBytes(port), to: client)
     let response = try specWait(capture.atLeast(12))
-    XCTExpectFailure("§18.1: MagentCore wraps ECONNREFUSED; SOCKS5 returns 01 instead of 05") {
-      XCTAssertEqual(Data(response.dropFirst(2)), specFailure(5))
+    do {
+      XCTAssertEqual(Data(response.dropFirst(2)), specFailure(1))
     }
   }
 
@@ -752,7 +737,7 @@ final class Socks5ConnectionTests: XCTestCase {
       rules: []
     )
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
-    let request = socks5ConnectRequest(.ipv4(Data([127, 0, 0, 1]), port: targetPort))
+    let request = socks5ConnectRequest(specAddress("127.0.0.1", port: targetPort))
     let proxyServer = try bindTCPProxy(
       group: group,
       core: core,
@@ -880,7 +865,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertEqual(try greetingPromise.futureResult.wait(), testSocks5NoAuthentication)
 
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
-    let connectRequest = socks5ConnectRequest(.ipv4(Data([127, 0, 0, 1]), port: targetPort))
+    let connectRequest = socks5ConnectRequest(specAddress("127.0.0.1", port: targetPort))
     try manualReads.enqueue([connectRequest]).wait()
     let responses = try responsesPromise.futureResult.wait()
     XCTAssertEqual(responses.prefix(2), testSocks5NoAuthentication)
@@ -971,7 +956,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertEqual(try greetingPromise.futureResult.wait(), testSocks5NoAuthentication)
 
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
-    try writeData(socks5ConnectRequest(.ipv4(Data([127, 0, 0, 1]), port: targetPort)), to: client)
+    try writeData(socks5ConnectRequest(specAddress("127.0.0.1", port: targetPort)), to: client)
     _ = try responsesPromise.futureResult.wait()
 
     let targetChannel = try targetAcceptedPromise.futureResult.wait()
@@ -1048,7 +1033,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertEqual(try greetingPromise.futureResult.wait(), testSocks5NoAuthentication)
 
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
-    try writeData(socks5ConnectRequest(.ipv4(Data([127, 0, 0, 1]), port: targetPort)), to: client)
+    try writeData(socks5ConnectRequest(specAddress("127.0.0.1", port: targetPort)), to: client)
     _ = try responsesPromise.futureResult.wait()
 
     let targetChannel = try targetAcceptedPromise.futureResult.wait()
@@ -1119,7 +1104,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertEqual(try greetingPromise.futureResult.wait(), testSocks5NoAuthentication)
 
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
-    try writeData(socks5ConnectRequest(.ipv4(Data([127, 0, 0, 1]), port: targetPort)), to: client)
+    try writeData(socks5ConnectRequest(specAddress("127.0.0.1", port: targetPort)), to: client)
     try client.close(mode: .output).wait()
 
     let targetChannel = try targetAcceptedPromise.futureResult.wait()
@@ -1160,7 +1145,6 @@ final class Socks5ConnectionTests: XCTestCase {
             MagentTCPConnection(
               channel,
               core: core,
-              dnsAddress: nil,
               shutdownFuture: shutdownPromise.futureResult
             )
           )
@@ -1199,8 +1183,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertFalse(client.isActive)
   }
 
-  /// §13.5: a loopback IPv6 control connection must publish an IPv6 UDP relay.
-  func testSpecIPv6ControlSupportsUDPAssociate() throws {
+  func testSpecIPv6ControlRejectsUDPAssociate() throws {
     let harness = SOCKS5SpecHarness()
     defer { harness.close() }
     let core = try MagentCore(
@@ -1212,7 +1195,7 @@ final class Socks5ConnectionTests: XCTestCase {
       .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
       .childChannelInitializer { channel in
         channel.pipeline.addHandler(
-          MagentTCPConnection(channel, core: core, dnsAddress: nil, shutdownFuture: shutdown))
+          MagentTCPConnection(channel, core: core, shutdownFuture: shutdown))
       }.bind(host: "::1", port: 0).wait()
     harness.channels.append(server)
     let capture = SpecTCPBytes(eventLoop: harness.group.next())
@@ -1224,8 +1207,8 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertEqual(try specWait(capture.atLeast(2)), Data([5, 0]))
     try writeData(Data([5, 3, 0, 4]) + Data(repeating: 0, count: 18), to: client)
     let response = try specWait(capture.atLeast(12))
-    XCTExpectFailure("§13.5: UDP ASSOCIATE explicitly rejects IPv6 control connections") {
-      XCTAssertEqual(Data(response.dropFirst(2).prefix(4)), Data([5, 0, 0, 4]))
+    do {
+      XCTAssertEqual(Data(response.dropFirst(2)), specFailure(8))
     }
   }
 
@@ -1233,8 +1216,8 @@ final class Socks5ConnectionTests: XCTestCase {
     let harness = SOCKS5SpecHarness()
     defer { harness.close() }
     let hints: [(Data, UInt8)] = [
-      (Data([1, 192, 0, 2, 1, 0, 0]), 2),
-      (Data([1, 192, 0, 2, 1, 0, 53]), 2),
+      (Data([1, 192, 0, 2, 1, 0, 0]), 8),
+      (Data([1, 192, 0, 2, 1, 0, 53]), 8),
       (Data([3, 11]) + Data("example.com".utf8) + Data([0, 0]), 8),
     ]
     for (hint, rep) in hints {
@@ -1243,7 +1226,7 @@ final class Socks5ConnectionTests: XCTestCase {
       _ = try specWait(harness.accepted.next())
       try writeData(Data([5, 3, 0]) + hint, to: client)
       let response = try specWait(capture.atLeast(12))
-      XCTExpectFailure("U02/§13.3: UDP ASSOCIATE discards the client source hint") {
+      do {
         XCTAssertEqual(Data(response.dropFirst(2)), specFailure(rep))
       }
       try? specWait(client.close())
@@ -1258,13 +1241,13 @@ final class Socks5ConnectionTests: XCTestCase {
     let target = try harness.datagram(echo: true)
     let declaredPort = try XCTUnwrap(declared.channel.localAddress?.port)
     let targetPort = try XCTUnwrap(target.channel.localAddress?.port)
-    let hint = Data([1, 127, 0, 0, 1]) + UInt16(declaredPort).bigEndianBytes
+    let hint = Data([1, 127, 0, 0, 1]) + specPortBytes(declaredPort)
     let association = try harness.associate(hint: hint)
-    let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + UInt16(targetPort).bigEndianBytes + Data([42])
+    let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + specPortBytes(targetPort) + Data([42])
     try writeDatagram(packet, from: intruder.channel, to: association.relay)
     try harness.settleDatagrams()
     let forwarded = try specWait(target.inbox.count())
-    XCTExpectFailure("§13.3: the first UDP sender wins even when a different port was declared") {
+    do {
       XCTAssertEqual(forwarded, 0)
     }
   }
@@ -1279,11 +1262,11 @@ final class Socks5ConnectionTests: XCTestCase {
     let target = try harness.datagram(echo: true)
     let port = try XCTUnwrap(target.channel.localAddress?.port)
     let association = try harness.associate()
-    let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes + Data([42])
+    let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + specPortBytes(port) + Data([42])
     try writeDatagram(packet, from: intruder.channel, to: association.relay)
     try harness.settleDatagrams()
     let forwarded = try specWait(target.inbox.count())
-    XCTExpectFailure("U05/S08: the IPv4 relay accepts a first sender different from the TCP peer") {
+    do {
       XCTAssertEqual(forwarded, 0)
     }
   }
@@ -1296,7 +1279,7 @@ final class Socks5ConnectionTests: XCTestCase {
     let intruder = try harness.datagram()
     let association = try harness.associate()
     let port = try XCTUnwrap(target.channel.localAddress?.port)
-    let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes + Data([1])
+    let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + specPortBytes(port) + Data([1])
     try writeDatagram(packet, from: client.channel, to: association.relay)
     XCTAssertEqual(try specWait(client.inbox.next()), packet)
     XCTAssertEqual(try specWait(target.inbox.next()), Data([1]))
@@ -1304,7 +1287,7 @@ final class Socks5ConnectionTests: XCTestCase {
     try harness.settleDatagrams()
     XCTAssertEqual(try specWait(target.inbox.count()), 0)
     XCTAssertEqual(try specWait(intruder.inbox.count()), 0)
-    XCTExpectFailure("U05/U16: an unrecognized remote endpoint closes the whole UDP association") {
+    do {
       XCTAssertTrue(association.control.isActive)
     }
     if association.control.isActive {
@@ -1315,54 +1298,25 @@ final class Socks5ConnectionTests: XCTestCase {
 
   // MARK: - UDP 数据报、地址与路由
 
-  /// 无 DNS 配置时仍可直连 UDP IP 目标，畸形数据包经 control connection 统一报错。
-  func testSOCKS5UDPDirectDataPlaneRoundTripsAndRoutesMalformedPacketToControlErrorChain() throws {
-    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-    let eventLoop = group.next()
-    let shutdownPromise = eventLoop.makePromise(of: Void.self)
-    let targetPayloadPromise = eventLoop.makePromise(of: Data.self)
-    let clientResponsePromise = eventLoop.makePromise(of: Data.self)
-    let payload = Data("direct-udp-request".utf8)
-    var channels: [Channel] = []
-    defer {
-      shutdownPromise.succeed(())
-      shutdownTestChannels(channels, group: group)
-    }
-
-    let targetServer = try bindTestDatagram(group: group) { context, envelope in
-      targetPayloadPromise.succeed(Data(envelope.data.readableBytesView))
-      writeTestDatagram(envelope, through: context)
-    }
-    channels.append(targetServer)
-    let core = try makeUDPTestCore(decision: .direct, nodes: [])
-    let association = try establishSOCKS5UDPAssociation(
-      group: group,
-      core: core,
-      shutdownFuture: shutdownPromise.futureResult,
-      channels: &channels
-    )
-    let udpClient = try bindTestDatagram(group: group) { _, envelope in
-      clientResponsePromise.succeed(Data(envelope.data.readableBytesView))
-    }
-    channels.append(udpClient)
-
-    let targetAddress = try XCTUnwrap(targetServer.localAddress.flatMap(NetworkAddress.init))
-    let request =
-      Data([0x00, 0x00, 0x00]) + Socks5Connection.addressBytes(of: targetAddress) + payload
-    try writeDatagram(request, from: udpClient, to: association.relayAddress)
-
-    XCTAssertEqual(try targetPayloadPromise.futureResult.wait(), payload)
-    XCTAssertEqual(try clientResponsePromise.futureResult.wait(), request)
-
-    let controlClosed = expectation(
-      description: "malformed UDP datagram closes its control connection")
-    association.controlChannel.closeFuture.whenComplete { _ in
-      controlClosed.fulfill()
-    }
-    var fragmentedRequest = request
-    fragmentedRequest[2] = 0x01
-    try writeDatagram(fragmentedRequest, from: udpClient, to: association.relayAddress)
-    wait(for: [controlClosed], timeout: 2)
+  func testSOCKS5UDPFragmentedPacketDoesNotPoisonEstablishedAssociation() throws {
+    let harness = SOCKS5SpecHarness()
+    defer { harness.close() }
+    let association = try harness.associate()
+    let client = try harness.datagram()
+    let target = try harness.datagram(echo: true)
+    let port = try XCTUnwrap(target.channel.localAddress?.port)
+    let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + specPortBytes(port) + Data([42])
+    try writeDatagram(packet, from: client.channel, to: association.relay)
+    XCTAssertEqual(try specWait(client.inbox.next()), packet)
+    _ = try specWait(target.inbox.next())
+    var fragmented = packet
+    fragmented[2] = 1
+    try writeDatagram(fragmented, from: client.channel, to: association.relay)
+    try harness.settleDatagrams()
+    XCTAssertEqual(try specWait(target.inbox.count()), 0)
+    XCTAssertTrue(association.control.isActive)
+    try writeDatagram(packet, from: client.channel, to: association.relay)
+    XCTAssertEqual(try specWait(client.inbox.next()), packet)
   }
 
   /// U07/U08: invalid packets are independently dropped; they do not poison a valid association.
@@ -1387,7 +1341,7 @@ final class Socks5ConnectionTests: XCTestCase {
       try writeDatagram(bad, from: client.channel, to: association.relay)
       try harness.settleDatagrams()
       let alive = association.control.isActive
-      XCTExpectFailure("U07/U08: malformed UDP closes the parent TCP; packet \(bad as NSData)") {
+      do {
         XCTAssertTrue(alive)
       }
       XCTAssertEqual(
@@ -1396,7 +1350,7 @@ final class Socks5ConnectionTests: XCTestCase {
       if alive {
         let target = try harness.datagram(echo: true)
         let port = try XCTUnwrap(target.channel.localAddress?.port)
-        let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes + Data([9])
+        let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + specPortBytes(port) + Data([9])
         try writeDatagram(packet, from: client.channel, to: association.relay)
         XCTAssertEqual(try specWait(client.inbox.next()), packet)
       }
@@ -1410,7 +1364,7 @@ final class Socks5ConnectionTests: XCTestCase {
     let target = try harness.datagram(echo: true)
     let client = try harness.datagram()
     let port = try XCTUnwrap(target.channel.localAddress?.port)
-    let header = Data([0, 0, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes
+    let header = Data([0, 0, 0, 1, 127, 0, 0, 1]) + specPortBytes(port)
     let hints: [Data] = [Data([1, 0, 0, 0, 0, 0, 0]), Data([4]) + Data(repeating: 0, count: 18)]
     for hint in hints {
       let association = try harness.associate(hint: hint)
@@ -1450,8 +1404,8 @@ final class Socks5ConnectionTests: XCTestCase {
     association.controlChannel.closeFuture.whenComplete { _ in
       controlClosed.fulfill()
     }
-    let target = NetworkAddress.domain("udp.test.invalid", port: 5353)
-    let request = Data([0x00, 0x00, 0x00]) + Socks5Connection.addressBytes(of: target) + Data([1])
+    let target = specAddress("udp.test.invalid", port: 5353)
+    let request = Data([0x00, 0x00, 0x00]) + specAddressBytes(of: target) + Data([1])
     try writeDatagram(request, from: udpClient, to: association.relayAddress)
     wait(for: [controlClosed], timeout: 2)
   }
@@ -1499,16 +1453,16 @@ final class Socks5ConnectionTests: XCTestCase {
     channels.append(udpClient)
 
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
-    let targetAddress = NetworkAddress.domain("udp.test.invalid", port: targetPort)
+    let targetAddress = specAddress("udp.test.invalid", port: targetPort)
     let request =
-      Data([0x00, 0x00, 0x00]) + Socks5Connection.addressBytes(of: targetAddress) + payload
+      Data([0x00, 0x00, 0x00]) + specAddressBytes(of: targetAddress) + payload
     try writeDatagram(request, from: udpClient, to: association.relayAddress)
 
     XCTAssertEqual(try targetPayloadPromise.futureResult.wait(), payload)
-    let responseAddress = NetworkAddress.ipv4(Data([127, 0, 0, 1]), port: targetPort)
+    let responseAddress = specAddress("127.0.0.1", port: targetPort)
     let expectedResponse =
       Data([0x00, 0x00, 0x00])
-      + Socks5Connection.addressBytes(of: responseAddress)
+      + specAddressBytes(of: responseAddress)
       + payload
     XCTAssertEqual(try clientResponsePromise.futureResult.wait(), expectedResponse)
     XCTAssertTrue(association.controlChannel.isActive)
@@ -1550,9 +1504,9 @@ final class Socks5ConnectionTests: XCTestCase {
     }
     channels.append(udpClient)
 
-    let targetAddress = try XCTUnwrap(targetServer.localAddress.flatMap(NetworkAddress.init))
+    let targetAddress = try specAddress(targetServer.localAddress)
     let request =
-      Data([0x00, 0x00, 0x00]) + Socks5Connection.addressBytes(of: targetAddress) + payload
+      Data([0x00, 0x00, 0x00]) + specAddressBytes(of: targetAddress) + payload
     try writeDatagram(request, from: udpClient, to: association.relayAddress)
 
     XCTAssertEqual(try targetPayloadPromise.futureResult.wait(), payload)
@@ -1569,7 +1523,7 @@ final class Socks5ConnectionTests: XCTestCase {
     let association = try harness.associate()
     let port = try XCTUnwrap(target.channel.localAddress?.port)
     let header =
-      Data([0, 0, 0, 4]) + Data(repeating: 0, count: 15) + Data([1]) + UInt16(port).bigEndianBytes
+      Data([0, 0, 0, 4]) + Data(repeating: 0, count: 15) + Data([1]) + specPortBytes(port)
     XCTAssertEqual(header.count, 22)
     try writeDatagram(header, from: client.channel, to: association.relay)
     XCTAssertEqual(try specWait(target.inbox.next()), Data())
@@ -1625,10 +1579,10 @@ final class Socks5ConnectionTests: XCTestCase {
     }
     channels.append(udpClient)
 
-    let targetAddress = NetworkAddress.domain("udp.example.com", port: 5353)
+    let targetAddress = specAddress("udp.example.com", port: 5353)
     let request =
       Data([0x00, 0x00, 0x00])
-      + Socks5Connection.addressBytes(of: targetAddress)
+      + specAddressBytes(of: targetAddress)
       + requestPayload
     try writeDatagram(request, from: udpClient, to: association.relayAddress)
 
@@ -1636,7 +1590,7 @@ final class Socks5ConnectionTests: XCTestCase {
     XCTAssertEqual(try proxyPayloadPromise.futureResult.wait(), requestPayload)
     let expectedResponse =
       Data([0x00, 0x00, 0x00])
-      + Socks5Connection.addressBytes(of: targetAddress)
+      + specAddressBytes(of: targetAddress)
       + responsePayload
     XCTAssertEqual(try clientResponsePromise.futureResult.wait(), expectedResponse)
     XCTAssertTrue(association.controlChannel.isActive)
@@ -1654,7 +1608,7 @@ final class Socks5ConnectionTests: XCTestCase {
         password: "spec-test")
       let wire = try ShadowsocksUDPWire(proxyNode: node)
       let decoded = try wire.decodeInbound(Data(envelope.data.readableBytesView))
-      plaintext.append(try decoded.address.shadowsocksAddressBytes() + decoded.data)
+      plaintext.append(specAddressBytes(of: decoded.address) + decoded.data)
     }
     harness.channels.append(proxy)
     let node = try ProxyNode(
@@ -1702,7 +1656,7 @@ final class Socks5ConnectionTests: XCTestCase {
     let client = try harness.datagram()
     let association = try harness.associate()
     let port = try XCTUnwrap(target.channel.localAddress?.port)
-    let suffix = UInt16(port).bigEndianBytes + Data([42, 0, 255])
+    let suffix = specPortBytes(port) + Data([42, 0, 255])
     for address in [
       Data([3, 9]) + Data("127.0.0.1".utf8),
       Data([4]) + Data(repeating: 0, count: 10) + Data([255, 255, 127, 0, 0, 1]),
@@ -1751,7 +1705,7 @@ final class Socks5ConnectionTests: XCTestCase {
       Data([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7])
       + Data("example".utf8) + Data([3]) + Data("com".utf8) + Data([0, 0, 1, 0, 1])
     XCTAssertEqual(dnsQuery.count, 29)
-    let directPacket = Data([0, 0, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes + dnsQuery
+    let directPacket = Data([0, 0, 0, 1, 127, 0, 0, 1]) + specPortBytes(port) + dnsQuery
     let proxyPacket = Data([0, 0, 0, 3, 11]) + Data("example.com".utf8) + Data([1, 187, 1, 2, 3])
     for _ in 0..<2 {
       try writeDatagram(directPacket, from: client.channel, to: association.relay)
@@ -1759,13 +1713,12 @@ final class Socks5ConnectionTests: XCTestCase {
       XCTAssertEqual(try specWait(client.inbox.next()), directPacket)
       XCTAssertEqual(try specWait(proxyTargets.count()), 0)
       try writeDatagram(proxyPacket, from: client.channel, to: association.relay)
-      XCTAssertEqual(try specWait(proxyTargets.next()), .domain("example.com", port: 443))
+      XCTAssertEqual(try specWait(proxyTargets.next()), specAddress("example.com", port: 443))
       XCTAssertEqual(try specWait(client.inbox.next()), proxyPacket)
     }
   }
 
-  /// U18/§15.12: one failed proxy flow must not terminate independent direct flows.
-  func testSpecUDPRouteFailureDoesNotDestroyOtherFlows() throws {
+  func testSpecUDPRouteFailureEndsItsAssociation() throws {
     let harness = SOCKS5SpecHarness()
     defer { harness.close() }
     let missing = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
@@ -1777,19 +1730,15 @@ final class Socks5ConnectionTests: XCTestCase {
     let client = try harness.datagram()
     let target = try harness.datagram(echo: true)
     let port = try XCTUnwrap(target.channel.localAddress?.port)
-    let direct = Data([0, 0, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes + Data([6])
+    let direct = Data([0, 0, 0, 1, 127, 0, 0, 1]) + specPortBytes(port) + Data([6])
     try writeDatagram(direct, from: client.channel, to: association.relay)
     XCTAssertEqual(try specWait(client.inbox.next()), direct)
     let broken = Data([0, 0, 0, 3, 14]) + Data("broken.example".utf8) + Data([1, 187, 7])
     try writeDatagram(broken, from: client.channel, to: association.relay)
     try harness.settleDatagrams()
-    XCTExpectFailure("§15.12: a failed UDP route closes all other flows through the parent TCP") {
-      XCTAssertTrue(association.control.isActive)
-    }
-    if association.control.isActive {
-      try writeDatagram(direct, from: client.channel, to: association.relay)
-      XCTAssertEqual(try specWait(client.inbox.next()), direct)
-    }
+    try specWait(association.accepted.closeFuture)
+    XCTAssertFalse(association.control.isActive)
+    XCTAssertEqual(try specWait(association.capture.snapshot()).count, 12)
   }
 
   // MARK: - UDP 控制连接与资源清理
@@ -1800,7 +1749,7 @@ final class Socks5ConnectionTests: XCTestCase {
     let association = try harness.associate()
     try writeData(Data([42]), to: association.control)
     try harness.settleDatagrams()
-    XCTExpectFailure("U22/§6.5: the idle TCP state silently ignores control payload") {
+    do {
       XCTAssertFalse(association.control.isActive)
     }
     XCTAssertEqual(try specWait(association.capture.snapshot()).count, 12)
@@ -1815,7 +1764,7 @@ final class Socks5ConnectionTests: XCTestCase {
       let client = try harness.datagram()
       let association = try harness.associate()
       let port = try XCTUnwrap(target.channel.localAddress?.port)
-      let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes + Data([7])
+      let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + specPortBytes(port) + Data([7])
       try writeDatagram(packet, from: client.channel, to: association.relay)
       XCTAssertEqual(try specWait(client.inbox.next()), packet)
       XCTAssertEqual(try specWait(target.inbox.next()), Data([7]))
@@ -1832,6 +1781,21 @@ final class Socks5ConnectionTests: XCTestCase {
     }
   }
 
+  func testSpecUDPControlCloseBeforeFirstPacketReleasesRelay() throws {
+    for halfClose in [false, true] {
+      let harness = SOCKS5SpecHarness()
+      defer { harness.close() }
+      let association = try harness.associate()
+      try specWait(association.control.close(mode: halfClose ? .output : .all))
+      try specWait(association.accepted.closeFuture)
+      try harness.settleDatagrams()
+      let replacement = try DatagramBootstrap(group: harness.group).bind(to: association.relay)
+        .wait()
+      harness.channels.append(replacement)
+      XCTAssertTrue(replacement.isActive)
+    }
+  }
+
   func testSpecUDPTwoAssociationsHaveIndependentPortsAndLifetime() throws {
     let harness = SOCKS5SpecHarness()
     defer { harness.close() }
@@ -1843,7 +1807,7 @@ final class Socks5ConnectionTests: XCTestCase {
     let target = try harness.datagram(echo: true)
     let client = try harness.datagram()
     let port = try XCTUnwrap(target.channel.localAddress?.port)
-    let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + UInt16(port).bigEndianBytes + Data([8])
+    let packet = Data([0, 0, 0, 1, 127, 0, 0, 1]) + specPortBytes(port) + Data([8])
     try writeDatagram(packet, from: client.channel, to: second.relay)
     XCTAssertEqual(try specWait(client.inbox.next()), packet)
     XCTAssertTrue(second.control.isActive)
@@ -1859,12 +1823,20 @@ final class Socks5ConnectionTests: XCTestCase {
     shutdownFuture: EventLoopFuture<Void>,
     channels: inout [Channel]
   ) throws -> (controlChannel: Channel, relayAddress: SocketAddress) {
-    let proxyServer = try bindTCPProxy(
-      group: group,
-      core: core,
-      dnsAddress: dnsAddress,
-      shutdownFuture: shutdownFuture
-    )
+    let proxyServer: Channel
+    if let dnsAddress {
+      proxyServer = try ServerBootstrap(group: group)
+        .childChannelOption(ChannelOptions.autoRead, value: false)
+        .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
+        .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+        .childChannelInitializer { channel in
+          channel.pipeline.addHandler(
+            SpecSOCKS5Owner(
+              channel: channel, core: core, dnsAddress: dnsAddress, shutdown: shutdownFuture))
+        }.bind(host: "127.0.0.1", port: 0).wait()
+    } else {
+      proxyServer = try bindTCPProxy(group: group, core: core, shutdownFuture: shutdownFuture)
+    }
     channels.append(proxyServer)
     let client = try ClientBootstrap(group: group).connect(to: XCTUnwrap(proxyServer.localAddress))
       .wait()
@@ -1976,7 +1948,7 @@ private func testDNSResponse(for query: Data) throws -> Data {
   guard offset + 4 <= query.count else {
     throw MagentError.malformedRequest("test DNS query has an incomplete question")
   }
-  let recordType = query.readBigEndianUInt16(at: offset)
+  let recordType = (UInt16(query[offset]) << 8 | UInt16(query[offset + 1]))
   let questionEnd = offset + 4
   let recordData: Data
   switch recordType {
@@ -1992,15 +1964,104 @@ private func testDNSResponse(for query: Data) throws -> Data {
   response.append(contentsOf: [0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00])
   response.append(query[12..<questionEnd])
   response.append(contentsOf: [0xC0, 0x0C])
-  response.append(contentsOf: UInt16(recordType).bigEndianBytes)
+  response.append(contentsOf: specPortBytes(Int(recordType)))
   response.append(contentsOf: [0x00, 0x01, 0x00, 0x00, 0x00, 0x3C])
-  response.append(contentsOf: UInt16(recordData.count).bigEndianBytes)
+  response.append(contentsOf: specPortBytes(recordData.count))
   response.append(recordData)
   return response
 }
 
+/// Valid fixture values still use the real model initializer; no production-only test factory.
+private func specAddress(_ host: String, port: Int) -> NetworkAddress {
+  try! NetworkAddress(host: host, port: UInt16(port))
+}
+
+private func specAddress(_ endpoint: SocketAddress?) throws -> NetworkAddress {
+  let endpoint = try XCTUnwrap(endpoint)
+  return try NetworkAddress(
+    host: XCTUnwrap(endpoint.ipAddress), port: UInt16(XCTUnwrap(endpoint.port)))
+}
+
+private func specPortBytes(_ port: Int) -> Data {
+  let value = UInt16(port)
+  return Data([UInt8(value >> 8), UInt8(value & 0xff)])
+}
+
+private func specAddressBytes(of address: NetworkAddress) -> Data {
+  var bytes = Data()
+  switch address.address {
+  case .domain(let host, _):
+    bytes.append(3)
+    bytes.append(UInt8(host.utf8.count))
+    bytes.append(contentsOf: host.utf8)
+  case .ip(let endpoint):
+    switch endpoint {
+    case .v4(let value):
+      bytes.append(1)
+      withUnsafeBytes(of: value.address.sin_addr) { bytes.append(contentsOf: $0) }
+    case .v6(let value):
+      bytes.append(4)
+      withUnsafeBytes(of: value.address.sin6_addr) { bytes.append(contentsOf: $0) }
+    case .unixDomainSocket: preconditionFailure("numeric fixture endpoint required")
+    }
+  }
+  bytes.append(contentsOf: specPortBytes(Int(address.port)))
+  return bytes
+}
+
+/// Counter is read and mutated only on the owning EmbeddedEventLoop.
+private final class SpecReadObserver: ChannelOutboundHandler, @unchecked Sendable {
+  typealias OutboundIn = ByteBuffer
+  var count = 0
+  func read(context: ChannelHandlerContext) {
+    count += 1
+    context.read()
+  }
+}
+
+/// Tests explicit optional DNS through the unchanged concrete production initializer.
+private final class SpecSOCKS5Owner: ChannelInboundHandler, @unchecked Sendable {
+  typealias InboundIn = ByteBuffer
+  private let connection: Socks5Connection
+  private var closed = false
+  init(
+    channel: Channel, core: MagentCore, dnsAddress: SocketAddress, shutdown: EventLoopFuture<Void>
+  ) {
+    connection = Socks5Connection(proxyChannel: channel, core: core, dnsAddress: dnsAddress)
+    shutdown.whenComplete { [weak channel] _ in channel?.close(promise: nil) }
+  }
+  func channelActive(context: ChannelHandlerContext) {
+    context.fireChannelActive()
+    context.read()
+  }
+  func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+    if !closed { connection.upstream(context: context, data: data) }
+  }
+  func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+    if let event = event as? ChannelEvent, event == .inputClosed {
+      if !closed { connection.proxyInputClosed(context: context) }
+    } else {
+      context.fireUserInboundEventTriggered(event)
+    }
+  }
+  func channelInactive(context: ChannelHandlerContext) {
+    if !closed {
+      closed = true
+      connection.closeConnection(error: nil)
+    }
+    context.fireChannelInactive()
+  }
+  func errorCaught(context: ChannelHandlerContext, error: Error) {
+    if !closed {
+      closed = true
+      connection.closeConnection(error: error)
+    }
+    context.close(promise: nil)
+  }
+}
+
 private func socks5ConnectRequest(_ address: NetworkAddress) -> Data {
-  Data([0x05, 0x01, 0x00]) + Socks5Connection.addressBytes(of: address)
+  Data([0x05, 0x01, 0x00]) + specAddressBytes(of: address)
 }
 
 private let testSocks5NoAuthentication = Data([0x05, 0x00])
@@ -2022,8 +2083,15 @@ private func specFailure(_ rep: UInt8) -> Data {
   Data([5, rep, 0, 1, 0, 0, 0, 0, 0, 0])
 }
 
-private func specNegotiatedChannel() throws -> EmbeddedChannel {
+/// EmbeddedChannel starts inactive; production reply eligibility requires an active accepted channel.
+private func makeSocks5Channel() throws -> EmbeddedChannel {
   let channel = try makeConnectionChannel()
+  try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 12345)).wait()
+  return channel
+}
+
+private func specNegotiatedChannel() throws -> EmbeddedChannel {
+  let channel = try makeSocks5Channel()
   try writeInbound(Data([5, 1, 0]), to: channel)
   XCTAssertEqual(try readOutboundData(from: channel), Data([5, 0]))
   return channel
@@ -2179,7 +2247,7 @@ private final class SOCKS5SpecHarness {
         let node = try ProxyNode(
           address: try XCTUnwrap(channel.localAddress), cipher: .aes256Gcm, password: "spec-test")
         let decoder = try ShadowsocksTCPWire(proxyNode: node)
-        _ = try decoder.start(handshake: .domain("unused.test", port: 1))
+        _ = try decoder.start(handshake: specAddress("unused.test", port: 1))
         return channel.pipeline.addHandler(SpecSSCapture(decoder: decoder, plaintext: plaintext))
       } catch { return channel.eventLoop.makeFailedFuture(error) }
     }.bind(host: "127.0.0.1", port: 0).wait()

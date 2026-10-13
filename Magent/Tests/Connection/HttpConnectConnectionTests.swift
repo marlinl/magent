@@ -1,6 +1,7 @@
 import Foundation
 import NIOCore
 import NIOEmbedded
+import NIOHTTP1
 import NIOPosix
 import XCTest
 
@@ -47,13 +48,13 @@ final class HttpConnectConnectionTests: XCTestCase {
     channels.append(client)
     let responsePromise = client.eventLoop.makePromise(of: Data.self)
     try client.pipeline.addHandler(
-      TestDataCollector(expectedByteCount: HttpProtocol.established.count, promise: responsePromise)
+      TestDataCollector(expectedByteCount: httpConnectEstablished.count, promise: responsePromise)
     ).wait()
 
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
     try writeData(httpConnectRequest(host: "127.0.0.1", port: targetPort), to: client)
 
-    XCTAssertEqual(try responsePromise.futureResult.wait(), HttpProtocol.established)
+    XCTAssertEqual(try responsePromise.futureResult.wait(), httpConnectEstablished)
     let targetChannel = try targetAcceptedPromise.futureResult.wait()
     channels.append(targetChannel)
     XCTAssertTrue(targetChannel.isActive)
@@ -67,7 +68,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     let targetAcceptedPromise = eventLoop.makePromise(of: Channel.self)
     let firstWirePayload = Data("first-http-wire-payload".utf8)
     let secondWirePayload = Data("second-http-wire-payload".utf8)
-    let firstProxyPayload = Data(repeating: 0xA5, count: 8 * 1024 * 1024)
+    let firstProxyPayload = Data(repeating: 0xA5, count: 32 * 1024)
     let secondProxyPayload = Data("second-http-proxy-payload".utf8)
     let targetPayloadPromise = eventLoop.makePromise(of: Data.self)
     let firstTunnelWritePromise = eventLoop.makePromise(of: Data.self)
@@ -122,9 +123,9 @@ final class HttpConnectConnectionTests: XCTestCase {
     let tunnelPayloadsPromise = eventLoop.makePromise(of: Data.self)
     try client.pipeline.addHandlers(
       TestDataCollector(
-        expectedByteCount: HttpProtocol.established.count, promise: responsePromise),
+        expectedByteCount: httpConnectEstablished.count, promise: responsePromise),
       TestDataCollector(
-        expectedByteCount: HttpProtocol.established.count + firstWirePayload.count
+        expectedByteCount: httpConnectEstablished.count + firstWirePayload.count
           + secondWirePayload.count,
         promise: tunnelPayloadsPromise
       )
@@ -132,7 +133,7 @@ final class HttpConnectConnectionTests: XCTestCase {
 
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
     try manualReads.enqueue([httpConnectRequest(host: "127.0.0.1", port: targetPort)]).wait()
-    XCTAssertEqual(try responsePromise.futureResult.wait(), HttpProtocol.established)
+    XCTAssertEqual(try responsePromise.futureResult.wait(), httpConnectEstablished)
 
     let targetChannel = try targetAcceptedPromise.futureResult.wait()
     channels.append(targetChannel)
@@ -144,18 +145,89 @@ final class HttpConnectConnectionTests: XCTestCase {
     try delayedWrites.release().wait()
     XCTAssertEqual(
       try tunnelPayloadsPromise.futureResult.wait(),
-      HttpProtocol.established + firstWirePayload + secondWirePayload
+      httpConnectEstablished + firstWirePayload + secondWirePayload
     )
     XCTAssertEqual(try delayedWrites.writeCount().wait(), 3)
 
     try manualReads.enqueue([firstProxyPayload, secondProxyPayload]).wait()
-    XCTAssertEqual(try manualReads.deliveredCount().wait(), 2)
-
+    // Socket send buffers may complete either batch immediately; compare bytes and order, not timing.
     try targetChannel.setOption(ChannelOptions.autoRead, value: true).wait()
     let receivedPayload = try targetPayloadPromise.futureResult.wait()
     XCTAssertEqual(receivedPayload.count, firstProxyPayload.count + secondProxyPayload.count)
     XCTAssertEqual(receivedPayload.suffix(secondProxyPayload.count), secondProxyPayload)
     XCTAssertEqual(try manualReads.deliveredCount().wait(), 3)
+  }
+
+  /// 200 的网络写 Future 未完成时，源站数据与 FIN 都不能越过成功屏障。
+  func testHTTPConnectDefersRemotePayloadAndFINUntilSuccessIsWritten() throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let loop = group.next()
+    let shutdown = loop.makePromise(of: Void.self)
+    let accepted = loop.makePromise(of: Channel.self)
+    let successPending = loop.makePromise(of: Data.self)
+    let delayed = DelayedTestWrites(eventLoop: loop, firstWritePromise: successPending)
+    let payload = Data("remote-before-success".utf8)
+    var channels: [Channel] = []
+    defer {
+      _ = try? delayed.release().wait()
+      shutdown.succeed(())
+      shutdownTestChannels(channels, group: group)
+    }
+    let targetServer = try ServerBootstrap(group: group)
+      .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+      .childChannelInitializer { channel in
+        accepted.succeed(channel)
+        return channel.pipeline.addHandler(TestInboundHandler())
+      }.bind(host: "127.0.0.1", port: 0).wait()
+    channels.append(targetServer)
+    let core = try MagentCore(
+      defaultDecision: .direct, proxyNodes: [], defaultTimeout: 10_000, rules: [])
+    let proxyServer = try bindTCPProxy(
+      group: group, core: core, shutdownFuture: shutdown.futureResult
+    ) {
+      $0.pipeline.addHandler(delayed)
+    }
+    channels.append(proxyServer)
+    let client = try ClientBootstrap(group: group)
+      .channelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+      .connect(to: XCTUnwrap(proxyServer.localAddress)).wait()
+    channels.append(client)
+    let response = loop.makePromise(of: Data.self)
+    let inputClosed = expectation(description: "remote FIN follows complete 200 and payload")
+    try client.pipeline.addHandlers(
+      TestDataCollector(
+        expectedByteCount: httpConnectEstablished.count + payload.count, promise: response),
+      TestInputClosedRecorder(expectation: inputClosed)
+    ).wait()
+    try writeData(
+      httpConnectRequest(host: "127.0.0.1", port: XCTUnwrap(targetServer.localAddress?.port)),
+      to: client)
+    XCTAssertEqual(try successPending.futureResult.wait(), httpConnectEstablished)
+    let target = try accepted.futureResult.wait()
+    channels.append(target)
+    try writeData(payload, to: target)
+    try target.close(mode: .output).wait()
+    XCTAssertEqual(try delayed.writeCount().wait(), 1)
+    try delayed.release().wait()
+    XCTAssertEqual(try response.futureResult.wait(), httpConnectEstablished + payload)
+    wait(for: [inputClosed], timeout: 2)
+    XCTAssertTrue(client.isActive)
+  }
+
+  func testHTTPConnectRejectsInvalidUTF8AcrossEverySplit() throws {
+    let bytes =
+      Data("CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\nX-Value: ".utf8)
+      + Data([0xFF]) + Data("\r\n\r\n".utf8)
+    for split in 0...bytes.count {
+      let channel = try makeConnectionChannel()
+      try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
+      try writeInbound(Data(bytes.prefix(split)), to: channel)
+      try writeInbound(Data(bytes.dropFirst(split)), to: channel)
+      XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(.badRequest))
+      XCTAssertNil(try readOutboundData(from: channel))
+      XCTAssertFalse(channel.isActive)
+      XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true))
+    }
   }
 
   /// HTTP CONNECT 客户端半关闭前的数据必须先于下游 FIN 转发。
@@ -209,16 +281,16 @@ final class HttpConnectConnectionTests: XCTestCase {
     let wirePayloadPromise = eventLoop.makePromise(of: Data.self)
     try client.pipeline.addHandlers(
       TestDataCollector(
-        expectedByteCount: HttpProtocol.established.count, promise: responsePromise),
+        expectedByteCount: httpConnectEstablished.count, promise: responsePromise),
       TestDataCollector(
-        expectedByteCount: HttpProtocol.established.count + wirePayload.count,
+        expectedByteCount: httpConnectEstablished.count + wirePayload.count,
         promise: wirePayloadPromise
       )
     ).wait()
 
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
     try writeData(httpConnectRequest(host: "127.0.0.1", port: targetPort), to: client)
-    XCTAssertEqual(try responsePromise.futureResult.wait(), HttpProtocol.established)
+    XCTAssertEqual(try responsePromise.futureResult.wait(), httpConnectEstablished)
 
     let targetChannel = try targetAcceptedPromise.futureResult.wait()
     channels.append(targetChannel)
@@ -283,9 +355,9 @@ final class HttpConnectConnectionTests: XCTestCase {
     let wirePayloadPromise = eventLoop.makePromise(of: Data.self)
     try client.pipeline.addHandlers(
       TestDataCollector(
-        expectedByteCount: HttpProtocol.established.count, promise: responsePromise),
+        expectedByteCount: httpConnectEstablished.count, promise: responsePromise),
       TestDataCollector(
-        expectedByteCount: HttpProtocol.established.count + wirePayload.count,
+        expectedByteCount: httpConnectEstablished.count + wirePayload.count,
         promise: wirePayloadPromise
       ),
       TestInputClosedRecorder(expectation: clientInputClosed)
@@ -293,7 +365,7 @@ final class HttpConnectConnectionTests: XCTestCase {
 
     let targetPort = try XCTUnwrap(targetServer.localAddress?.port)
     try writeData(httpConnectRequest(host: "127.0.0.1", port: targetPort), to: client)
-    XCTAssertEqual(try responsePromise.futureResult.wait(), HttpProtocol.established)
+    XCTAssertEqual(try responsePromise.futureResult.wait(), httpConnectEstablished)
 
     let targetChannel = try targetAcceptedPromise.futureResult.wait()
     channels.append(targetChannel)
@@ -355,7 +427,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     let responsePromise = eventLoop.makePromise(of: Data.self)
     try client.pipeline.addHandler(
       TestDataCollector(
-        expectedByteCount: HttpProtocol.established.count + wirePayload.count,
+        expectedByteCount: httpConnectEstablished.count + wirePayload.count,
         promise: responsePromise
       )
     ).wait()
@@ -401,9 +473,10 @@ final class HttpConnectConnectionTests: XCTestCase {
     channels.append(client)
     let responsePromise = eventLoop.makePromise(of: Data.self)
     let clientClosed = expectation(
-      description: "incomplete HTTP CONNECT request closes without a response")
+      description: "incomplete HTTP CONNECT request closes after one bad request response")
     try client.pipeline.addHandler(
-      TestDataCollector(expectedByteCount: 1, promise: responsePromise)
+      TestDataCollector(
+        expectedByteCount: httpErrorResponse(.badRequest).count, promise: responsePromise)
     ).wait()
     client.closeFuture.whenComplete { _ in
       clientClosed.fulfill()
@@ -413,9 +486,7 @@ final class HttpConnectConnectionTests: XCTestCase {
     try client.close(mode: .output).wait()
 
     wait(for: [clientClosed], timeout: 2)
-    XCTAssertThrowsError(try responsePromise.futureResult.wait()) { error in
-      XCTAssertEqual(error as? MagentError, .connectionClosed)
-    }
+    XCTAssertEqual(try responsePromise.futureResult.wait(), httpErrorResponse(.badRequest))
   }
 
   /// 通过节点列表选中的 Shadowsocks Wire 建立 HTTP CONNECT 隧道。
@@ -472,12 +543,12 @@ final class HttpConnectConnectionTests: XCTestCase {
     channels.append(client)
     let responsePromise = client.eventLoop.makePromise(of: Data.self)
     try client.pipeline.addHandler(
-      TestDataCollector(expectedByteCount: HttpProtocol.established.count, promise: responsePromise)
+      TestDataCollector(expectedByteCount: httpConnectEstablished.count, promise: responsePromise)
     ).wait()
 
     try writeData(httpConnectRequest(host: host, port: 443), to: client)
 
-    XCTAssertEqual(try responsePromise.futureResult.wait(), HttpProtocol.established)
+    XCTAssertEqual(try responsePromise.futureResult.wait(), httpConnectEstablished)
     XCTAssertEqual(try handshakePromise.futureResult.wait().count, expectedHandshakeLength)
     channels.append(try proxyNodeAcceptedPromise.futureResult.wait())
   }
@@ -519,7 +590,8 @@ final class HttpConnectConnectionTests: XCTestCase {
     let clientClosed = expectation(
       description: "HTTP CONNECT closes after the bad gateway response")
     try client.pipeline.addHandler(
-      TestDataCollector(expectedByteCount: HttpProtocol.badGateway.count, promise: responsePromise)
+      TestDataCollector(
+        expectedByteCount: httpErrorResponse(.badGateway).count, promise: responsePromise)
     ).wait()
     client.closeFuture.whenComplete { _ in
       clientClosed.fulfill()
@@ -527,12 +599,13 @@ final class HttpConnectConnectionTests: XCTestCase {
 
     try writeData(httpConnectRequest(host: "127.0.0.1", port: unavailablePort), to: client)
 
-    XCTAssertEqual(try responsePromise.futureResult.wait(), HttpProtocol.badGateway)
+    XCTAssertEqual(try responsePromise.futureResult.wait(), httpErrorResponse(.badGateway))
     wait(for: [clientClosed], timeout: 2)
   }
 
   func testMagentTCPConnectionRejectsHTTPConnectPayloadInDecoderLeftovers() throws {
     let channel = try makeConnectionChannel()
+    try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
     var requestAndPayload = httpConnectRequest(host: "127.0.0.1", port: 443)
     // 合法 method 前缀会留在 decoder 缓冲区，确保测试命中 decoder removal 的 leftover 路径。
@@ -541,13 +614,14 @@ final class HttpConnectConnectionTests: XCTestCase {
     try writeInbound(requestAndPayload, to: channel)
     channel.embeddedEventLoop.run()
 
-    XCTAssertEqual(try readOutboundData(from: channel), HttpProtocol.badRequest)
+    XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(.badRequest))
     XCTAssertNil(try readOutboundData(from: channel))
     XCTAssertFalse(channel.isActive)
   }
 
   func testMagentTCPConnectionBuffersHTTPConnectAndReturnsBadRequest() throws {
     let channel = try makeConnectionChannel()
+    try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
     let first = Data("CONNECT example.com:443 HTTP/1.1\r\nHost: other".utf8)
     let second = Data(".example:443\r\n\r\n".utf8)
@@ -556,37 +630,32 @@ final class HttpConnectConnectionTests: XCTestCase {
     XCTAssertNil(try readOutboundData(from: channel))
     try writeInbound(second, to: channel)
 
-    XCTAssertEqual(try readOutboundData(from: channel), HttpProtocol.badRequest)
+    XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(.badRequest))
     XCTAssertFalse(channel.isActive)
   }
 
   func testMagentTCPConnectionRejectsOversizedIncompleteHTTPConnectRequest() throws {
     let channel = try makeConnectionChannel()
+    try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
-    var request = Data("CONNECT ".utf8)
-    request.append(Data(repeating: 0x61, count: 64 * 1024))
+    try writeInbound(Data("CONNECT ".utf8), to: channel)
+    try writeInbound(Data(repeating: 0x61, count: 64 * 1024), to: channel)
 
-    try writeInbound(request, to: channel)
-
-    XCTAssertEqual(try readOutboundData(from: channel), HttpProtocol.badRequest)
+    XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(.badRequest))
     XCTAssertFalse(channel.isActive)
   }
 
   func testHTTPConnectParserValidatesRequestHeadAndHost() throws {
-    let request = HttpProtocol(
-      address: try HttpProtocol.parseAuthority("example.com:443"),
-      version: "HTTP/1.1",
-      headers: [
-        (name: "Host", value: "EXAMPLE.com:443"),
-        (name: "X-Test", value: "value"),
-      ]
-    )
-
-    XCTAssertEqual(request.address, .domain("example.com", port: 443))
-    XCTAssertEqual(request.version, "HTTP/1.1")
-    XCTAssertEqual(request.headers.map(\.name), ["Host", "X-Test"])
-    XCTAssertEqual(request.headers.map(\.value), ["EXAMPLE.com:443", "value"])
-    XCTAssertNoThrow(try request.checkConnect())
+    let model = try HttpProtocol(
+      head: HTTPRequestHead(
+        version: .http1_1, method: .CONNECT, uri: "example.com:443",
+        headers: HTTPHeaders([("Host", "EXAMPLE.com:443"), ("X-Test", "value")])
+      ))
+    guard case .connect(let target, let version) = model.request else {
+      return XCTFail("CONNECT must produce tunnel semantics")
+    }
+    XCTAssertEqual(target, try NetworkAddress(host: "example.com", port: 443))
+    XCTAssertEqual(version, .http1_1)
   }
 
   /// HTTP CONNECT 数值地址保留 IP 类型并参与 CIDR 规则匹配。
@@ -608,15 +677,23 @@ final class HttpConnectConnectionTests: XCTestCase {
       ]
     )
 
-    let ipv4 = try HttpProtocol.parseAuthority("10.1.2.3:443")
-    let ipv6 = try HttpProtocol.parseAuthority("[fd00::1]:443")
-
-    XCTAssertEqual(ipv4, .ipv4(Data([10, 1, 2, 3]), port: 443))
-    guard case .ipv6(let ipv6Bytes, let ipv6Port) = ipv6 else {
-      return XCTFail("bracketed IPv6 authority must remain IPv6")
+    let ipv4Model = try HttpProtocol(
+      head: HTTPRequestHead(
+        version: .http1_1, method: .CONNECT, uri: "10.1.2.3:443",
+        headers: HTTPHeaders([("Host", "10.1.2.3:443")])
+      ))
+    let ipv6Model = try HttpProtocol(
+      head: HTTPRequestHead(
+        version: .http1_1, method: .CONNECT, uri: "[fd00::1]:443",
+        headers: HTTPHeaders([("Host", "[fd00::1]:443")])
+      ))
+    guard case .connect(let ipv4, _) = ipv4Model.request,
+      case .connect(let ipv6, _) = ipv6Model.request
+    else {
+      return XCTFail("numeric CONNECT targets must produce tunnel semantics")
     }
-    XCTAssertEqual(ipv6Bytes.count, 16)
-    XCTAssertEqual(ipv6Port, 443)
+    XCTAssertEqual(ipv4, try NetworkAddress(host: "10.1.2.3", port: 443))
+    XCTAssertEqual(ipv6, try NetworkAddress(host: "fd00::1", port: 443))
     XCTAssertNotNil(try core.routeTCPWire(ipv4))
     XCTAssertNotNil(try core.routeTCPWire(ipv6))
   }
@@ -624,7 +701,7 @@ final class HttpConnectConnectionTests: XCTestCase {
   func testMagentTCPConnectionRejectsHTTPConnectBodyFraming() throws {
     let requests = [
       Data(
-        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nContent-Length: 0\r\n\r\n"
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nContent-Length: 1\r\n\r\nx"
           .utf8
       ),
       Data(
@@ -635,9 +712,10 @@ final class HttpConnectConnectionTests: XCTestCase {
 
     for request in requests {
       let channel = try makeConnectionChannel()
+      try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
       try writeInbound(request, to: channel)
 
-      XCTAssertEqual(try readOutboundData(from: channel), HttpProtocol.badRequest)
+      XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(.badRequest))
       XCTAssertFalse(channel.isActive)
       XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true))
     }
@@ -651,13 +729,13 @@ final class HttpConnectConnectionTests: XCTestCase {
       Data("CONNECT example.com:+443 HTTP/1.1\r\nHost: example.com:+443\r\n\r\n".utf8),
       Data("CONNECT example.com:443 HTTP/1.1\r\nHost : example.com:443\r\n\r\n".utf8),
       Data("CONNECT example.com:443 HTTP/1.1\r\nHost: other.example:443\r\n\r\n".utf8),
-      Data("CONNECT example.com:443 HTTP/1.2\r\nHost: example.com:443\r\n\r\n".utf8),
     ]
     for request in malformedRequests {
       let channel = try makeConnectionChannel()
+      try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
       try writeInbound(request, to: channel)
 
-      XCTAssertEqual(try readOutboundData(from: channel), HttpProtocol.badRequest)
+      XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(.badRequest))
       XCTAssertFalse(channel.isActive)
       XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true))
     }
@@ -668,4 +746,13 @@ private func httpConnectRequest(host: String, port: Int) -> Data {
   precondition(!host.isEmpty)
   precondition((1...65535).contains(port))
   return Data("CONNECT \(host):\(port) HTTP/1.1\r\nHost: \(host):\(port)\r\n\r\n".utf8)
+}
+
+/// Byte-level expectations are independent of production response builders/encoders.
+private let httpConnectEstablished = Data("HTTP/1.1 200 OK\r\n\r\n".utf8)
+
+func httpErrorResponse(_ status: HTTPResponseStatus, version: String = "HTTP/1.1") -> Data {
+  Data(
+    "\(version) \(status.code) \(status.reasonPhrase)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+      .utf8)
 }

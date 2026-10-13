@@ -1,46 +1,86 @@
 ---
-desc: accepted TCP 的协议识别、唯一分派和关闭所有权
-updated_at: 2026-10-10
+desc: accepted TCP 的首请求收齐、唯一分派和关闭所有权
+updated_at: 2026-10-13
 baseline: target-design
 ---
 
 # MagentTCPConnection 产品设计
 
-状态：目标设计；合并状态与协议探测类型，相关私有签名待确认；DNS 参数移除和完整请求交接均尚未迁移源码。
+状态：目标设计，源码尚待迁移。当前源码只识别协议前缀，随后通过首次 `upstream` 交付探测缓冲；
+本文改为主 handler 收齐首个协议请求，二级 `init` 解析，安装后显式 `start`，后续字节才交 `upstream`。
+这不表示整个 SOCKS5 握手能一次收齐，也不表示请求通过了语义校验。
 相关边界：[架构](../ARCHITECTURE.md#ownership-and-lifecycle) ·
-[HTTP SPEC](../HTTP_PROXY_SPEC.md) · [组件源码](../../Sources/Connection/MagentTCPConnection.swift)。
+[HTTP SPEC](../HTTP_PROXY_SPEC.md) · [主 handler 源码](../../Sources/Connection/MagentTCPConnection.swift) ·
+[共享协议源码](../../Sources/Connection/ProxyConnection.swift)。
 
 ## Context
 
-`Magent` 为每条 accepted TCP Channel 安装本 handler。按现有接口，本组件识别协议、创建唯一具体 Connection、
-分派客户端字节及 EOF，并拥有 accepted Channel 的最终关闭。具体 Connection 拥有协议回复与下游资源；
-Core 路由和创建下游，Wire 编解码。
+`Magent` 为每条 accepted TCP Channel 安装本 handler。它在 detecting 下有界收齐首个请求，
+再识别协议、固定协议状态、创建唯一具体 Connection，之后分派字节及 EOF，并拥有 accepted Channel 的最终关闭。
+具体 Connection 在初始化阶段解析请求语义，随后负责本地回复和下游资源；Core 选路和创建下游，Wire 编解码。
 
-同一 listener 接受 SOCKS4、SOCKS5、HTTP CONNECT 和普通 HTTP。不增加 HTTP-only listener、
-服务配置快照、协议工厂或第二套分派协议。分类成功不表示请求已经完整或合法。
+`detectBuffer` 保存 TCP 字节流中第一个协议请求的完整原始 data：从连接收到的第一个字节开始，
+包括协议头、变长字段及该请求的全部 body，不是只保存识别协议所需的前缀。一个请求可以跨多次 TCP read；
+TCP 分段、一次 read 返回或 FIN 都不能代替下面的消息结束条件。
 
-四份 Connection design 已提出由本组件收齐、校验完整请求并负责本地回复，再交具体 Connection 建立下游和转发。
-这一职责迁移尚缺完整请求交接、建立结果和成功回复后激活的接口。以下定义当前分派边界下的状态、成员和方法；
-这些声明不能直接承载全部新职责，迁移所需签名须先确认，不能把已解析目标塞进 `NIOAny` 或默默扩充私有函数。
+下表按四个入口对应的 SPEC 定义字节边界：`B = detectBuffer[0..<writerIndex]`，索引从 0 开始；
+`N` 是首请求总字节数（结束位置为不包含端点的偏移 N），`[k]` 表示字段占 k 字节。
+`U`、`D` 分别为 USERID、DOMAIN 的字节数，均不含末尾 `00`；`H` 是 HTTP 首个头结束符
+`0D 0A 0D 0A`（`\r\n\r\n`）之后的偏移，包含请求行、所有头字段和这 4 个结束字节。
 
-本版不配置 SOCKS5 UDP 的专用 DNS 服务器，因此本组件不接收、保存或透传 `dnsAddress`。
-该地址原本供 UDP 直连域名查询使用，并非本地 DNS 监听端口；移除它不改变 accepted listener 或 UDP relay 的端口。
+| 协议 / SPEC | 首请求字节布局 | 首请求结尾与精确长度 N |
+| --- | --- | --- |
+| [SOCKS4 / 4a](../SOCKS4_PROXY_SPEC.md#doc-02-inbound-wire-protocol) | SOCKS4：`04 01 DSTPORT[2] DSTIP[4] USERID[U] 00`。<br/>SOCKS4a：`04 01 DSTPORT[2] 00 00 00 xx USERID[U] 00 DOMAIN[D] 00`，`xx != 00`。 | 从偏移 8 开始找到 USERID 的第一个 `00`。普通 SOCKS4 到该字节结束：`N = 9 + U`，`B[N-1] == 00`。<br/>若 DSTIP 为 `00 00 00 xx` 且 `xx != 00`，继续从 USERID 结束符之后找 DOMAIN 的第一个 `00`：`N = 10 + U + D`，`B[N-1] == 00`。固定头内的 `00` 不作为字段结束符。 |
+| [SOCKS5](../SOCKS5_PROXY_SPEC.md#s05) | 首请求是 greeting：`05 NMETHODS[1] METHODS[M]`，其中 `M = UInt8(B[1])`。 | 先收齐前 2 字节，再收 M 个方法字节，`N = 2 + M`；合法 M 为 `1...255`，N 最大为 257。**没有固定结束字节**，METHODS 中的 `00` 是方法值，不是结束符。`M == 0` 在 2 字节处交接失败。CONNECT / UDP ASSOCIATE 命令不属于首请求，必须等 `05 00` 回复写成后再接收。 |
+| [HTTP CONNECT](../HTTP_PROXY_SPEC.md#s06) | `CONNECT SP authority SP HTTP/1.x CRLF`，随后是零或多行 `header CRLF`，最后一个 `CRLF`；完整头以 `0D 0A 0D 0A` 结束。 | 无 Content-Length 或 `Content-Length: 0` 时，`N = H`，最后 4 字节为 `0D 0A 0D 0A`；二级 init 还须通过 NIO 的完整 head/end(nil) 校验。非零 Content-Length 或任意 Transfer-Encoding 直接失败，不等待 body。 |
+| [HTTP forward](../HTTP_PROXY_SPEC.md#s06) | `METHOD SP request-target SP HTTP/1.x CRLF`，随后是零或多行 `header CRLF`，最后一个 `CRLF`，再接 `BODY[L]`（若有）。 | 无 Content-Length / Transfer-Encoding 时，`L = 0`、`N = H`。唯一合法 Content-Length 的十进制值为 L 时，`N = H + L`，必须收满头结束符之后的 L 个原始字节，由二级 init 通过 NIO head/body/end(nil) 校验。L > 0 时**没有固定结束字节**，body 内的 `00` 或 `\r\n\r\n` 都不终止请求；L = 0 才以头结束符结束。Transfer-Encoding/chunked、重复或非法 Content-Length 均失败。 |
+
+因此，正常首请求收齐时 `B[0..<N]` 就是它的完整 TCP payload；`B.count < N` 继续累计，
+`B.count == N` 恰好收齐，`B.count > N` 表示同批还带有首请求之后的额外字节。
+交接使用 `B` 的完整原始内容；额外字节保留给二级 init 按严格顺序拒绝，不能裁掉或以后作为合法业务重放。
+扫描推进 readerIndex 不改变首请求 data 的范围；不能用剩余的 readableBytes 代替完整 B。
+已确认非法、超限或 EOF 截断属于提前失败交接，不再等待完整请求，由二级对象生成适用的失败回复。
+未知协议不能猜测回复格式；不完整的 SOCKS5 greeting 在 EOF 时可直接关闭。
+
+本组件不解析业务目标、不选路、不生成 HTTP/SOCKS 回复。`NIOAny` 仍只携带 `ByteBuffer`。
+SOCKS5 的专用 `dnsAddress` 固定传 nil，不增加配置透传；UDP DIRECT 域名按
+[SOCKS5 DNS 契约](../SOCKS5_PROXY_SPEC.md#s09)失败，不回退其他解析策略。
 
 ## Contract
 
-### 受限类型与执行边界
+### 受限类型与成员
 
-主类型的目标定义为 **5 个实例成员、6 个状态、8 个方法**：1 个构造、5 个 NIO 回调、2 个私有流程方法。
-`State` 同时表达探测阶段、选定协议和终态；不再保留独立 `ProxyProbe` 或 `.active`。
-`ProxyConnection` 只有三个共享入口。不通过 extension、helper、wrapper 或新文件扩展集合。
-下列精确声明固定参数、访问级别和返回类型；未标访问级别的方法为 internal，除显式 throws 外无 async 或默认参数。
-所有状态和下游调用在 accepted Channel 的 EventLoop 串行推进。
+`MagentTCPConnection.swift` 定义本类及私有 `State`；`ProxyConnection.swift` 独立定义共享协议。
+主类型限定 **6 个实例成员、6 个状态、8 个方法**：1 个构造、5 个 NIO 回调和 2 个 private 方法。
+`requestLength` 只保存 HTTP 头部收齐后计算出的首请求总长度；不保存协议子阶段或持久 decoder。
+不新增 Bool、协议工厂、包装 owner、静态存储或其他未声明成员。HTTP 临时结果适配器复用
+[HTTP CONNECT 的 codec 契约](HttpConnectConnection-DESIGN.md#共用-http-codec-适配器)。
 
 ```swift
 internal final class MagentTCPConnection: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
+
+    private let serverChannel: Channel
+    private let core: MagentCore
+    private var detectBuffer: ByteBuffer
+    private var state: State = .detecting
+    private var proxyConnection: ProxyConnection? = nil
+    private var requestLength: Int? = nil
 }
 ```
+
+| 成员 | 初始化及允许修改的入口 | 不变量与生命周期 |
+| --- | --- | --- |
+| `serverChannel` | 仅 init 注入。 | 始终为同一 accepted Channel，本组件拥有最终关闭。 |
+| `core` | 仅 init 注入。 | 当前 runtime 的 Core，不随 restart 切换，不由本类关闭。 |
+| `detectBuffer` | init 分配空缓冲；channelRead 从首字节开始追加首请求完整原始 data，并推进扫描游标；install 清空。 | `0..<writerIndex` 保存完整累计 data，收齐边界 N 见 Context 表格；同批尾随字节也保留以供拒绝。不 discardReadBytes；readerIndex 仅作进度，不是请求起点，不能据此丢弃已扫描前缀。交接后不保存业务流量。 |
+| `state` | 初值 detecting；install 先固定四种协议之一，再构造对象；errorCaught/channelInactive 置 closed。 | 未收齐始终 detecting；六个 case 均无关联值，不承担首请求解析进度。 |
+| `proxyConnection` | 初值 nil；install 固定协议状态后构造并赋值一次。 | 强持有唯一具体对象，不覆盖、不重置；终态保留引用但不再分派业务。 |
+| `requestLength` | 初值 nil；channelRead 在 HTTP 头完整且定界合法后写入 N；install/errorCaught/channelInactive 清 nil。 | 唯一含义是首请求的总字节数，HTTP 为 H 或 H+L；等待 body 时保持不变。SOCKS4/5 不使用，不保存 head、decoder、协议类型或其他阶段数据。 |
+
+构造后所有成员及下游调用均在 accepted EventLoop 串行访问；`@unchecked Sendable` 不开放跨线程写入。
+`shutdownFuture` 只在 init 订阅，回调弱引用 accepted 并请求关闭，不另存成员。
+临时 collector、context、首包切片、探测返回值及原始 Error 仅在本次同步操作中使用。
 
 ### State 定义与转换
 
@@ -55,204 +95,194 @@ private enum State {
 }
 ```
 
-初态为 `.detecting`。四个协议状态既表示已经选定对象，也标明协议种类；不携带 Connection、缓冲、资源或 Future。
-数据不足保持 `.detecting`，不支持的输入抛错并走统一关闭，不增加 `.incomplete` 或 `.unsupported` 状态。
-
-| 状态 | 允许的输入与操作 | 合法转换与负责方法 |
+| 状态 | 允许的输入和操作 | 转换 |
 | --- | --- | --- |
-| `.detecting` | `channelRead` 累计协议前缀；不足时续读；完整分类后构造一个具体 Connection。 | `installProxyConnection` 先保存唯一对象，再进入匹配的协议状态；错误或完整关闭分别由 `errorCaught` / `channelInactive` 进入 `.closed`。 |
-| `.socks4` / `.socks5` / `.httpConnect` / `.httpForward` | 字节与输入 EOF 委派给对应的唯一对象，不再探测。具体 Connection 可能仍在握手。 | `errorCaught` / `channelInactive` 进入 `.closed`；不切换协议、不退回 `.detecting`，单向 EOF 本身不改变状态。 |
-| `.closed` | 不再分派数据、输入 EOF 或重复清理下游；保留必要的 NIO 事件传播及关闭请求。 | 终态，无回退。 |
+| detecting | 累计 detectBuffer，按 Context 表格检查首请求是否结束。未结束则继续等待，不创建下游对象。 | 收齐后 detectProxyProtocol 返回具体协议，install 先写入该协议状态，再构造对象；已确定失败按提前失败契约交接。 |
+| socks4 / socks5 / httpConnect / httpForward | 对应唯一具体 Connection；后续字节与 EOF 只分派，不再做首请求检测。 | 错误或 accepted 完整失效进入 closed，不退回 detecting、不更换协议。 |
+| closed | 不再分派或重复清理，保留必要 NIO 事件传播。 | 终态。 |
 
-探测期收到 EOF 或 runtime 的 `shutdownFuture` 完成时，先请求 accepted 关闭，由 `channelInactive` 收敛终态；
-它们不是额外状态。错误路径必须先置 `.closed` 再清理具体 Connection，阻断关闭回调重入。
-进入具体协议状态不代表请求完整、下游建连成功或本地成功回复写成；这些阶段仍由具体 Connection 的状态约束。
+`detecting` 同时覆盖首请求的所有分片；没有按协议拆分的 request/greeting 状态，也没有关联值。
+结束判断按原字节选择 Context 中的定界规则，只是本次调用的局部判断，不提前写入协议状态。
+HTTP 的总长度用 requestLength 保存，扫描位置使用 detectBuffer.readerIndex；不把已删除的状态搬进容器。
 
-### 全部实例成员
+正常顺序是：**判断首请求完整 → 判断协议 → state = 具体协议 → new ProxyConnection**。
+install 内从设置 state 到保存对象属于无回调的同步区间：构造纯解析，无 I/O、事件传播或异步任务。
+所以这个区间允许 proxyConnection 暂为 nil；start 或下一次外部回调到来前，引用必须已经保存。
+区间之外协议状态与对象不一致才是内部错误。交接不表示请求有效、建连成功或回复完成。
+错误关闭先固定 closed 再清理下游。runtime 关闭仍由 shutdownFuture 请求 accepted 关闭。
 
-以下为目标设计的全部存储属性。它们覆盖当前探测与分派职责，不是完整请求交接方案的成员上限或上线证明。
+<a id="下游-connection-协议proxyconnection"></a>
+### 共享协议：ProxyConnection
 
-| 精确声明 | 初值、用途与生命周期 |
-| --- | --- |
-| `private let serverChannel: Channel` | 构造注入的 accepted Channel；本组件拥有其最终关闭，不能替换为 listener 或下游。 |
-| `private let core: MagentCore` | 构造注入当前 runtime 的 Core，传给所有具体 Connection；活动连接不切换 Core，也不关闭 Core。 |
-| `private var detectBuffer: ByteBuffer` | 用 accepted allocator 创建空缓冲；只在探测期保存尚未交付的原始字节，分类成功后交付一次并清空，不保存转发流量。未分类就关闭时随 handler 释放。 |
-| `private var state: State = .detecting` | 保存上节六个状态；同时记录协议选择和生命周期，不另存协议种类。所有转换在 accepted EventLoop 完成，终态不可恢复。 |
-| `private var proxyConnection: ProxyConnection? = nil` | 强持有唯一具体 Connection；完整类型和对应关系见下节。安装时赋值一次，终止时清理其下游，引用随 handler 释放。 |
+协议只有以下 **4 个入口**，具体类完整实现，不提供 extension 默认实现。
+本次新增 start 是初始化解析与网络启动之间的明确边界，不新增启动结果回调或公共应用 API。
 
-`shutdownFuture` 只在构造中订阅，回调弱引用 accepted Channel，不另存为成员。
-`context`、本批 `input`、探测结果 `proxy`、交接数据 `initialData` 及构造中的 `connection` 均为方法局部值。
-不新增计数、写入 Future 或结构体来隐藏状态；本组件没有 Wire、下游 Channel 或业务写入完成计数。
-
-### 下游 Connection 协议：ProxyConnection
-
-`proxyConnection` 是主 handler 的成员，`ProxyConnection` 是它引用的现有类约束协议；不新增名为 ProxyConnection 的包装类。
-完整成员声明为：
-
-```swift
-private var proxyConnection: ProxyConnection? = nil
-```
-
-该成员可以持有四种具体 Connection 中的一种。三个入口统一定义在协议中，由各具体类完整实现，
-不提供协议默认实现：
+#### 非 private 方法
 
 ```swift
 internal protocol ProxyConnection: AnyObject {
-    /// 主 handler 交付客户端字节；具体对象按自身协议阶段处理并管理续读。
+    /// 主 handler 固定协议状态、构造并保存对象、清空首包缓冲后调用一次。
+    func start(context: ChannelHandlerContext)
+
+    /// 只交付初始化之后新到达的客户端原字节，由具体对象管理续读。
     func upstream(context: ChannelHandlerContext, data: NIOAny)
 
-    /// accepted 结束或出错时只清理自有下游；不关闭 accepted、不发回复或反向上报错误。
+    /// accepted 结束或出错时收尾自有下游；不关闭 accepted、不回包、不反向报错。
     func closeConnection(error: Error?)
 
-    /// 客户端输入 EOF；具体对象负责截断检查、半关闭或结束 UDP 关联。
+    /// 所有先到字节已交付后的客户端输入 EOF。
     func proxyInputClosed(context: ChannelHandlerContext)
 }
 ```
 
-`proxyInputClosed` 必须按具体协议处理 EOF：TCP 隧道协调半关闭，HTTP forward 继续完成请求与响应，
-SOCKS5 UDP 模式结束关联。源码迁移时删除原协议 extension 中的默认关闭实现，保留各具体类已有的同名方法；
-三个入口的签名不变。
+#### private 方法
 
-| `state` | `proxyConnection` 的合法值 |
-| --- | --- |
-| `.detecting` | nil，尚未创建具体 Connection。 |
-| `.socks4` | 唯一 `Socks4Connection` 实例。 |
-| `.socks5` | 唯一 `Socks5Connection` 实例；其 UDP 子对象由它持有，不直接保存在本成员中。 |
-| `.httpConnect` | 唯一 `HttpConnectConnection` 实例。 |
-| `.httpForward` | 唯一 `HttpForwardConnection` 实例。 |
-| `.closed` | 分类前关闭时为 nil；分类后关闭可保留原对象引用，但已经提交下游清理，不再分派业务。 |
+无。
 
-安装必须在同一 EventLoop 内按“保存对象 → 写入对应协议状态 → 取出并清空探测缓冲 → 调用 upstream”完成，
-保存对象到写入状态之间不调用外部回调。进入具体协议状态后不更换对象；若出现 nil 或类型不匹配，属于内部状态错误，
-应进入已有错误关闭入口，不能静默丢数据或重新创建对象。
-类型对应由安装分支保证，不要求逐包重复类型判断或强制转换。
-关闭先置 `.closed`，再调用一次 `closeConnection(error:)`，避免同步回调重入重复清理。
-accepted 的最终关闭仍由主 handler 负责；持有具体对象不转移 accepted 的所有权。
+#### 安装与关闭约束
 
-### 开放入口与 NIO 回调
+安装在同一 EventLoop 同步完成：**固定协议状态 → 取完整原字节视图 → init 纯解析 → 保存对象 →
+清空首包缓冲及 requestLength → start**。init 不发包、不建连、不续读，也不提交延后启动闭包。
+构造不 throws：成功请求或原始错误保存在二级对象的 prepared 阶段，由 start 消费并进入已有失败边界。
+不把首包再送一次 upstream，不使用空 ByteBuffer 充当启动信号。start 只消费一次 prepared，不能重复提交回复或建连。
 
-这里的“开放”指供 `Magent` 或 NIO 调用的 internal 入口，不增加应用可调用的 public API。
-五个事件回调来自 SwiftNIO `ChannelInboundHandler`，构造由 `Magent` 安装 accepted handler 时调用。
+安装前已知输入 EOF 时，在 start 后按序交 proxyInputClosed；若 start 已同步关闭，不再交付。
+若当时 accepted 已完整 inactive，则只清理，不构造对象或尝试回复。
+`closeConnection` 只收尾下游，最终 accepted 关闭仍由主 handler 收敛。
+具体对象可以在正常双向结束/单请求响应排空时请求 accepted.close()，但不在 closeConnection 内这样做。
+
+TCP 隧道下行已排空且 accepted 输出已关闭时，NIO 可能直接发出 channelInactive 而没有 inputClosed。
+此时 closeConnection(nil) 只允许此前已经接收的有界上行写入完成，并在失败或 core.defaultTimeout 到期时关闭下游；
+不续读、不接新工作。nil 无法区分正常 FIN 与 runtime 关闭，两者在该窄条件下采用相同有界收尾。
+错误关闭立即中断，UDP 直接释放。主 handler 只清理一次，不等待 Future 或接管写入链。
+
+### 方法契约
+
+所有未标 public 的入口均为 internal；下列签名为完整目标契约。除显式 throws/default 外不增加 async 或其他默认参数。
+
+#### 非 private 方法
 
 ```swift
-/// Magent 创建；绑定 accepted Channel、当前 Core 及关闭通知。
 internal init(
     _ serverChannel: Channel, core: MagentCore,
     shutdownFuture: EventLoopFuture<Void>
 )
-
-/// accepted 激活后发起首次手动读取。
 func channelActive(context: ChannelHandlerContext)
-
-/// 探测时累计并分类；四种协议状态只调用唯一 Connection.upstream。
 func channelRead(context: ChannelHandlerContext, data: NIOAny)
-
-/// accepted 完整关闭时置终态并清理下游一次。
 func channelInactive(context: ChannelHandlerContext)
-
-/// inputClosed 委派给具体 Connection；未选定时结束连接，其他事件继续传播。
 func userInboundEventTriggered(context: ChannelHandlerContext, event: Any)
-
-/// 固定终态、用原始错误清理下游，再关闭 accepted；重复错误不重复清理。
 func errorCaught(context: ChannelHandlerContext, error: Error)
 ```
 
-| 入口 | 调用责任与完成边界 |
+| 入口 | 调用者与责任 |
 | --- | --- |
-| `init` | 保存依赖、创建空探测缓冲并订阅关闭通知；不创建出站，不启动读写。关闭通知只请求 accepted 关闭，清理由已有 NIO 回调收敛。 |
-| `channelActive` | 传播激活事件并发起首次手动读取。 |
-| `channelRead` | `.detecting` 下调用可抛错的探测方法，不足则续读；四种协议状态交唯一对象，`.closed` 忽略。捕获探测原始错误后调用本类 `errorCaught(context:error:)` 收敛，不跳过本 handler 的清理入口。分类后读许可归具体 Connection。 |
-| `channelInactive` | 首次完整失效先进入终态，再以 nil 错误清理下游；重复调用仍传播 inactive，但不再次清理。 |
-| `userInboundEventTriggered` | 只消费 `ChannelEvent.inputClosed`；探测期请求关闭，四种协议状态转交具体 Connection，终态忽略。协议状态与对象不一致时走已有错误关闭入口；其他事件原样传播。 |
-| `errorCaught` | 首次错误先进入终态，再将原始 Error 交下游清理并请求 accepted 关闭；不包装错误、不生成本地协议回复。重复错误仅维持关闭请求。 |
+| init | Magent 安装 handler 时注入依赖、创建空缓冲、订阅 runtime 关闭通知；无网络操作。 |
+| channelActive | NIO 回调，传播激活事件并发起首次手动 read。 |
+| channelRead | detecting 下有界追加并判断首请求是否结束；不足仅续读，收齐后调用 detectProxyProtocol，再 install。局部 HTTP 头解码结果用于定界；已产生的原 Error 与支持版本一并交 install。已安装时只调用 upstream；closed 忽略。未知协议错误交本类 errorCaught。 |
+| channelInactive | 先置 closed、清空首包缓冲及 requestLength，再以 nil 清理下游一次；重复调用仍传播 inactive。 |
+| userInboundEventTriggered | 仅消费 inputClosed：已安装则委派；未齐的已识别 SOCKS4/HTTP 提前安装失败对象并通知 EOF；未知协议或未齐 greeting 请求关闭。其他事件原样传播。 |
+| errorCaught | 固定 closed、清空首包缓冲及 requestLength、以原 Error 清理下游一次，再请求 accepted 关闭；不生成本地回复。 |
 
-`Magent` 安装前设置 `autoRead=false`、单批读取和允许远端半关闭。
-分类前本组件续读，分类后具体 Connection 控制读许可，主 handler 不追加无条件 read。
-构造无需额外 deadline、时钟服务或许可对象参数。
+Magent 安装前设置 autoRead=false、单批读取和允许远端半关闭。安装前本类续读，start 后读许可归具体对象。
+构造仍不接收 dnsAddress；移除 Magent 调用点旧 DNS 参数的源码迁移尚待完成。
 
-源码迁移时，`Magent` 安装本 handler 的调用同步去掉 `dnsAddress: config.dnsListener`，
-本类删除对应成员及赋值。本轮仅修改本篇设计，不修改 Swift 或 `MagentConfig` 的公共声明；
-不能把现有源码仍接受 DNS 配置描述为已完成删除。
-
-### 私有函数定义
-
-两个私有函数均由 `.detecting` 分支调用。以下为合并类型所需的精确签名提案，确认后再改源码；
-它们只负责协议分类和安装，完整请求解析、路由和本地回复不隐含在其中。
+#### private 方法
 
 ```swift
-/// 数据不足返回 detecting，识别成功返回四种协议之一，不支持则抛错；不修改成员。
 private func detectProxyProtocol() throws -> State
-
-/// 分类完成时创建唯一对象，保存引用后交出全部探测字节一次。
-private func installProxyConnection(_ proxy: State, context: ChannelHandlerContext)
+private func installProxyConnection(
+    _ proxy: State, context: ChannelHandlerContext,
+    initialError: Error? = nil, initialVersion: HTTPVersion = .http1_1
+)
 ```
 
-| 方法 | 调用者、输入输出与副作用 |
+| 方法 | 调用者、结果与副作用 |
 | --- | --- |
-| `detectProxyProtocol` | `channelRead` 追加本批输入后调用；只读取 `detectBuffer`。不足返回 `.detecting`，成功返回四种协议之一，不支持则抛出现有 `MagentError.invalidOptions`；绝不返回 `.closed`，不消耗缓冲、不修改状态、不做网络操作。 |
-| `installProxyConnection` | `channelRead` 得到具体协议分类后调用；只接受 `.detecting` 阶段的四种协议结果。按上节顺序安装和交付一次，不执行规则匹配或直接建连。关闭后或已经安装时不得再构造；传入 `.detecting` / `.closed` 属调用错误，交已有错误关闭入口。 |
+| detectProxyProtocol | channelRead 在首请求结束后调用；只读完整原字节并返回四种协议之一。提前失败/EOF 分支也可对实际前缀作相同分类。不修改 state、缓冲或 requestLength，不收齐数据、不建连、不回包；无法分类则抛原错误。 |
+| installProxyConnection | channelRead 或 inputClosed 调用，入口必须 state == detecting 且对象为 nil，参数为四种具体协议之一。先 state = proxy，再构造并保存唯一对象、清空缓冲与 requestLength，最后 start。initialError/initialVersion 只传当前局部 HTTP 头解码的同一原 Error 和支持版本，不能包装。重复安装或非法状态走已有 errorCaught。 |
 
-这次合并仅调整以下方法契约，其他构造、NIO 回调与 `ProxyConnection` 三个入口保持原声明：
+HTTP 首请求的头部只在完整时局部解码一次。head、错误及版本都在 channelRead 本次调用中使用，
+合法时仅把总长度 N 保存为 requestLength，失败时直接分类并交 install，不跨批保存 head。
+错误交接版本取本次 codec 结果中受支持的 head.version，否则用 HTTP/1.1；未知协议不猜测回复。
+等待 body 时只比较累计长度，不能每收到一个分片就重新解码头部。
 
-| 原声明 | 目标调整与原因 |
+| 协议 | 唯一构造调用 |
 | --- | --- |
-| `private func detectProxyProtocol() -> ProxyProbe` | 改为上面的 `throws -> State`；复用状态类型表达分类结果，用原始错误结束不支持的输入。 |
-| `private func installProxyConnection(_ proxy: ProxyProbe, context: ChannelHandlerContext)` | 参数类型改为 `State`，名称和其余参数不变；安装结果直接对应协议状态。 |
-| `ProxyProbe` 的 `static func detect(_ data: Data) -> ProxyProbe` | 随独立类型移除，分类逻辑直接归已有 `detectProxyProtocol`；不新增替代静态方法或辅助类型。 |
+| SOCKS4 | `Socks4Connection(proxyChannel: serverChannel, core: core, initialData: initialData)` |
+| SOCKS5 | `Socks5Connection(proxyChannel: serverChannel, core: core, dnsAddress: nil, initialData: initialData)` |
+| CONNECT | `HttpConnectConnection(proxyChannel: serverChannel, core: core, initialData: initialData)` |
+| HTTP forward | `HttpForwardConnection(proxyChannel: serverChannel, core: core, initialData: initialData)` |
 
-### 协议探测与对象选择
+HTTP 失败交接额外传 `initialError` 和 `initialVersion`，声明以两 HTTP 文档为准。
+正常构造不传这两个参数，不由主 handler 构造 HttpProtocol 或解析 NetworkAddress。
 
-| 输入 | 选择及唯一构造 |
-| --- | --- |
-| 首字节 0x04 | `Socks4Connection(proxyChannel: serverChannel, core: core)` |
-| 首字节 0x05 | `Socks5Connection(proxyChannel: serverChannel, core: core, dnsAddress: nil)` |
-| 精确 CONNECT 前缀 | `HttpConnectConnection(proxyChannel: serverChannel, core: core)` |
-| 合法 HTTP 方法及目标前缀 | `HttpForwardConnection(proxyChannel: serverChannel, core: core)` |
+### 首请求收齐约束
 
-`Socks5Connection` 沿用其当前构造声明，此处显式传 nil 表示未配置专用 DNS；不新增读取配置或解析器的替代入口。
-按 [SOCKS5 SPEC 的 DNS 契约](../SOCKS5_PROXY_SPEC.md#s09)，TCP DIRECT 域名仍由 Core 的 NIO 连接流程解析，
-PROXY 的业务域名原样交 Wire，UDP DIRECT 数值 IP 不需要解析；UDP DIRECT 域名因缺少 DNS 配置失败，
-按关联错误边界结束该关联。不会自动回退系统解析，也不会按 UDP 载荷中的域名做解析或路由。
-上述 nil 装配只表达本组件的目标调用；SOCKS5 内部可选 DNS 能力及公共配置的整体移除须另行统一相关契约。
-
-HTTP 方法上限按 [HTTP SPEC](../HTTP_PROXY_SPEC.md#s21)统一为 32 字节。合法但尚缺字节返回 `.detecting`；
-不支持的输入抛错。识别 origin-form、absolute-form 或 `*` 只选择 HTTP 解析器，
-不绕过模型对 URI 方案、OPTIONS、方法或目标的限制。探测缓冲有界，不以方法长度替代整批字节限额。
-TODO：当前源码尚未对 `detectBuffer` 追加设置整批字节限额，实施时需补齐，不能把 32 字节方法限制当作缓冲上限。
-
-### 主 handler 到下游协议的调用映射
-
-| 方法 | 输入、责任与完成边界 |
-| --- | --- |
-| `upstream` | context 为 accepted handler context；首次收到完整探测缓冲，之后收到原序字节。具体对象校验握手余量/请求边界，并控制客户端续读。 |
-| `proxyInputClosed` | 所有已读数据交付后通知输入 EOF；由具体协议判断截断、半关闭或 UDP 关联结束。 |
-| `closeConnection` | accepted 正常失效传 nil，错误传原 Error；只释放下游资源，不再次关闭 accepted、不发回复或反向上报。 |
-
-具体 Connection 在最高失败边界完成适用的失败回复后，通过 accepted pipeline 的 errorCaught
-交回原始错误。不新增错误代理；主 handler 置 closed 后清理下游，防止下游关闭回调再次形成关闭循环。
+- 所有未完成的正常输入都保持 detecting。按原始前缀选择结束判断规则不等于协议分派；
+  只有判断完整后，才由 detectProxyProtocol 返回协议并交 install 更新 state。
+- SOCKS4 固定头未齐且未确定非法时等待；头齐后 readerIndex 从偏移 8 单调扫描 USERID。
+  普通 SOCKS4 到第一个 NUL 完整。4a 的固定头末字节非零，扫描未找到 NUL 时游标前字节也非零；
+  找到 USERID 的 NUL 后把 readerIndex 停在其后一字节，即 DOMAIN 起点，前一字节为零。
+  以后只检查该起点至多 255 字节的 DOMAIN 窗口，包含最多 254 字节名称及 NUL，不回扫 USERID。
+  不保存 domainStart、字段阶段或 Bool；非法命令/端口、域名超限立即按失败交接。
+- SOCKS5 直接按前 2 字节得到 N = 2 + NMETHODS，最多等待 257 字节，无需额外长度或阶段成员；
+  NMETHODS=0 立即失败。同批余量保留，绝不等后续命令到齐才发方法回复。
+- HTTP 方法 token 上限 32 字节。头未齐时用 readerIndex 有界扫描 CRLFCRLF，保留跨批最多 3 字节重叠；
+  头齐后固定 readerIndex 为 H，严格校验原始 UTF-8，并对 `0..<H` 调用一次共用 decodeRequest。
+  该同步操作使用局部真实 NIO decoder，结束即释放，不伪造 EOF、不构造 HttpProtocol。
+  UTF-8 非法或 codec 失败时立即交接失败，不等待 body；head/codec/context 都不跨下一次事件保留。
+- HTTP 的长度判断只处理 framing：无 CL/TE 则 N=H；唯一合法 CL=L 则先验证 L<=64KiB-H，再设 N=H+L。
+  重复/逗号/非十进制/溢出的 CL、TE/chunked、Expect、Trailer、Upgrade、CONNECT 非零 body 或声明超限，
+  立即交子 init 失败，不把额外语义模型放在主类。正常请求将 N 写入 requestLength，之后只等待 writerIndex>=N。
+  请求体原字节不需要在主类逐批解码；子 init 对完整交接数据执行唯一完整 NIO 消息校验及模型构造。
+  这是受当前单一 Content-Length 范围约束的长度判断，不增加第二套 HTTP 请求行、字段或目标 parser。
+- SOCKS4/HTTP 正常首请求上限 64 KiB，HTTP forward 计入头和 body；SOCKS5 greeting 上限 257。
+  追加前检查总量；本批首字节已能确定 SOCKS5 时先应用 greeting 限额，不先复制 64 KiB 再裁剪。
+  只有确认超限拒绝时，最多保留“上限 + 1 字节”的真实前缀作为证据并停止读取，
+  剩余输入可丢弃；子 init 必须先验总量并失败，不能把证据截成合法请求。
+  其余交接保留同批所有字节，不丢弃或延后重放。探测尚未分类时也受 64 KiB 限制。
 
 ## Core Logic
 
-1. 激活后读取。探测不足则保留 `.detecting`、保存原字节并续读；不支持的输入抛错，由本类错误入口关闭，不猜测协议回复格式。
-2. 分类后创建并保存唯一具体对象，进入对应协议状态，再把全部累计字节交付一次；前缀和同批余量都不能丢失。
-3. 后续读取及输入 EOF 只委派给该对象。严格握手下的额外字节由具体协议拒绝，不由本组件偷偷丢弃。
-4. accepted 完整失效或错误时先进入 closed，再调用一次下游清理。重复 inactive/error 只完成必要的 NIO 传播。
-5. restart 为下一周期先验证配置并创建新 Core，再结束旧周期；旧 shutdownFuture 关闭旧 accepted。
-   新连接使用新 Core 和新通知。close 终结服务实例；这里没有热更新保活或优雅排空订阅。
+```mermaid
+flowchart TD
+    A[accepted 激活 首次读取<br/>state = detecting] --> B[追加首请求原始 data]
+    B --> C{首请求结束了吗}
+    C -->|否 保持 detecting 并继续等待| B
+    C -->|是| D[识别完整首请求的协议]
+    D --> E[state = socks4 / socks5<br/>或 httpConnect / httpForward]
+    E --> F[new 对应 ProxyConnection<br/>init 纯解析]
+    F --> G[保存对象 清空 detectBuffer/requestLength<br/>调用 start]
+    G --> H[后续数据 upstream<br/>输入 EOF proxyInputClosed]
+    C -->|已确定失败| D
+    D -->|无法识别| I[主 handler 关闭]
+    G -->|失败回复后上报原 Error| I
+    H -->|错误| I
+    I --> J[先置 closed<br/>下游清理一次 accepted 关闭]
+    K[runtime shutdown 或 accepted 失效] --> J
+```
+
+主流程只有四步：**1. 判断首请求是否结束，未结束继续等待；2. 收齐后识别协议；
+3. state 改为具体协议；4. 构造下一层 ProxyConnection 并继续启动。**
+之后主 handler 不再探测、解析或缓存业务。SOCKS5 的后续命令始终由已安装的 Socks5Connection 处理。
+已确定非法、超限或 EOF 截断继续遵守提前失败契约；它们不是新的状态，也不被视为正常收齐。
 
 ## Corners
 
 | 场景 | 必须保持的行为 |
 | --- | --- |
-| 协议前缀任意分片、与请求合包 | 识别结果稳定；累计字节完整交付一次，具体协议决定请求是否有效。 |
-| HTTP 方法 31/32/33 字节 | 前两种合法 token 可分类；33 字节拒绝，不额外扩大规范范围。 |
-| 成功隧道内数据类似另一协议 | 仍交同一对象，不重新探测。 |
-| 协议已识别但请求仍未完整 | 保持对应协议状态，具体 Connection 继续处理分片；识别成功不等于允许业务转发。 |
-| 协议状态与具体对象不一致，或重复安装 | 不覆盖对象、不重放首包；状态错误交统一关闭入口，终态只做必要清理。 |
-| 分类前 EOF / 分类后 EOF | 前者结束；后者交具体对象，不能直接把单向 FIN 当整连接结束。 |
-| 具体对象失败后再来 inactive/error | 不重复回复或清理，不复活活动状态。 |
-| restart/close 与下游建连完成竞争 | 旧 accepted 关闭；具体 owner 回收迟到下游，不迁入新周期。 |
-| 未配置专用 DNS 的 SOCKS5 UDP | IP 直连和 PROXY 按原流程处理；DIRECT 域名按 SPEC 失败并结束所属关联，不静默更换解析策略。 |
+| 首请求逐字节分片 | 始终 detecting，不提前设置协议状态或构造对象；USERID/HTTP 头增量扫描，4a DOMAIN 只检查至多 255 字节窗口。 |
+| SOCKS4a USERID 与 DOMAIN 的 NUL 分片 | 分别收齐；不能把 USERID 当目标，也不能把 4a 标记当业务地址。 |
+| SOCKS5 客户端等待方法回复才发命令 | 只等 greeting，start 发方法回复；不等待全握手造成互等。 |
+| HTTP forward 的 body 晚于头到达 | state 仍为 detecting，只按 requestLength 等待完整 body；不重新解头，收齐后才分类、设状态并构造。 |
+| Expect:100-continue 或已确定非法 framing | 提前交接失败，不等待 body、不发 100、不创建下游。 |
+| 完整请求与提前业务/第二请求合包 | 原始余量交 init 拒绝；不切包后按合法业务重放。 |
+| 恰达上限 / 多一字节 | 前者仍须完整且合法；后者保留超限证据、失败，不无界复制。 |
+| 收齐期间 EOF | 已识别 SOCKS4/HTTP 由失败对象尽力回复；未知协议或未齐 greeting 关闭。 |
+| 固定协议状态后构造 / start 同步失败 | 构造无回调，保存对象后才能 start；start 失败时主清理能找到正确 owner，首包不再交 upstream。 |
+| HTTP 解码原始错误 | 错误实例传二级统一失败边界，再回主关闭；不重解造替代错误。 |
+| accepted 半关闭后直接 inactive | 仍只清理一次；二级按共享契约有界收尾已经接收的上行。 |
+| restart 与迟到建连回调竞争 | 旧对象关闭并回收迟到下游，不切换 Core、不复活状态。 |
 
-实施检查覆盖唯一构造、三入口参数方向、严格余量校验交接、读许可、EOF 和重复清理。
-本文不改变源码；能力是否已实现需按各 SPEC 和现有 Connection 测试验证。
+实施验收需覆盖四种首请求分片、同批余量、提前失败、一次 start、读许可和重复清理。
+本轮只修订文档；当前 Swift 的前缀交接、旧构造和三个共享入口尚未迁移，不能视作已通过运行验收。

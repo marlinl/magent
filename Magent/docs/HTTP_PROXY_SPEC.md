@@ -40,10 +40,13 @@ CONNECT 内的 TLS、HTTP/2 或 WebSocket 是不透明 TCP 业务，不受入站
 ## 2. 接入、所有权与运行周期
 
 Magent 的同一 TCP listener 可探测 HTTP、SOCKS4 和 SOCKS5；HTTP 不另要求专用端口。
-`MagentTCPConnection` 选择一个具体 Connection，交付完整探测余量及后续输入，拥有 accepted
-Channel 的最终关闭。协议一旦选定，不再因请求失败或隧道内容重新探测。
+`MagentTCPConnection` 识别协议并收齐首请求：CONNECT 到无体消息结束，普通转发到头及
+Content-Length body 完整。它将从首字节起的原始请求和同批余量一次交给对应 Connection 的构造，
+安装后显式启动，之后仅分派新输入，并拥有 accepted Channel 的最终关闭。协议不重新选择。
+已确定非法、超限或 EOF 截断时提前交接失败；Expect 等不支持的头部不得等待 body 才拒绝。
 
-每个 HTTP Connection 拥有请求缓冲、一次请求语义、下游 Channel、可选 TCP Wire、在途写和终态。
+每个 HTTP Connection 拥有一次请求语义、早期下游缓冲、下游 Channel、可选 TCP Wire、在途写和终态。
+构造只解析并保存成功或原始错误，安装后才允许本地回复及出站；不再在具体 Connection 累计首请求。
 `closeConnection(error:)` 只释放自有下游资源，不关闭 accepted，不生成响应，也不重入错误路径。
 主 handler 在 accepted 失效或收到原始错误时统一调用该清理入口。
 
@@ -71,8 +74,11 @@ Connection。不能让解码器先合并重复 CL，再要求模型判断原始�
 
 ### 唯一请求语义
 
-收到完整 `.head` 时只调用一次 `HttpProtocol(head:)`，保存其 `.connect` 或 `.forward` 结果。
-目标、出站请求头及请求体定界以该结果为准；`.end` 不再次从字符串提取目标。
+主 handler 收齐头部后用局部 NIO decoder 确认头部语法，按无体或唯一 Content-Length 得到总长度，
+随后只等待原始字节收齐，不构造请求语义模型。具体 Connection 初始化时对完整交接内容校验，
+从完整 `.head` 至多调用一次 `HttpProtocol(head:)`，保存其 `.connect` 或 `.forward` 结果；
+已有底层错误直接沿原错误失败，不为构造模型重解码。目标、出站头和声明体长以模型结果为准，
+并与 NIO 的 body/end 核对；不再次从字符串提取目标。
 精确类型、错误枚举及构造约束引用 [MODELS 的 HttpProtocol](MODELS_SPEC.md#httpprotocol)。
 
 | 输入 | 结果 |
@@ -103,7 +109,8 @@ Connection。不能让解码器先合并重复 CL，再要求模型判断原始�
 | 普通请求任意 TE 或 Trailer | 拒绝。 |
 | CONNECT CL=0 / 非零 CL / TE | 分别允许 / 拒绝 / 拒绝。 |
 
-`.body` 和 `.end` 由 Connection 检查时序、长度、限额、提前 EOF 及实际 trailer。
+主 handler 按头结束位置及声明体长收齐原始字节；具体 Connection 初始化再用 NIO 校验 `.body` / `.end` 及交接内容的
+时序、长度、限额、提前 EOF 及实际 trailer，不能把主层定界视为语义校验成功。
 普通请求必须完整接收、无多余请求字节才可发起业务出站；CONNECT 必须完成请求结束及解码器余量检查。
 收到头部不表示请求已经完整。超出完整请求的同批字节在出站前拒绝；以后才到达的额外字节终止本连接，
 不解释为下一事务。

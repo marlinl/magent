@@ -8,18 +8,33 @@ import XCTest
 
 /// `MagentTCPConnection` 协议探测和通用连接生命周期测试。
 final class MagentTCPConnectionTests: XCTestCase {
-  func testProxyProbeWaitsForFragmentedHTTPMethod() {
-    XCTAssertEqual(ProxyProbe.detect(Data()), .incomplete)
-    XCTAssertEqual(ProxyProbe.detect(Data("CON".utf8)), .incomplete)
-    XCTAssertEqual(ProxyProbe.detect(Data("CONNECT ".utf8)), .httpConnect)
-    XCTAssertEqual(ProxyProbe.detect(Data("GET ".utf8)), .incomplete)
-    XCTAssertEqual(ProxyProbe.detect(Data("GET /".utf8)), .httpForward)
-    XCTAssertEqual(ProxyProbe.detect(Data("PROPFIND /".utf8)), .httpForward)
-    XCTAssertEqual(ProxyProbe.detect(Data("M-SEARCH http://example.com/".utf8)), .httpForward)
-    XCTAssertEqual(ProxyProbe.detect(Data([0x04])), .socks4)
-    XCTAssertEqual(ProxyProbe.detect(Data([0x05])), .socks5)
-    XCTAssertEqual(ProxyProbe.detect(Data("UNKNOWN ".utf8)), .incomplete)
-    XCTAssertEqual(ProxyProbe.detect(Data("UNKNOWN protocol".utf8)), .unsupported)
+  func testProtocolDetectionWaitsForFragmentedHTTPPrefix() throws {
+    let channel = try makeConnectionChannel()
+    defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
+    try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
+
+    for bytes in [Data(), Data("G".utf8), Data("ET ".utf8), Data("htt".utf8)] {
+      try writeInbound(bytes, to: channel)
+      XCTAssertTrue(channel.isActive)
+      XCTAssertNil(try readOutboundData(from: channel))
+    }
+    try writeInbound(Data("x".utf8), to: channel)
+    XCTAssertFalse(channel.isActive)
+    XCTAssertNil(try readOutboundData(from: channel))
+  }
+
+  func testSocks5DispatchPreservesEveryFirstPacketByteAcrossSplits() throws {
+    let greeting = Data([0x05, 0x01, 0x00])
+    for split in 0...greeting.count {
+      let channel = try makeConnectionChannel()
+      defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
+      try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
+      try writeInbound(Data(greeting.prefix(split)), to: channel)
+      try writeInbound(Data(greeting.dropFirst(split)), to: channel)
+      XCTAssertEqual(try readOutboundData(from: channel), Data([0x05, 0x00]))
+      XCTAssertNil(try readOutboundData(from: channel))
+      XCTAssertTrue(channel.isActive)
+    }
   }
 
   func testMagentTCPConnectionClosesUnsupportedProtocol() throws {
@@ -45,7 +60,7 @@ func makeConnectionChannel() throws -> EmbeddedChannel {
   let shutdownPromise = channel.eventLoop.makePromise(of: Void.self)
   try channel.pipeline.addHandler(
     MagentTCPConnection(
-      channel, core: core, dnsAddress: nil, shutdownFuture: shutdownPromise.futureResult)
+      channel, core: core, shutdownFuture: shutdownPromise.futureResult)
   ).wait()
   return channel
 }
@@ -314,11 +329,10 @@ func readOutboundData(from channel: EmbeddedChannel) throws -> Data? {
   return Data(buffer.readableBytesView)
 }
 
-/// 绑定测试代理 listener，并向 accepted Channel 传入路由、DNS 与关闭通知。
+/// 绑定与生产分派相同的测试 listener，传入路由与关闭通知；主 handler 不配置专用 DNS。
 func bindTCPProxy(
   group: EventLoopGroup,
   core: MagentCore,
-  dnsAddress: SocketAddress? = nil,
   shutdownFuture: EventLoopFuture<Void>,
   configurePipeline: @escaping @Sendable (Channel) -> EventLoopFuture<Void> = {
     $0.eventLoop.makeSucceededFuture(())
@@ -334,7 +348,6 @@ func bindTCPProxy(
           MagentTCPConnection(
             channel,
             core: core,
-            dnsAddress: dnsAddress,
             shutdownFuture: shutdownFuture
           )
         )

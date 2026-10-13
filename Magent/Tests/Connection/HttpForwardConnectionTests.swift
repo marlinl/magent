@@ -11,13 +11,14 @@ import XCTest
 final class HttpForwardConnectionTests: XCTestCase {
   func testMagentTCPConnectionRoutesHTTPForwardToItsParser() throws {
     let channel = try makeConnectionChannel()
+    try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
 
     try writeInbound(Data("GET http://example.com/ HTTP/1.1\r\n".utf8), to: channel)
     XCTAssertNil(try readOutboundData(from: channel))
 
     try writeInbound(Data("Malformed-Header\r\n\r\n".utf8), to: channel)
-    XCTAssertEqual(try readOutboundData(from: channel), HttpForwardConnection.badRequest)
+    XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(.badRequest))
     XCTAssertFalse(channel.isActive)
   }
 
@@ -199,7 +200,7 @@ final class HttpForwardConnectionTests: XCTestCase {
       description: "HTTP forward closes after the bad gateway response")
     try client.pipeline.addHandler(
       TestDataCollector(
-        expectedByteCount: HttpForwardConnection.badGateway.count, promise: responsePromise)
+        expectedByteCount: httpErrorResponse(.badGateway).count, promise: responsePromise)
     ).wait()
     client.closeFuture.whenComplete { _ in
       clientClosed.fulfill()
@@ -211,7 +212,7 @@ final class HttpForwardConnectionTests: XCTestCase {
     )
     try writeData(request, to: client)
 
-    XCTAssertEqual(try responsePromise.futureResult.wait(), HttpForwardConnection.badGateway)
+    XCTAssertEqual(try responsePromise.futureResult.wait(), httpErrorResponse(.badGateway))
     wait(for: [clientClosed], timeout: 2)
   }
 
@@ -364,15 +365,18 @@ final class HttpForwardConnectionTests: XCTestCase {
         ("X-Keep", "value"),
       ])
     )
-    let parsed = try HttpForwardConnection.buildRequest(head: head, body: Data())
-    let payload = try XCTUnwrap(String(data: parsed.payload, encoding: .utf8))
-
-    XCTAssertEqual(parsed.target, .domain("example.com", port: 80))
-    XCTAssertTrue(payload.hasPrefix("GET /a?b=c HTTP/1.1\r\nHost: example.com\r\n"))
-    XCTAssertFalse(payload.localizedCaseInsensitiveContains("proxy-authorization"))
-    XCTAssertFalse(payload.localizedCaseInsensitiveContains("x-remove"))
-    XCTAssertTrue(payload.contains("X-Keep: value\r\n"))
-    XCTAssertTrue(payload.hasSuffix("Connection: close\r\n\r\n"))
+    let model = try HttpProtocol(head: head)
+    guard case .forward(let target, let rewritten, let framing) = model.request else {
+      return XCTFail("ordinary HTTP must produce forward semantics")
+    }
+    XCTAssertEqual(target, try NetworkAddress(host: "example.com", port: 80))
+    XCTAssertEqual(rewritten.uri, "/a?b=c")
+    XCTAssertEqual(rewritten.headers["Host"], ["example.com"])
+    XCTAssertFalse(rewritten.headers.contains(name: "Proxy-Authorization"))
+    XCTAssertFalse(rewritten.headers.contains(name: "X-Remove"))
+    XCTAssertEqual(rewritten.headers["X-Keep"], ["value"])
+    XCTAssertEqual(rewritten.headers["Connection"], ["close"])
+    guard case .none = framing else { return XCTFail("body framing must be absent") }
   }
 
   func testHTTPForwardRejectsUnsupportedOrAmbiguousRequests() throws {
@@ -416,9 +420,23 @@ final class HttpForwardConnectionTests: XCTestCase {
 
     for request in requests {
       let channel = try makeConnectionChannel()
+      try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
       try writeInbound(request, to: channel)
 
-      XCTAssertEqual(try readOutboundData(from: channel), HttpForwardConnection.badRequest)
+      let text = String(decoding: request, as: UTF8.self)
+      let status: HTTPResponseStatus
+      if text.contains("Expect:") {
+        status = .expectationFailed
+      } else if text.contains("Transfer-Encoding:") || text.contains("Upgrade:")
+        || text.contains("https://")
+      {
+        status = .notImplemented
+      } else if text.contains("HTTP/1.2") {
+        status = .httpVersionNotSupported
+      } else {
+        status = .badRequest
+      }
+      XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(status), text)
       XCTAssertFalse(channel.isActive)
       XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true))
     }
@@ -426,6 +444,7 @@ final class HttpForwardConnectionTests: XCTestCase {
 
   func testHTTPForwardRejectsPipelinedRequestFromDecoderLeftovers() throws {
     let channel = try makeConnectionChannel()
+    try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
     let request = Data(
       "GET http://127.0.0.1:9/ HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n"
@@ -434,27 +453,40 @@ final class HttpForwardConnectionTests: XCTestCase {
 
     try writeInbound(request, to: channel)
 
-    XCTAssertEqual(try readOutboundData(from: channel), HttpForwardConnection.badRequest)
+    XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(.badRequest))
     XCTAssertNil(try readOutboundData(from: channel))
     XCTAssertFalse(channel.isActive)
   }
 
-  func testHTTPForwardRequestSizeBoundaryUsesOverflowSafeRawByteCount() throws {
+  func testHTTPForwardRejectsDeclaredBodyThatCannotFitWholeRequestLimit() throws {
     let channel = try makeConnectionChannel()
-    defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
     try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
-    let prefix = Data(
-      "POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: 65536\r\n\r\n".utf8
+    defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
+    let head = Data(
+      "POST http://127.0.0.1:9/ HTTP/1.1\r\nHost: 127.0.0.1:9\r\nContent-Length: 65536\r\n\r\n".utf8
     )
-    let request = prefix + Data(repeating: 0x61, count: 64 * 1024 - prefix.count)
-
-    try writeInbound(request, to: channel)
-    XCTAssertNil(try readOutboundData(from: channel))
-    XCTAssertTrue(channel.isActive)
-
-    try writeInbound(Data([0x61]), to: channel)
-    XCTAssertEqual(try readOutboundData(from: channel), HttpForwardConnection.badRequest)
+    // The head already proves header + body cannot fit; no extra client byte or dial is needed.
+    try writeInbound(head, to: channel)
+    XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(.badRequest))
     XCTAssertFalse(channel.isActive)
+  }
+
+  func testHTTPForwardRejectsTruncatedBodyAcrossEverySplit() throws {
+    let bytes = Data(
+      "POST http://127.0.0.1:9/ HTTP/1.1\r\nHost: 127.0.0.1:9\r\nContent-Length: 4\r\n\r\nab".utf8)
+    for split in 0...bytes.count {
+      let channel = try makeConnectionChannel()
+      try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
+      try writeInbound(Data(bytes.prefix(split)), to: channel)
+      try writeInbound(Data(bytes.dropFirst(split)), to: channel)
+      XCTAssertNil(try readOutboundData(from: channel))
+      channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
+      channel.embeddedEventLoop.run()
+      XCTAssertEqual(try readOutboundData(from: channel), httpErrorResponse(.badRequest))
+      XCTAssertNil(try readOutboundData(from: channel))
+      XCTAssertFalse(channel.isActive)
+      XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true))
+    }
   }
 
   func testHTTPForwardPreservesPercentEncodedOriginForm() throws {
@@ -465,13 +497,12 @@ final class HttpForwardConnectionTests: XCTestCase {
       headers: HTTPHeaders([("Host", "example.com")])
     )
 
-    let request = try HttpForwardConnection.buildRequest(head: head, body: Data())
-    let payload = try XCTUnwrap(String(data: request.payload, encoding: .utf8))
-
-    XCTAssertTrue(
-      payload.hasPrefix("GET /a%20b/%2F?q=%0D%0AInjected HTTP/1.1\r\nHost: example.com\r\n")
-    )
-    XCTAssertFalse(payload.contains("\r\nInjected"))
+    let model = try HttpProtocol(head: head)
+    guard case .forward(_, let rewritten, _) = model.request else {
+      return XCTFail("ordinary HTTP must produce forward semantics")
+    }
+    XCTAssertEqual(rewritten.uri, "/a%20b/%2F?q=%0D%0AInjected")
+    XCTAssertFalse(rewritten.uri.contains("\r\nInjected"))
   }
 
   func testHTTPForwardNumericTargetsPreserveIPAddressType() throws {
@@ -500,25 +531,15 @@ final class HttpForwardConnectionTests: XCTestCase {
       headers: HTTPHeaders([("Host", "[fd00::1]:8080")])
     )
 
-    XCTAssertEqual(
-      try HttpForwardConnection.buildRequest(head: absoluteIPv4, body: Data()).target,
-      .ipv4(Data([10, 1, 2, 3]), port: 8080)
-    )
-    XCTAssertEqual(
-      try HttpForwardConnection.buildRequest(head: hostIPv4, body: Data()).target,
-      .ipv4(Data([10, 1, 2, 3]), port: 8080)
-    )
-    for request in [absoluteIPv6, hostIPv6] {
-      guard
-        case .ipv6(let bytes, let port) = try HttpForwardConnection.buildRequest(
-          head: request,
-          body: Data()
-        ).target
-      else {
-        return XCTFail("bracketed HTTP target must preserve IPv6 type")
+    for (head, host) in [
+      (absoluteIPv4, "10.1.2.3"), (hostIPv4, "10.1.2.3"),
+      (absoluteIPv6, "fd00::1"), (hostIPv6, "fd00::1"),
+    ] {
+      let model = try HttpProtocol(head: head)
+      guard case .forward(let target, _, _) = model.request else {
+        return XCTFail("numeric request must produce forward semantics")
       }
-      XCTAssertEqual(bytes.count, 16)
-      XCTAssertEqual(port, 8080)
+      XCTAssertEqual(target, try NetworkAddress(host: host, port: 8080))
     }
   }
 }

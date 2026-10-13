@@ -8,18 +8,132 @@ import XCTest
 
 /// `Socks4Connection` 请求、隧道、背压和 half-close 测试。
 final class Socks4ConnectionTests: XCTestCase {
-  func testMagentTCPConnectionBuffersFragmentedSOCKS4BindBeforeRejectingIt() throws {
+  func testMagentTCPConnectionRejectsSOCKS4BindAsSoonAsCommandIsKnown() throws {
     let channel = try makeConnectionChannel()
     defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
     try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
     let request = Data([0x04, 0x02, 0x01, 0xBB, 127, 0, 0, 1, 0x00])
 
-    try writeInbound(Data(request.prefix(4)), to: channel)
-    XCTAssertNil(try readOutboundData(from: channel))
-    try writeInbound(Data(request.dropFirst(4)), to: channel)
+    try writeInbound(Data(request.prefix(2)), to: channel)
 
     XCTAssertEqual(try readOutboundData(from: channel), Data([0x00, 0x5B, 0, 0, 0, 0, 0, 0]))
     XCTAssertFalse(channel.isActive)
+  }
+
+  /// A request plus one forbidden byte must fail before dialing at every incomplete split.
+  func testSOCKS4RejectsSameBatchPayloadAtEveryRequestSplit() throws {
+    let requests = [
+      socks4ConnectRequest(ipv4: [127, 0, 0, 1], port: 443),
+      socks4aConnectRequest(domain: "example.com", port: 443),
+    ]
+    for request in requests {
+      for split in 1..<request.count {
+        let channel = try makeConnectionChannel()
+        defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
+        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 12345)).wait()
+        try writeInbound(Data(request.prefix(split)), to: channel)
+        XCTAssertNil(try readOutboundData(from: channel), "split \(split)")
+        try writeInbound(Data(request.dropFirst(split)) + Data([0xAA]), to: channel)
+        XCTAssertEqual(try readOutboundData(from: channel), testSocks4Rejected, "split \(split)")
+        XCTAssertNil(try readOutboundData(from: channel))
+        XCTAssertFalse(channel.isActive)
+      }
+    }
+  }
+
+  /// Every incomplete prefix terminates once; duplicate EOF cannot acquire another reply.
+  func testSOCKS4TruncatedRequestEOFAtEveryOffsetRepliesOnce() throws {
+    let requests = [
+      socks4ConnectRequest(ipv4: [127, 0, 0, 1], port: 443),
+      socks4aConnectRequest(domain: "example.com", port: 443),
+    ]
+    for request in requests {
+      for offset in 1..<request.count {
+        let channel = try makeConnectionChannel()
+        defer { XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true)) }
+        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 12345)).wait()
+        try writeInbound(Data(request.prefix(offset)), to: channel)
+        XCTAssertNil(try readOutboundData(from: channel))
+        channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
+        channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
+        XCTAssertEqual(try readOutboundData(from: channel), testSocks4Rejected, "offset \(offset)")
+        XCTAssertNil(try readOutboundData(from: channel))
+        XCTAssertFalse(channel.isActive)
+      }
+    }
+  }
+
+  /// A stalled best-effort reply cannot retain the accepted Channel or replace the original cause.
+  func testSOCKS4FailureReplyDeadlinePreservesOriginalError() throws {
+    let channel = EmbeddedChannel()
+    let core = try MagentCore(
+      defaultDecision: .direct, proxyNodes: [], defaultTimeout: 25, rules: [])
+    let shutdown = channel.eventLoop.makePromise(of: Void.self)
+    let firstWrite = channel.eventLoop.makePromise(of: Data.self)
+    let error = channel.eventLoop.makePromise(of: Error.self)
+    let delayed = DelayedTestWrites(eventLoop: channel.eventLoop, firstWritePromise: firstWrite)
+    defer {
+      let released = delayed.release()
+      channel.embeddedEventLoop.run()
+      XCTAssertNoThrow(try released.wait())
+      XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true))
+    }
+    try channel.pipeline.addHandlers(
+      delayed, Socks4ErrorRecorder(error: error),
+      MagentTCPConnection(channel, core: core, shutdownFuture: shutdown.futureResult)
+    ).wait()
+    try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 12345)).wait()
+    try writeInbound(Data([4, 2]), to: channel)
+    XCTAssertEqual(try firstWrite.futureResult.wait(), testSocks4Rejected)
+    XCTAssertTrue(channel.isActive)
+    channel.embeddedEventLoop.advanceTime(by: .milliseconds(25))
+    XCTAssertFalse(channel.isActive)
+    XCTAssertEqual(
+      try error.futureResult.wait() as? MagentError,
+      .invalidOptions("SOCKS4 command is not supported"))
+    let writeCount = delayed.writeCount()
+    channel.embeddedEventLoop.run()
+    XCTAssertEqual(try writeCount.wait(), 1)
+  }
+
+  /// Beginning a success reply consumes reply ownership even when its write never completes.
+  func testSOCKS4SuccessReplyDeadlineClosesWithoutSecondReply() throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let loop = group.next()
+    let shutdown = loop.makePromise(of: Void.self)
+    let targetAccepted = loop.makePromise(of: Channel.self)
+    let firstWrite = loop.makePromise(of: Data.self)
+    let delayed = DelayedTestWrites(eventLoop: loop, firstWritePromise: firstWrite)
+    var channels: [Channel] = []
+    defer {
+      _ = try? delayed.release().wait()
+      shutdown.succeed(())
+      shutdownTestChannels(channels, group: group)
+    }
+    let target = try ServerBootstrap(group: group)
+      .childChannelInitializer { channel in
+        targetAccepted.succeed(channel)
+        return channel.eventLoop.makeSucceededFuture(())
+      }
+      .bind(host: "127.0.0.1", port: 0).wait()
+    channels.append(target)
+    let core = try MagentCore(
+      defaultDecision: .direct, proxyNodes: [], defaultTimeout: 200, rules: [])
+    let proxy = try bindTCPProxy(group: group, core: core, shutdownFuture: shutdown.futureResult) {
+      $0.pipeline.addHandler(delayed)
+    }
+    channels.append(proxy)
+    let client = try ClientBootstrap(group: group).connect(to: XCTUnwrap(proxy.localAddress)).wait()
+    channels.append(client)
+    let closed = expectation(description: "stalled success reply releases the accepted Channel")
+    client.closeFuture.whenComplete { _ in closed.fulfill() }
+
+    let port = try XCTUnwrap(target.localAddress?.port)
+    try writeData(socks4ConnectRequest(ipv4: [127, 0, 0, 1], port: port), to: client)
+    XCTAssertEqual(try firstWrite.futureResult.wait(), testSocks4Granted)
+    channels.append(try targetAccepted.futureResult.wait())
+    wait(for: [closed], timeout: 2)
+    XCTAssertEqual(try delayed.writeCount().wait(), 1)
   }
 
   /// 直连成功后只发送一次 SOCKS4 成功响应。
@@ -334,15 +448,21 @@ final class Socks4ConnectionTests: XCTestCase {
 
     let targetChannel = try targetAcceptedPromise.futureResult.wait()
     channels.append(targetChannel)
-    try manualReads.enqueue([firstPayload, secondPayload]).wait()
+    // Keep every injected read within the production receive limit. The whole 8 MiB
+    // stream still fills the paused receiver and proves later reads remain gated.
+    let batches =
+      stride(from: 0, to: firstPayload.count, by: 64 * 1024).map { offset in
+        Data(firstPayload[offset..<min(offset + 64 * 1024, firstPayload.count)])
+      } + [secondPayload]
+    try manualReads.enqueue(batches).wait()
 
-    XCTAssertEqual(try manualReads.deliveredCount().wait(), 2)
+    XCTAssertLessThan(try manualReads.deliveredCount().wait(), batches.count + 1)
 
     try targetChannel.setOption(ChannelOptions.autoRead, value: true).wait()
     let receivedPayload = try targetPayloadPromise.futureResult.wait()
     XCTAssertEqual(receivedPayload.count, firstPayload.count + secondPayload.count)
     XCTAssertEqual(receivedPayload.suffix(secondPayload.count), secondPayload)
-    XCTAssertEqual(try manualReads.deliveredCount().wait(), 3)
+    XCTAssertEqual(try manualReads.deliveredCount().wait(), batches.count + 1)
   }
 
   /// SOCKS4 客户端半关闭前的最后一批数据必须先于下游 FIN 转发。
@@ -758,3 +878,22 @@ private func socks4aConnectRequest(domain: String, port: Int) -> Data {
 
 private let testSocks4Granted = Data([0x00, 0x5A, 0, 0, 0, 0, 0, 0])
 private let testSocks4Rejected = Data([0x00, 0x5B, 0, 0, 0, 0, 0, 0])
+
+/// Observes the original accepted-pipeline failure before the lifecycle owner consumes it.
+private final class Socks4ErrorRecorder: ChannelInboundHandler, @unchecked Sendable {
+  typealias InboundIn = ByteBuffer
+  private let error: EventLoopPromise<Error>
+  private var recorded = false
+
+  init(error: EventLoopPromise<Error>) {
+    self.error = error
+  }
+
+  func errorCaught(context: ChannelHandlerContext, error: Error) {
+    if !recorded {
+      recorded = true
+      self.error.succeed(error)
+    }
+    context.fireErrorCaught(error)
+  }
+}

@@ -29,7 +29,7 @@ USERID 只用于确定报文边界，不成为身份、路由键或节点凭据�
 | 所有者 | 责任 |
 | --- | --- |
 | Magent | EventLoopGroup、listener、accepted Channel 与运行周期关闭通知 |
-| MagentTCPConnection | accepted Channel 协议探测、向唯一 Connection 分派、最终关闭 |
+| MagentTCPConnection | accepted Channel 协议探测、首请求增量收齐、向唯一 Connection 分派、最终关闭 |
 | Socks4Connection | 请求解析、本地回复、下游 Channel、独立 TCP Wire、背压与方向 EOF |
 | Core | 消费已验证目标、规则匹配、节点 UUID 查找、Wire 选择和下游创建 |
 | Wire | 实际节点端点、毫秒超时、一次启动及流编解码；不拥有 Channel 或本地回复 |
@@ -85,8 +85,12 @@ DOMAIN 为 `1...254` 字节，规范名称的标签与总长度按模型校验�
 <a id="doc-03-incremental-parser"></a>
 ## 03 · 增量解析、目标身份与严格顺序
 
-请求可以任意分片。缺少固定字段或终止 NUL 时，只要尚未确定非法或超过上限，就等待更多输入。
-不得把一次 read 的结束当作请求结束；同一字节不能因逐字节输入而被反复从头扫描。
+请求可以任意分片，由 MagentTCPConnection 收齐首请求后交给 Socks4Connection 初始化校验；
+构造只保存解析结果，安装后才启动本地回复和出站。二级对象不再积累请求分片。
+已确定非法、超限或 EOF 截断时提前交接失败，仍由二级对象尽力回复 0x5B，不创建下游。
+缺少固定字段或终止 NUL 时，只要尚未确定非法或超过上限，就等待更多输入。
+不得把一次 read 的结束当作请求结束；USERID 扫描必须保存进度，不因逐字节输入而重扫已检查的 USERID。
+SOCKS4a 的 DOMAIN 可以从其起点检查至多 255 字节（含终止 NUL）的有界窗口，不能回扫整个请求前缀。
 版本、命令、端口、字段格式已确定非法时立即失败，不等待对端继续补齐。
 
 SOCKS4a 名称严格交给 [NetworkAddress](MODELS_SPEC.md#networkaddress) 的构造和规范化规则：

@@ -32,7 +32,7 @@ TCP 使用严格请求/回复顺序：greeting 后须等待方法回复，请求
 | 所有者 | 职责 |
 | --- | --- |
 | Magent | EventLoopGroup、listener、accepted Channel 和运行周期关闭通知 |
-| MagentTCPConnection | 协议探测、客户端输入/EOF 分派、accepted Channel 最终关闭 |
+| MagentTCPConnection | 协议探测、首个 greeting 收齐、客户端输入/EOF 分派、accepted Channel 最终关闭 |
 | Socks5Connection | 本地解析及回复、TCP 下游、UDP 关联 Channel、可选 DNS client、后端登记及清理 |
 | MagentCore | 使用模型规则选路、提供 TCP/UDP Wire、创建下游 Channel |
 | Wire | 节点端点、TCP 启动及编解码；不拥有 Channel 或发送本地 SOCKS 回复 |
@@ -66,6 +66,8 @@ VER(1) | NMETHODS(1) | METHODS(NMETHODS)
 ```
 
 VER 必须是 `05`，NMETHODS 为 `1...255`，当前消息长 `2 + NMETHODS`，最多 257 字节。
+主 handler 收齐的首请求仅为这个 greeting，不等待后续 CONNECT / ASSOCIATE 命令。
+具体 Connection 初始化解析原始 greeting 及同批余量；安装后才启动方法回复，后续命令由它增量收齐。
 完整列表包含 `00` 才回复 `05 00`；无 `00` 或空列表回复 `05 FF` 后结束。
 同时包含 `00` 和 `02` 仍只选择 `00`；不进入 RFC 1929 子协商。
 

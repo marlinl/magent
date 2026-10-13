@@ -115,12 +115,17 @@ Keep public support types next to the public API that consumes them. Keep small 
 ## Connection and Protocol Ownership
 
 `Magent.start(_:)` installs one `MagentTCPConnection` for every accepted TCP channel. `MagentTCPConnection` owns
-protocol detection and the accepted channel lifecycle. It buffers until `ProxyProbe` selects exactly one concrete
-connection: `Socks4Connection`, `Socks5Connection`, `HttpConnectConnection`, or `HttpForwardConnection`.
+protocol detection and the accepted channel lifecycle. The target contract buffers the first complete protocol
+message before initializing exactly one `Socks4Connection`, `Socks5Connection`, `HttpConnectConnection`, or
+`HttpForwardConnection`. This means the SOCKS5 greeting only, and includes the Content-Length body for HTTP
+forward. Known-invalid or truncated SOCKS4/HTTP input is handed off early for a local failure reply. Constructors
+parse without I/O; after installing the owner and clearing the buffer, the main handler calls `start(context:)`.
+Only subsequent new bytes go through `upstream`. Current source still requires migration to this contract.
 
-Each concrete TCP connection owns its incremental request buffer, protocol state, selected `Wire`, and downstream
-`wireChannel`. `ProxyConnection.closeConnection(error:)` closes only downstream resources; it must not close the
-accepted proxy channel owned by `MagentTCPConnection`. All `channelInactive` and `errorCaught` paths must guard the
+Each concrete TCP connection owns protocol state, early downstream buffering, its selected `Wire`, and downstream
+`wireChannel`; SOCKS5 additionally accumulates the command received after the method reply.
+`ProxyConnection.closeConnection(error:)` closes only downstream resources; it must not close the accepted proxy
+channel owned by `MagentTCPConnection`. All `channelInactive` and `errorCaught` paths must guard the
 closed state before propagating cleanup to avoid recursive close loops.
 
 SOCKS4, SOCKS5, and HTTP CONNECT use strict request/reply ordering: bytes received after a complete handshake

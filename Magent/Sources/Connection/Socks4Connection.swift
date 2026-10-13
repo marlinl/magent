@@ -139,9 +139,14 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
       fail(MagentError.malformedRequest("truncated SOCKS4 request"))
       return
     }
-    tunnelReady.flatMap {
+    tunnelReady.flatMap { () -> EventLoopFuture<Void> in
       self.wireWriteTail
-    }.flatMap {
+    }.flatMap { () -> EventLoopFuture<Void> in
+      // If both inputs ended, closing either output can make NIO close that Channel
+      // completely. Drain both write directions before that can trigger owner cleanup.
+      self.wireInputEnded
+        ? self.proxyWriteTail : self.proxyChannel.eventLoop.makeSucceededFuture(())
+    }.flatMap { () -> EventLoopFuture<Void> in
       guard self.state == .forwarding, let channel = self.wireChannel else {
         return self.proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
       }
@@ -184,7 +189,7 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
       if wireInitialized {
         try inbound(input)
       } else {
-        guard input.readableBytes <= Self.maximumPendingBytes - earlyWireBytes.readableBytes else {
+        guard input.readableBytes <= 64 * 1024 - earlyWireBytes.readableBytes else {
           throw MagentError.malformedRequest("SOCKS4 early downstream buffer exceeded")
         }
         earlyWireBytes.writeBuffer(&input)
@@ -209,13 +214,19 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
         try self.wire?.finishInbound()
         self.wireEOFChecked = true
       }
-    }.flatMap {
+    }.flatMap { () -> EventLoopFuture<Void> in
       self.tunnelReady
-    }.flatMap {
+    }.flatMap { () -> EventLoopFuture<Void> in
       self.proxyWriteTail
-    }.flatMap {
+    }.flatMap { () -> EventLoopFuture<Void> in
+      self.proxyInputEnded
+        ? self.wireWriteTail : self.proxyChannel.eventLoop.makeSucceededFuture(())
+    }.flatMap { () -> EventLoopFuture<Void> in
       guard self.state == .forwarding else {
         return self.proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
+      }
+      guard !self.proxyOutputEnded else {
+        return self.proxyChannel.eventLoop.makeSucceededFuture(())
       }
       self.proxyOutputEnded = true
       return self.proxyChannel.close(mode: .output)
@@ -241,12 +252,12 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
     }
     // An inactive Channel cannot accept the still-open client direction. Preserve the
     // success/reverse-write barriers, but do not leave the accepted input open afterwards.
-    tunnelReady.flatMap {
+    tunnelReady.flatMap { () -> EventLoopFuture<Void> in
       guard self.state != .closed else {
         return self.proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
       }
       return self.proxyWriteTail
-    }.flatMap {
+    }.flatMap { () -> EventLoopFuture<Void> in
       guard self.state != .closed else {
         return self.proxyChannel.eventLoop.makeSucceededFuture(())
       }
@@ -344,6 +355,15 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
       throw MagentError.invalidOptions("SOCKS4 command is not supported")
     }
     wire = try core.routeTCPWire(address)
+    // One operation owns this deadline, including connect, startup and the complete
+    // local reply. Terminal cleanup completes tunnelReady and cancels the timer.
+    let deadline = proxyChannel.eventLoop.scheduleTask(
+      in: .milliseconds(wire?.getTimeout() ?? core.defaultTimeout)
+    ) {
+      self.fail(MagentError.channelConnectionTimedOut)
+    }
+    tunnelReady.whenComplete { _ in deadline.cancel() }
+    proxyChannel.closeFuture.whenComplete { _ in deadline.cancel() }
     let connected: EventLoopFuture<Channel>
     if let wire {
       connected = core.createTCPClientChannel(
@@ -354,31 +374,37 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
         eventLoop: proxyChannel.eventLoop, address: address,
         timeout: core.defaultTimeout, handler: self)
     }
-    connected.flatMap { channel -> EventLoopFuture<Void> in
+    connected.flatMapThrowing { channel -> Data? in
       guard self.state != .closed, self.proxyChannel.isActive else {
         channel.close(promise: nil)
-        return channel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
+        throw MagentError.connectionClosed
       }
       self.wireChannel = channel
-      do {
-        let startup = try self.wire?.start(handshake: address)
-        if let startup, startup.isEmpty {
-          throw MagentError.invalidOptions("Wire startup must return bytes or nil")
-        }
-        self.wireInitialized = true
-        let early = self.earlyWireBytes
-        self.earlyWireBytes = self.proxyChannel.allocator.buffer(capacity: 0)
-        try self.inbound(early)
-        let ready = self.wireReadyPromise
-        self.wireReadyPromise = nil
-        ready?.succeed(())
-        let startupWrite =
-          startup.map(self.requestWireChannel)
-          ?? channel.eventLoop.makeSucceededFuture(())
-        return startupWrite.flatMap { self.startTunnel(channel) }
-      } catch {
-        return channel.eventLoop.makeFailedFuture(error)
+      // The sole supported TCP backend's startup output is bounded by 32 salt,
+      // 259 address and 34 framing bytes. Reserve both owned write copies first.
+      guard self.pendingWireBytes <= Self.maximumPendingBytes / 2 - 325 else {
+        throw MagentError.malformedRequest("SOCKS4 startup buffer exceeded")
       }
+      let startup = try self.wire?.start(handshake: address)
+      if let startup, startup.isEmpty || startup.count > 325 {
+        throw MagentError.invalidOptions("Wire startup exceeds its fixed capacity")
+      }
+      self.wireInitialized = true
+      let early = self.earlyWireBytes
+      self.earlyWireBytes = self.proxyChannel.allocator.buffer(capacity: 0)
+      try self.inbound(early)
+      let ready = self.wireReadyPromise
+      self.wireReadyPromise = nil
+      ready?.succeed(())
+      return startup
+    }.flatMap { startup -> EventLoopFuture<Void> in
+      startup.map(self.requestWireChannel)
+        ?? self.proxyChannel.eventLoop.makeSucceededFuture(())
+    }.flatMap { () -> EventLoopFuture<Void> in
+      guard let channel = self.wireChannel else {
+        return self.proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
+      }
+      return self.startTunnel(channel)
     }.whenFailure { error in
       self.fail(error)
     }
@@ -386,14 +412,16 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
 
   /// A complete eight-byte success write is the only transition that enables tunnel delivery.
   private func startTunnel(_ channel: Channel) -> EventLoopFuture<Void> {
-    guard state != .closed, proxyChannel.isActive, channel.isActive else {
+    guard state != .closed, proxyChannel.isActive,
+      channel.isActive || (wireInputEnded && pendingWireBytes == 0)
+    else {
       channel.close(promise: nil)
       return proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
     }
     guard let reply = respondProxyChannelOnce(Self.granted) else {
       return proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
     }
-    return reply.flatMap {
+    return reply.flatMap { () -> EventLoopFuture<Void> in
       guard self.state != .closed, self.proxyChannel.isActive else {
         return channel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
       }
@@ -436,7 +464,16 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
     } else {
       reply = nil
     }
+    // Best-effort failure replies also have a finite lifetime. Timeout reports the
+    // original failure, never a replacement timeout, then owner cleanup closes both sides.
+    let deadline = proxyChannel.eventLoop.scheduleTask(in: .milliseconds(core.defaultTimeout)) {
+      guard !self.errorReported, !self.resourcesReleased else { return }
+      self.errorReported = true
+      self.proxyChannel.pipeline.fireErrorCaught(error)
+    }
+    proxyChannel.closeFuture.whenComplete { _ in deadline.cancel() }
     (reply ?? proxyChannel.eventLoop.makeSucceededFuture(())).whenComplete { _ in
+      deadline.cancel()
       guard !self.errorReported, !self.resourcesReleased else { return }
       self.errorReported = true
       self.proxyChannel.pipeline.fireErrorCaught(error)
@@ -449,14 +486,35 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
     guard let channel = wireChannel, channel.isActive else {
       throw MagentError.connectionClosed
     }
-    guard data.readableBytes <= Self.maximumPendingBytes - pendingWireBytes else {
+    // Fixed capacities of the currently supported Shadowsocks TCP implementation:
+    // each 16 KiB input produces at most 16,452 bytes (two AEAD frames). Reserve
+    // the retained input, one temporary plaintext copy and both encoded write copies
+    // for the whole batch before invoking Wire, including queued earlier writes.
+    let count = data.readableBytes
+    guard count <= 64 * 1024 else {
       throw MagentError.malformedRequest("SOCKS4 upstream buffer exceeded")
     }
-    // TODO: Reserve Wire's documented worst-case expansion before encode. This first
-    // version bounds queued output; concrete Wire capacity guarantees still need migration.
-    let plain = Data(data.readableBytesView)
-    let encoded = try wire?.encodeOutbound(plain, address: nil) ?? plain
-    requestWireChannel(encoded).whenComplete { result in
+    let chunks = (count + 16 * 1024 - 1) / (16 * 1024)
+    let maximumOutput = wire == nil ? count : chunks * 16_452
+    guard
+      count + min(count, 16 * 1024) + 2 * maximumOutput
+        <= Self.maximumPendingBytes - 2 * pendingWireBytes
+    else {
+      throw MagentError.malformedRequest("SOCKS4 upstream capacity reservation failed")
+    }
+    var input = data
+    var write = wireWriteTail
+    while let part = input.readSlice(length: min(input.readableBytes, 16 * 1024)),
+      part.readableBytes > 0
+    {
+      let plain = Data(part.readableBytesView)
+      let encoded = try wire?.encodeOutbound(plain, address: nil) ?? plain
+      guard encoded.count <= 16_452 else {
+        throw MagentError.malformedRequest("Wire exceeded its fixed encode capacity")
+      }
+      write = requestWireChannel(encoded)
+    }
+    write.whenComplete { result in
       switch result {
       case .success:
         if self.state == .forwarding, !self.proxyInputEnded, self.pendingWireBytes == 0,
@@ -473,27 +531,37 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
   /// Decodes initialized stream input and retains early plaintext behind the complete-reply barrier.
   private func inbound(_ data: ByteBuffer) throws {
     guard state != .closed, wireInitialized else { return }
-    guard data.readableBytes <= Self.maximumPendingBytes - pendingProxyBytes - earlyProxyBytes.count
-    else {
+    let count = data.readableBytes
+    guard count <= 64 * 1024 else {
       throw MagentError.malformedRequest("SOCKS4 downstream buffer exceeded")
     }
-    // TODO: Include Wire's retained partial frame and worst-case plaintext release in
-    // the pre-call reservation once the concrete decoder capacity contract is migrated.
-    let bytes = Data(data.readableBytesView)
-    let decoded = bytes.isEmpty ? Data() : (try wire?.decodeInbound(bytes).data ?? bytes)
-    guard decoded.count <= Self.maximumPendingBytes - pendingProxyBytes - earlyProxyBytes.count
+    // A batch can release one historical SS frame (at most 16,383 plaintext bytes)
+    // in addition to its new bytes. Reserving only the current input is insufficient.
+    let maximumOutput = wire == nil || count == 0 ? count : count + 16_383
+    guard
+      count + min(count, 16 * 1024) + 2 * maximumOutput
+        <= Self.maximumPendingBytes - 2 * pendingProxyBytes - 2 * earlyProxyBytes.count
     else {
-      throw MagentError.malformedRequest("SOCKS4 decoded buffer exceeded")
+      throw MagentError.malformedRequest("SOCKS4 downstream capacity reservation failed")
     }
-    if state == .handshaking {
-      earlyProxyBytes.append(decoded)
-      return
+    var input = data
+    var write = proxyWriteTail
+    while let part = input.readSlice(length: min(input.readableBytes, 16 * 1024)),
+      part.readableBytes > 0
+    {
+      let bytes = Data(part.readableBytesView)
+      let decoded = try wire?.decodeInbound(bytes).data ?? bytes
+      guard decoded.count <= 32 * 1024 else {
+        throw MagentError.malformedRequest("Wire exceeded its fixed decode capacity")
+      }
+      if state == .handshaking {
+        earlyProxyBytes.append(decoded)
+      } else if !decoded.isEmpty {
+        write = respondProxyChannel(decoded)
+      }
     }
-    guard !decoded.isEmpty else {
-      if !wireInputEnded, pendingProxyBytes == 0 { wireChannel?.read() }
-      return
-    }
-    respondProxyChannel(decoded).whenComplete { result in
+    guard state == .forwarding else { return }
+    write.whenComplete { result in
       switch result {
       case .success:
         if self.state == .forwarding, !self.wireInputEnded, self.pendingProxyBytes == 0 {
@@ -510,12 +578,12 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
     guard state != .closed, let channel = wireChannel else {
       return proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
     }
-    guard data.count <= Self.maximumPendingBytes - pendingWireBytes else {
+    guard data.count <= Self.maximumPendingBytes / 2 - pendingWireBytes else {
       return proxyChannel.eventLoop.makeFailedFuture(
         MagentError.malformedRequest("SOCKS4 downstream write buffer exceeded"))
     }
     pendingWireBytes += data.count
-    let write = wireWriteTail.flatMap {
+    let write = wireWriteTail.flatMap { () -> EventLoopFuture<Void> in
       guard self.state != .closed else {
         return channel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
       }
@@ -530,13 +598,13 @@ internal final class Socks4Connection: ChannelInboundHandler, ProxyConnection, @
 
   /// Orders local replies and already decoded business bytes without taking the reply right.
   private func respondProxyChannel(_ data: Data) -> EventLoopFuture<Void> {
-    guard data.count <= Self.maximumPendingBytes - pendingProxyBytes else {
+    guard data.count <= Self.maximumPendingBytes / 2 - pendingProxyBytes else {
       return proxyChannel.eventLoop.makeFailedFuture(
         MagentError.malformedRequest("SOCKS4 accepted write buffer exceeded"))
     }
     let isFailureReply = state == .closed && firstError != nil
     pendingProxyBytes += data.count
-    let write = proxyWriteTail.flatMap {
+    let write = proxyWriteTail.flatMap { () -> EventLoopFuture<Void> in
       guard self.proxyChannel.isActive,
         self.state != .closed || (isFailureReply && !self.resourcesReleased)
       else {

@@ -112,7 +112,6 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
           return
         }
         if head.version == .http1_0 || head.version == .http1_1 { requestVersion = head.version }
-        // TODO: HttpProtocol(head:) 及 Request 关联值由 MODELS_SPEC 后续模型迁移提供。
         request = try HttpProtocol(head: head)
       }
       guard let request, case .forward(let target, let head, _) = request.request else {
@@ -136,6 +135,9 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
       sent.whenSuccess {
         guard self.state != .closed, self.firstError == nil else { return }
         self.requestBody.clear()
+        if self.remoteInputEnded {
+          do { try self.finishRemoteInput() } catch { self.fail(error) }
+        }
         if self.proxyInputEnded {
           self.proxyInputClosed(context: acceptedContext.value)
         } else {
@@ -162,7 +164,7 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
     }
     guard requestSent, !remoteOutputEnded else { return }
     remoteOutputEnded = true
-    remoteWrite.flatMap {
+    remoteWrite.flatMap { () -> EventLoopFuture<Void> in
       guard self.state != .closed, let channel = self.wireChannel else {
         return self.proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
       }
@@ -282,7 +284,10 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
     case .none: expected = 0
     case .fixedLength(let count): expected = count
     }
-    guard expected <= UInt64(Self.bufferLimit),
+    let headBytes = requestBytes - input.readableBytes - requestBody.readableBytes
+    guard headBytes <= Self.bufferLimit,
+      expected <= UInt64(Self.bufferLimit - headBytes),
+      UInt64(requestBody.readableBytes) <= expected,
       UInt64(input.readableBytes) <= expected - UInt64(requestBody.readableBytes)
     else {
       throw MagentError.malformedRequest("HTTP body or trailing bytes exceed declared length")
@@ -310,28 +315,44 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
     let loop = proxyChannel.eventLoop
     return loop.makeCompletedFuture {
       self.wire = try self.core.routeTCPWire(target)
-    }.flatMap {
+    }.flatMap { () -> EventLoopFuture<Channel> in
+      guard self.state != .closed, self.firstError == nil else {
+        return loop.makeFailedFuture(MagentError.connectionClosed)
+      }
       if let wire = self.wire {
         return self.core.createTCPClientChannel(
           eventLoop: loop, address: wire.getEndpoint(), timeout: wire.getTimeout(), handler: self)
       }
       return self.core.createTCPClientChannel(
         eventLoop: loop, address: target, timeout: self.core.defaultTimeout, handler: self)
-    }.flatMap { channel in
+    }.flatMap { channel -> EventLoopFuture<Void> in
       guard self.state != .closed, self.firstError == nil, self.proxyChannel.isActive else {
         channel.close(promise: nil)
         return loop.makeFailedFuture(MagentError.connectionClosed)
       }
       self.wireChannel = channel
       return loop.makeCompletedFuture {
-        // TODO: 启动写入的绝对期限仍需接入，当前只沿用 Core 建连 timeout。
         let startup = try self.wire?.start(handshake: target)
         self.wireStarted = true
         var output = channel.allocator.buffer(capacity: startup?.count ?? 0)
         if let startup { output.writeBytes(startup) }
         return output
-      }.flatMap { startup in
-        self.writeRemote(startup)
+      }.flatMap { startup -> EventLoopFuture<Void> in
+        guard startup.readableBytes <= 325 else {
+          return loop.makeFailedFuture(
+            MagentError.invalidOptions("TCP Wire startup exceeds supported capacity"))
+        }
+        // 本次启动操作拥有计时器；底层写成功、失败或关闭均取消它，不跨连接保留任务。
+        let deadline = loop.scheduleTask(
+          in: .milliseconds(self.wire?.getTimeout() ?? self.core.defaultTimeout)
+        ) { [weak self = self] in
+          self?.fail(MagentError.channelConnectionTimedOut)
+        }
+        let written = self.writeRemote(startup)
+        written.whenComplete { _ in deadline.cancel() }
+        // cleanup 关闭下游即取消；不依赖任意 outbound handler 一定兑现其写 promise。
+        channel.closeFuture.whenComplete { _ in deadline.cancel() }
+        return written
       }.flatMapThrowing {
         guard self.state != .closed, self.firstError == nil else {
           throw MagentError.connectionClosed
@@ -372,11 +393,22 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
       if let failure = collector.failure { throw failure }
       var output = collector.bytes ?? self.proxyChannel.allocator.buffer(capacity: 0)
       collector.bytes = nil
-      // TODO: 按 Wire 固定最坏输出上界为编码前的输入、返回值与副本预留容量。
+      // 请求批次最大 64 KiB，前一 part 已写成；先预留四片的最坏编码输出。
+      guard output.readableBytes <= Self.bufferLimit, self.remoteWriteBytes == 0 else {
+        throw MagentError.invalidOptions("HTTP outbound transfer budget is exhausted")
+      }
       if let wire = self.wire, output.readableBytes > 0 {
-        let encoded = try wire.encodeOutbound(Data(output.readableBytesView), address: nil)
-        output = self.proxyChannel.allocator.buffer(capacity: encoded.count)
-        output.writeBytes(encoded)
+        var input = output
+        output = self.proxyChannel.allocator.buffer(capacity: 4 * 16_452)
+        while let bytes = input.readSlice(length: min(16 * 1024, input.readableBytes)),
+          bytes.readableBytes > 0
+        {
+          let encoded = try wire.encodeOutbound(Data(bytes.readableBytesView), address: nil)
+          guard encoded.count <= 16_452 else {
+            throw MagentError.invalidOptions("TCP Wire exceeds supported encode capacity")
+          }
+          output.writeBytes(encoded)
+        }
       }
       return output
     }.flatMap { self.writeRemote($0) }.flatMapThrowing {
@@ -401,12 +433,24 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
       earlyRemote.writeBuffer(&data)
       return
     }
-    // TODO: 按实际 Wire 的固定单次输入/最坏输出上界，在调用前预留容量。
+    // 16 KiB 输入可能释放历史残留帧，故按每片 32 KiB 返回值预留，不能只用本次输入大小。
+    // 单批输入/副本/最坏聚合输出/临时结果和在途写合计受 512 KiB 方向预算约束。
+    guard data.readableBytes <= Self.bufferLimit, clientWriteBytes == 0 else {
+      throw MagentError.invalidOptions("HTTP inbound transfer budget is exhausted")
+    }
     var output = data
     if let wire, data.readableBytes > 0 {
-      let decoded = try wire.decodeInbound(Data(data.readableBytesView)).data
-      output = proxyChannel.allocator.buffer(capacity: decoded.count)
-      output.writeBytes(decoded)
+      var input = data
+      output = proxyChannel.allocator.buffer(capacity: 128 * 1024)
+      while let part = input.readSlice(length: min(16 * 1024, input.readableBytes)),
+        part.readableBytes > 0
+      {
+        let decoded = try wire.decodeInbound(Data(part.readableBytesView)).data
+        guard decoded.count <= 32 * 1024 else {
+          throw MagentError.invalidOptions("TCP Wire exceeds supported decode capacity")
+        }
+        output.writeBytes(decoded)
+      }
     }
     guard output.readableBytes > 0 else {
       if !remoteInputEnded { wireChannel?.read() }
@@ -433,7 +477,8 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
       try wire?.finishInbound()
       wireInputFinished = true
     }
-    guard !finishing else { return }
+    // 源站可在请求发送期间结束响应；仍要等整个 head/body/end 链写成，不能只等当前 part。
+    guard requestSent, !finishing else { return }
     finishing = true
     clientWrite.whenComplete { result in
       guard self.state != .closed, self.firstError == nil else { return }
@@ -501,14 +546,14 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
   /// Wire 启动和请求内容共用写序；实际写成后释放持有字节，不把数据无限排入 NIO。
   private func writeRemote(_ data: ByteBuffer) -> EventLoopFuture<Void> {
     guard state != .closed, firstError == nil, !remoteOutputEnded, let channel = wireChannel,
-      data.readableBytes <= Self.bufferLimit - remoteWriteBytes
+      data.readableBytes <= 128 * 1024 - remoteWriteBytes
     else {
       return proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
     }
     guard data.readableBytes > 0 else { return remoteWrite }
     let count = data.readableBytes
     remoteWriteBytes += count
-    remoteWrite = remoteWrite.flatMap {
+    remoteWrite = remoteWrite.flatMap { () -> EventLoopFuture<Void> in
       guard self.state != .closed, self.firstError == nil else {
         return channel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
       }
@@ -520,12 +565,13 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
 
   /// 客户端写保持源站字节顺序；本地错误由 fail 的 responseStarted 屏障隔离。
   private func writeClient(_ data: ByteBuffer) -> EventLoopFuture<Void> {
-    guard !didCleanUp, data.readableBytes <= Self.bufferLimit - clientWriteBytes else {
+    guard !didCleanUp, data.readableBytes <= 128 * 1024 - clientWriteBytes else {
       return proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
     }
+    guard data.readableBytes > 0 else { return clientWrite }
     let count = data.readableBytes
     clientWriteBytes += count
-    clientWrite = clientWrite.flatMap {
+    clientWrite = clientWrite.flatMap { () -> EventLoopFuture<Void> in
       guard !self.didCleanUp else {
         return self.proxyChannel.eventLoop.makeFailedFuture(MagentError.connectionClosed)
       }

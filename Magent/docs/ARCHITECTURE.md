@@ -185,19 +185,26 @@ can exercise them, but they are not part of the API exposed to applications.
 `Connection/` implements the local proxy frontends and owns accepted-connection
 protocol state.
 
-`MagentTCPConnection` is installed on every accepted TCP channel. It buffers
-the initial bytes until it can identify one supported frontend and then hands
-the channel to a concrete connection:
+`MagentTCPConnection` is installed on every accepted TCP channel. The target
+contract buffers the complete first protocol message before initializing one
+concrete connection; current source still hands off after prefix detection:
 
 - `HttpConnectConnection` for HTTP CONNECT tunnels;
 - `HttpForwardConnection` for the supported HTTP forward-proxy subset;
 - `Socks4Connection` for SOCKS4 and SOCKS4a CONNECT;
 - `Socks5Connection` for SOCKS5 CONNECT and UDP ASSOCIATE.
 
-Each concrete connection parses its local protocol incrementally, derives the
-requested destination, asks `Core` for a routing decision, opens and owns the
-downstream channel, and forwards data in both directions. It also owns the
-frontend-specific success or failure reply and its protocol state machine.
+The first message is the full SOCKS4/4a request, SOCKS5 greeting, HTTP CONNECT
+request without a body, or HTTP forward request including its Content-Length
+body. Known-invalid or truncated SOCKS4/HTTP input is handed off early for a
+local failure reply. Initializers parse without I/O; after saving the one owner
+and clearing its buffer, the main handler calls `start(context:)` once. Only new
+bytes go to `upstream`. SOCKS5 command requests arrive after the method reply
+and remain incrementally parsed by the concrete connection.
+
+Each concrete connection derives the requested destination, asks `Core` for a
+routing decision, opens and owns the downstream channel, and forwards data. It
+also owns the frontend-specific reply and its protocol state machine.
 
 The Connection layer does not define routing policy and does not implement a
 remote proxy protocol. It consumes the decision and `Wire` selected by Core.
@@ -285,8 +292,8 @@ the original destination.
   settings, and Network Extension integration.
 - `Magent` owns its `EventLoopGroup`, local listener, accepted TCP channels,
   and each running cycle's shutdown signal.
-- `MagentTCPConnection` owns the accepted channel's protocol detection and
-  overall frontend lifecycle.
+- `MagentTCPConnection` owns the accepted channel's protocol detection, first-message
+  accumulation, unique frontend installation, and overall frontend lifecycle.
 - A concrete Connection owns its protocol state, downstream channel, and any
   protocol-specific relay resources.
 - A `Wire` owns only backend protocol state; it never owns the channel carrying
@@ -365,8 +372,10 @@ own status and verification requirements.
 ### Shared TCP Lifecycle
 
 - `MagentTCPConnection` incrementally probes the accepted byte stream, selects
-  one concrete frontend, and transfers all buffered bytes to it. A probe match
-  is not request validation. The HTTP probe accepts token methods up to 32 bytes;
+  one concrete frontend, and, in the target contract, collects its first message
+  before initialization. All same-batch trailing bytes are included for strict
+  validation; known failure permits early handoff. A probe match is not request
+  validation. The HTTP probe accepts token methods up to 32 bytes;
   a target beginning with `https://` can select the forward parser and still be
   rejected by that parser.
 - A TCP request performs one `routeTCPWire` selection. `nil` means direct;
@@ -414,7 +423,9 @@ failure for a known SPEC gap, is not evidence that the target behavior passes.
 
 ### SOCKS4 and SOCKS4a
 
-`Socks4Connection` owns the incremental request, local reply, and TCP tunnel.
+`Socks4Connection` owns request validation, the local reply, and TCP tunnel.
+The target moves first-request accumulation into `MagentTCPConnection`; its
+initializer receives the complete request, or a prefix already known to fail.
 It supports CONNECT with a SOCKS4 IPv4 target or SOCKS4a domain target; it rejects
 BIND and provides no UDP command. USERID is consumed only to locate its NUL
 terminator, and SOCKS4a reads a separate NUL-terminated domain. The frontend must

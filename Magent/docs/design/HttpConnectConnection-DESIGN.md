@@ -1,251 +1,250 @@
 # HttpConnectConnection Product Design
 
-更新日期：2026-10-10。状态：**职责与成员设计提案；请求交接接口待确认，尚不能据此直接迁移源码**。
+更新日期：2026-10-13。状态：**六成员目标设计；现有 Swift 尚未迁移，不代表上线验收通过**。
 行为基线：[HTTP SPEC](../HTTP_PROXY_SPEC.md)、[Wire SPEC](../WIRES_SPEC.md)、[MODELS SPEC](../MODELS_SPEC.md)。
 
 ## Context
 
-上游是 [MagentTCPConnection 的 Core Logic](MagentTCPConnection-DESIGN.md#core-logic)：它完成协议探测，
-选择 `.httpConnect` 并持有唯一 `HttpConnectConnection`，首次交付探测缓冲，之后通过
-`ProxyConnection.upstream`、`proxyInputClosed`、`closeConnection` 分派字节、EOF 和清理。
-accepted Channel 的最终关闭始终由该上游负责；本类借用 accepted，拥有唯一 `wireChannel` 及可选 TCP Wire。
+`MagentTCPConnection` 探测协议并收齐 HTTP 首请求，构造时交付包含同批余量的全部原始字节；
+已确定非法或截断时提前交付前缀。主 handler 仅在头完整时做一次局部 NIO 头解码及长度定界，
+不构造 HttpProtocol 或发送本地响应；不持久保存 decoder 或解码 body。
+本类 init 纯解析并保存结果；主 handler 安装完成后显式调用 [ProxyConnection.start](MagentTCPConnection-DESIGN.md#共享协议proxyconnection)，
+再开始本地响应、Core 选路、Wire 启动及转发。upstream 此后只接收新字节，不重放首请求。
+本类借用 accepted Channel，拥有唯一 `wireChannel` 和本连接独占的可选 `wire`；DIRECT 无 Wire。
+accepted 的最终关闭属于主 handler；`closeConnection(error:)` 只处理本类状态和下游资源。
+全部状态在 accepted EventLoop 访问，不新增 Task、线程、会话包装或 Swift 文件。
 
-上游当前第 2 步只完成分类与字节交付，不代表 CONNECT 请求完整、合法或握手成功。
-本篇后续流程沿用已提出的完整请求交接前提：上游收齐并完成 HTTP 解码及唯一模型校验，
-再将最终目标交本类；上游负责本地 200 / 错误响应，本类负责下游建立和隧道转发。
-完整目标交接、建立结果回传及 200 写成后的激活接口仍待确认，现行架构、SPEC 和源码尚未迁移。
-
-因此本类流程从“接收已验证目标”开始，依次为 Core 路由与建连、Wire 启动写入、上游完整 200 写成、
-隧道转发及收尾。四份文档、五个业务类的整体关系见
-[共同设计前提](Socks4Connection-DESIGN.md#context)。隧道中的 TLS、HTTP/2 等作为业务数据，不重新解析或再次选路。
+CONNECT 仅支持无体 authority-form。完整请求至完整 200 写成之间拒绝客户端业务；
+随后所有业务均为不透明隧道字节，不再解析 HTTP 或重新选路。
 
 ## Contract
 
-### 全部实例成员
-
-本类保留 **5 个基础成员**，计数不构成硬上限或正常 EOF 已闭合的证明。
-
-| 声明 | 用途与生命周期 |
-| --- | --- |
-| `private let proxyChannel: Channel` | 借用 accepted，用于业务写回与向 owner 报告错误；清理不关闭它。 |
-| `private let core: MagentCore` | 当前 runtime 注入；一次路由及下游创建的入口，连接内不更换。 |
-| `private var wireChannel: Channel?` | 唯一 TCP 下游，初始 nil，关闭时释放，迟到建连结果直接关闭。 |
-| `private var wire: Wire?` | PROXY 保存本连接独占 Wire；DIRECT 为 nil。节点端点、超时和编码使用同一实例。 |
-| `private var state: State = .handshaking` | 建立与等待完整 200 合属 `.handshaking`，另区分隧道转发与终止；不以关联值存放额外数据。 |
-
-HTTP 请求缓冲、版本和回复资格属于主 handler；目标、建连 Future、Wire 启动数据及当前写 Future
-属于相应操作的局部变量/回调链。回调捕获数据仍须有界；Wire 负责自己的帧分片。
-不保存第二份 HTTP 请求、早到响应队列或 `toWireWrite` / `toProxyWrite`。
-
-状态不得携带其他资源，也不能省略必要的结束条件。
-不新增基类、资源 struct、闭包容器或源文件。
-
-### State 定义与转换
-
-沿用既有状态名与无关联值枚举，恢复明确初值。`handshaking` 在完整请求交接方案中表示
-下游建立及本地成功回复尚未完成，不再表示本类累计协议分片。
-
-```swift
-private enum State {
-    case handshaking
-    case forwarding
-    case closed
-}
-
-private var state: State = .handshaking
-```
-
-| 当前状态 | 允许的输入与操作 | 转换条件及推进者 |
-| --- | --- | --- |
-| `.handshaking` | 完整目标只接收一次；建立链可拨号并写 Wire 启动数据；不转发客户端或下游业务。 | 主 handler 的完整成功回复写成通知将状态置为 `.forwarding`；建连成功本身不切状态。 |
-| `.forwarding` | `upstream` / `channelRead` 转发业务；对应 EOF 入口处理方向结束，另一方向仍可继续。 | 正常双向结束协调完成，或 `fail` / `closeConnection` 终止时进入 `.closed`。 |
-| `.closed` | 禁止业务、重复响应及续读；只允许关闭并释放未清理资源、回收迟到 Channel。 | 终态，无回退；重复清理仍检查并释放实际资源。 |
-
-构造设置初态，`fail` 和 `closeConnection` 可从任何非终态进入 `.closed`。
-启动与成功回复是一条有序流程；成功回复后启读的跨组件入口仍须确认，不能由普通下游回调擅自激活。
-上述枚举定义协议阶段；双向 EOF 和在途写排空的协调要求继续保留，不能据此把单方向 FIN 直接视为整连接关闭。
-
-### 方法契约与待确认交接
-
-保留 [ProxyConnection 三个入口声明](MagentTCPConnection-DESIGN.md#下游-connection-协议proxyconnection)。
-`upstream` 仅接受激活后的业务字节；`proxyInputClosed` 接收客户端 EOF；`closeConnection` 幂等释放下游，
-不生成 HTTP 响应、不关闭 accepted、不重入错误路径。
-
-下游回调沿用现有 SwiftNIO 声明，全部在 accepted EventLoop 执行：
+### 类型、六个实例成员及状态
 
 ```swift
 internal final class HttpConnectConnection: ChannelInboundHandler, ProxyConnection, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
+    private enum Direction { case upstream, downstream }
+    private enum Transfer {
+        case reading
+        case writing(tail: EventLoopFuture<Void>, pendingBytes: Int)
+        case draining(tail: EventLoopFuture<Void>, pendingBytes: Int)
+        case ended
+    }
+    private enum State {
+        case prepared(version: HTTPVersion, result: Result<HttpProtocol, Error>)
+        case opening(version: HTTPVersion, upstream: Transfer, downstream: Transfer)
+        case replying(upstream: Transfer, downstream: Transfer)
+        case relay(upstream: Transfer, downstream: Transfer)
+        case failing
+        case finishing(tail: EventLoopFuture<Void>)
+        case closed
+    }
+    private let proxyChannel: Channel
+    private let core: MagentCore
+    private var state: State
+    private var buffer: ByteBuffer
+    private var wireChannel: Channel? = nil
+    private var wire: Wire? = nil
 }
+```
 
+这是完整实例成员集合：**6 个成员、0 个 Boolean 成员**。不增加静态/计算属性、位掩码、
+上下文对象或附加存储绕过限制。关联值也属于合同：仅保存当前阶段必需的版本、两向传输状态及
+建立期两个输入状态及真实写屏障。prepared 只短暂保存解析结果或原始错误；不添加独立请求、
+错误、codec、计时器字段或旧布尔标记。原始首请求只属于 init 局部参数，构造结束即释放。
+
+| 成员 / 关联值 | 初始化、变更入口与生命周期 |
+| --- | --- |
+| `proxyChannel` / `core` | init 注入的强引用，连接内不替换；下游使用 accepted EventLoop。 |
+| `buffer` | init 用 accepted allocator 建空缓冲，只保存启动/回复前早到的下游原字节；不保存请求。屏障通过后取走并释放，closeConnection 清空。 |
+| `wireChannel` / `wire` | openTunnel 一次选路后赋值；Wire 同时决定端点、超时和流状态。迟到 Channel 在赋值前检查状态，不符合阶段则立即关闭。cleanup 先取空再关闭资源。 |
+| `state` | init 置 prepared；start 成功分支进入 opening，失败分支交 fail。启动成功进入 replying，200 真正写成进入 relay；fail 抢占 failing；closeConnection 进入 closed 或受限 finishing，终态不复活。 |
+| `prepared.result` | init 同步局部解码、最多构造一次 HttpProtocol，确认 CONNECT 无体且无余量；成功只保存模型，失败保存原 Error。start 取走结果后释放，重复 start 不重复启动。 |
+| `version` | prepared/opening 可本地回复；正常构造取支持的入站版本，否则 HTTP/1.1。initialError 非 nil 时取受支持的 initialVersion，否则 HTTP/1.1；进入 replying 前封闭失败响应资格。 |
+| `opening` / `replying` 的 `Transfer` | 仅允许 reading/ended，分别表示未见/已见输入 EOF。建立/200 的真实写屏障属于唯一建立链局部值，不保存为业务 tail。 |
+| `relay` 的 `Transfer` | upstream 指客户端→下游；downstream 指下游→客户端。writing 持有尚未完成的真实网络写 tail 及完整容量预留；draining 表示该方向已见 EOF，必须等待同一 tail；ended 表示输入已 EOF 且数据已排空，不单独表示 FIN 已提交。 |
+| `finishing.tail` | accepted 已失效后的原上行排空屏障，只能沿既有链完成；不再接收输入、建连或启动新的业务。 |
+
+reading 遇业务进入 writing，遇 EOF 完成适用校验后直接 ended；不为零业务制造空 Future。
+writing 可追加到同一有界 tail 或进入 draining。
+写完成扣减本批容量预留，仅最新 tail 清零后才能恢复 reading；draining 清零后先切 ended。
+新进入 ended 时若反向仍 reading/writing，提交对应输出 FIN；反向 draining 时暂缓，双 ended 时整体关闭。
+先更新状态再执行 I/O，避免同步 channelInactive 重入；FIN 回调只传播失败，不重复发 FIN。
+启动门槛前只记录输入 ended；门槛通过后先将早到 buffer 纳入 relay 写链，再按所记录 EOF
+推进 draining、校验 Wire 尾部和关闭，不把建立/回复阶段的 ended 当成 relay 已经排空。
+
+### 完整方法声明
+
+#### 非 private 方法
+
+```swift
+internal init(proxyChannel: Channel, core: MagentCore, initialData: ByteBuffer, initialError: Error? = nil, initialVersion: HTTPVersion = .http1_1)
+internal func start(context: ChannelHandlerContext)
+internal func upstream(context: ChannelHandlerContext, data: NIOAny)
+internal func proxyInputClosed(context: ChannelHandlerContext)
+internal func closeConnection(error: Error?)
 internal func channelRead(context: ChannelHandlerContext, data: NIOAny)
 internal func userInboundEventTriggered(context: ChannelHandlerContext, event: Any)
 internal func channelInactive(context: ChannelHandlerContext)
 internal func errorCaught(context: ChannelHandlerContext, error: Error)
+internal static func decodeRequest(_ data: ByteBuffer, on channel: Channel) throws -> HTTPRequestPartsHandler.Output
+internal static func encodeResponse(version: HTTPVersion, status: HTTPResponseStatus, on channel: Channel) throws -> ByteBuffer
 ```
 
-`channelRead` 解码并写回业务；正常 EOF 回调执行 Wire 检查与方向结束；异常失效及 `errorCaught`
-向 accepted owner 报告原始错误。已终止回调只传播事件或释放资源，不重复清理。
-
-| 待确认接口责任 | 调用方 → 拥有者 | 完成条件 / 原因 |
-| --- | --- | --- |
-| 目标交接与建立结果 | 主 handler → 本类 → 主 handler | 目标已通过 HttpProtocol 校验；建连及启动写成后才允许 200。 |
-| 隧道激活 | 主 handler → 本类 | 完整 200 写成后启动业务读取，客户端与下游都不能越过屏障。 |
-| EOF 与最终结束 | 主 handler ↔ 本类 | 先完成已接收数据的写入，再传播 FIN；最终关闭 accepted 由主 handler 执行。 |
-
-不自行新增或修改这些方法的 Swift 签名。旧 `parseRequestHead`、`writeSuccess`、`localResponse`
-对应的请求解析及本地回复责任移到主 handler。已有构造、建立、编解码及写入方法声明在下节完整保留；
-只对新增跨组件交接单独确认，不把整个原有方法集合改成待定。
-
-### 同文件 NIO 适配器
-
-此前确认的 `HTTPRequestPartsHandler`、`HTTPEncodedBytesHandler` 服务于 HTTP 请求解码和本地报文编码。
-在新前提下，这些操作跟随主 handler 的请求/回复流程；它们不拥有本 Connection 的路由、Wire 或生命周期。
-不能把请求模型、版本或缓冲偷偷留在这些适配器中，作为本类的隐式成员。
-
-本轮不更改适配器源码、签名或文件位置；后续迁移需确认由谁创建、消费和释放。
-本提案所称“五个类”指业务 Connection 类，已有 NIO codec 适配器不算新增 Connection，也不承担新的业务 owner。
-
-#### 已确认的适配器声明与内部成员
-
-以下精确声明及 codec 暂存契约继续保留，运行在 accepted EventLoop；后续随解析/编码调用方迁移，
-不增加网络 Channel，不转存 Connection 的 Core、Wire、EOF 或生命周期。两个适配器均沿用无参数默认构造。
-
-```swift
-internal final class HTTPRequestPartsHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = HTTPServerRequestPart
-
-    /// 暂存唯一 head、有界 body、end 及 trailer；第二个 head 或非法次序记录为错误。
-    internal func channelRead(context: ChannelHandlerContext, data: NIOAny)
-
-    /// 保存首个原始解码错误，交由当前解析阶段抛出。
-    internal func errorCaught(context: ChannelHandlerContext, error: Error)
-}
-
-internal final class HTTPEncodedBytesHandler: ChannelOutboundHandler, @unchecked Sendable {
-    typealias OutboundIn = IOData
-
-    /// 有界收集编码器输出；只接收 ByteBuffer，拒绝 FileRegion，不向网络写入。
-    internal func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?)
-}
-```
-
-以下存储成员均为 `internal`，可选值初始为 nil；每次取走结果后清空，适配器不跨请求复用。
-
-| 所属类型 / 声明 | 用途与释放 |
+| 方法 | 调用方与职责 |
 | --- | --- |
-| `HTTPRequestPartsHandler` / `var head: HTTPRequestHead?` | 保存 NIO 头及重复字段，交解析 owner 构造一次模型；取走后释放。 |
-| `HTTPRequestPartsHandler` / `var body: ByteBuffer?` | 当前 codec 调用的有界正文结果；CONNECT 必须为空，Forward 由请求 owner 取走，不长期留第二份完整请求。 |
-| `HTTPRequestPartsHandler` / `var ended: Bool = false` | `.end` 到达后置 true；收到头或字节数相符都不能代替结束事件。 |
-| `HTTPRequestPartsHandler` / `var trailers: HTTPHeaders?` | 记录 `.end` 的 trailer，由解析 owner 拒绝不支持的内容；结束时释放。 |
-| `HTTPRequestPartsHandler` / `var failure: Error?` | 保存首个解码/事件次序错误，调用阶段原样抛出；不吞错或自行回复。 |
-| `HTTPEncodedBytesHandler` / `var bytes: ByteBuffer?` | 当前编码批次的有界字节，最多 64 KiB；取走并清空后交实际网络写入。 |
-| `HTTPEncodedBytesHandler` / `var failure: Error?` | 保存首个容量/不支持 IOData 错误，阶段调用方检查；不能以空输出冒充成功。 |
+| init | 主 handler 交付首请求或失败前缀；纯同步解析并保存 prepared，不 read/write、选路、建连、投递启动任务或向 accepted 上报错误。initialError 非 nil 时保留同一 Error，不重复解码/建模。 |
+| start | 主 handler 先写协议 state，再 init，保存对象并清空首请求缓冲后调用一次；取出 prepared，成功开始 openTunnel，失败交 fail；不使用空 upstream 隐式启动。 |
+| upstream / closeConnection | 前者只接收构造后的新字节，完整 200 前严格拒绝业务；后者由 accepted owner 通知结束，不关闭 accepted、不回复、不重复上报。 |
+| channelRead | 下游回调交付业务，由 relay/write 完成透传或编解码、实际网络写入与流控。 |
+| proxyInputClosed / userInboundEventTriggered / channelInactive | 将首次 EOF 交 finish 推进对应 Transfer；重复事件幂等。正常 EOF 校验 Wire，一次排空和半关闭；全关不能假装成功排空。 |
+| errorCaught | 下游原始错误汇入 fail，由统一失败边界决定回复并上报主 handler。 |
+| decodeRequest / encodeResponse | 两 HTTP Connection 共用的局部 codec 操作；不持有连接资源，不选择错误策略；原错经 Output.failed 或声明的 throws 返回，不包装。 |
 
-请求必须保留准确余量；CONNECT 解码到 `.end` 且无 body/trailer/额外字节后才建立下游。
-Forward 的 body 按模型无体/Content-Length 定界，不把后续请求送入同一 decoder。
-`HTTPResponseEncoder` 用于本地响应，`HTTPRequestEncoder` 用于 Forward 请求；编码结果须符合模型的字段契约。
-编码 promise 只表示本地字节生成，成功回复屏障以实际网络写 Future 为准。
-隧道业务及源站原始响应直接走字节写入路径，不能再次经过 HTTP 编码器。
-
-### 构造与私有方法定义
-
-以下列出完整的构造及私有方法签名，并逐项注明职责。私有方法同样属于 Contract，
-不能在精简成员时一并省略、合并或擅自改签名。涉及职责迁移的方法仍保留原声明和去向，
-其新归属及调用接口确认前不删除；新增跨组件入口单独确认。
-除注明的迁移项外，不通过 extension、helper、wrapper、重载或新文件扩充方法集合；
-同步错误原样抛至拥有入口，Future 失败交统一错误边界，不在细节方法包装错误。
+#### private 方法
 
 ```swift
-/// 主 handler 注入 accepted 与当前 Core；初始化 handshaking，不访问网络。
-internal init(proxyChannel: Channel, core: MagentCore)
-
-/// 解析 HTTP 头并保留重复字段及准确余量，不足返回 nil；解析责任随主 handler 迁移。
-private func parseRequestHead(_ input: inout ByteBuffer) throws -> HTTPRequestHead?
-
-/// 路由并建立唯一下游；Future 成功表示连接及 Wire 启动完成，不表示本地 200 已写成。
-private func openTunnel(target: NetworkAddress) -> EventLoopFuture<Void>
-
-/// 原完整 200 回复入口；回复责任随主 handler 迁移，实际写成后才允许隧道启读。
-private func writeSuccess() -> EventLoopFuture<Void>
-
-/// 按序写回业务字节；返回实际网络写成结果，失败不在此包装。
-private func writeClient(_ data: ByteBuffer) -> EventLoopFuture<Void>
-
-/// 写入 Wire 启动或已编码上行业务；返回实际网络写成结果，保持来源顺序。
-private func writeRemote(_ data: ByteBuffer) -> EventLoopFuture<Void>
-
-/// 转发态 upstream 调用；DIRECT 透传，PROXY 编码后交 writeRemote。
-private func relayClient(_ data: ByteBuffer) throws
-
-/// 下游 channelRead 调用；DIRECT 透传或解码一次后交 writeClient。
-private func relayRemote(_ data: ByteBuffer) throws
-
-/// 正常 EOF 入口；检查 Wire，按成功回复与在途写完成条件结束对应输出。
-private func finishRemoteInput() throws
-
-/// 统一接收原始错误；主 handler 按回复资格选择本地错误响应或终止。
+private func openTunnel(request: HttpProtocol) -> EventLoopFuture<Void>
+private func relay(_ data: ByteBuffer, direction: Direction) throws
+private func write(_ data: ByteBuffer, direction: Direction) -> EventLoopFuture<Void>
+private func finish(_ direction: Direction) throws
 private func fail(_ error: Error)
-
-/// 原共用本地响应构造器；按请求版本生成 CONNECT 200 或无体错误响应，随回复责任迁移。
-internal static func localResponse(version: HTTPVersion, status: HTTPResponseStatus) -> HTTPResponseHead
 ```
 
-| 方法 | 归属与调用责任 |
+| 方法 | 调用方与职责 |
 | --- | --- |
-| `init` | 保留；主 handler 注入 accepted 与 Core，初态 `.handshaking`，不访问网络。 |
-| `parseRequestHead` | 请求解析责任随主 handler 迁移；原始 UTF-8、重复字段、准确余量以及 `.end` 检查继续保留。 |
-| `openTunnel` | 保留本类建立责任与声明；Future 成功表示 DIRECT 已连接或 Wire 初始化及启动写成，不表示本地 200 已写成。 |
-| `writeSuccess` / `localResponse` | 本地回复责任随主 handler 迁移；按请求版本编码，完整 200 是启读条件，一次回复资格不能丢失。 |
-| `relayClient` / `relayRemote` | 保留；转发态 `upstream` / 下游 `channelRead` 调用，PROXY 只编码/解码一次，不重新解析隧道业务。 |
-| `writeClient` / `writeRemote` | 保留实际字节写入；所属转发或启动流程调用，Future 仅在网络写成后成功。 |
-| `finishRemoteInput` | 保留；正常 EOF 或正常 inactive 调用，检查 Wire 并按成功回复及在途写完成条件传播方向结束；不得因恢复声明而虚构已解决排空。 |
-| `fail` | 保留统一错误入口；转交原始错误，由主 handler 按本地回复是否已开始处理，不由 codec 或帮助方法另行回复。 |
+| openTunnel | start 取出合法模型后调用；一次选路、拨号、Wire start 和实际启动写，随后编码并实际写完整 200。建立链持有本次目标等局部值，迟到回调检查阶段。 |
+| relay / write | 下游回调或 upstream 交付业务；DIRECT 透传，PROXY 有界编解码。write 返回实际网络 Future，按方向串联、计数和恢复读许可。 |
+| finish | EOF 入口调用；首次 EOF 推进对应 Transfer，重复事件幂等。正常 EOF 校验 Wire，一次排空和半关闭；全关不能假装成功排空。 |
+| fail | 所有同步/异步失败汇入此边界；按原阶段决定本地回复，先占 failing，再在唯一回复链保留原 Error 并上报主 handler。 |
 
-### 协作者与容量契约
+### 共用 HTTP codec 适配器
 
-Core 的精确接口引用 [Core Contract](MagentCore-DESIGN.md#contract)，Wire 方法与结果类型引用
-[Wire 抽象接口](../WIRES_SPEC.md#抽象接口草图)。TCP 路由一次，DIRECT 返回 nil Wire，PROXY 使用独占 TCP Wire；
-代理端点与超时来自同一 Wire。规则失败或节点缺失不回退 DIRECT，Connection 不再自行匹配规则。
-全部下游复用 accepted EventLoop；`@unchecked Sendable` 不允许跨 EventLoop 并发访问。
+以下类型仍位于现有 `HttpConnectConnection.swift`。它们只收集一次同步编解码的结果，不是新的
+Connection owner；不持有 Channel、Core、Wire、Connection、Future 或业务生命周期。
+两个适配器均默认无参构造，只收集本次局部 codec 操作，不跨批恢复已解出的头。
+类型和成员声明如下，方法按访问级别单列。
 
-调用 Wire 前按 [容量契约](../WIRES_SPEC.md#缓冲和进度)预留输入和最坏输出空间；
-当前输入、Wire 内部分片、编码输出和在途写都计入有界内存，方法局部捕获也不能例外。
-启动流程遵守 [TCP 启动约束](../WIRES_SPEC.md#启动与状态转换)，正常下游 EOF 遵守
-[完整性与半关闭](../WIRES_SPEC.md#eof-与半关闭)。不通过新增全局配额、公共配置或无归属任务实现这些要求。
+```swift
+internal final class HTTPRequestPartsHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
+    typealias InboundIn = HTTPServerRequestPart
+    internal enum Output {
+        case empty
+        case head(HTTPRequestHead, body: ByteBuffer)
+        case complete(HTTPRequestHead, body: ByteBuffer)
+        case failed(head: HTTPRequestHead?, error: Error)
+    }
+    internal private(set) var output: Output = .empty
+}
+internal final class HTTPEncodedBytesHandler: ChannelOutboundHandler, RemovableChannelHandler, @unchecked Sendable {
+    typealias OutboundIn = IOData
+    internal private(set) var output: Result<ByteBuffer, Error>? = nil
+}
+```
+
+#### 非 private 方法
+
+```swift
+// HTTPRequestPartsHandler
+internal func channelRead(context: ChannelHandlerContext, data: NIOAny)
+internal func errorCaught(context: ChannelHandlerContext, error: Error)
+// HTTPEncodedBytesHandler
+internal func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?)
+```
+
+| 所属类型 / 方法 | 调用方与职责 |
+| --- | --- |
+| HTTPRequestPartsHandler.channelRead | NIO 解码事件；严格接收唯一 head、零或多段 body、唯一 end(nil)，重复、乱序、trailer、超限转 failed；请求结果最多 64 KiB。 |
+| HTTPRequestPartsHandler.errorCaught | 保留首个原始 NIO 错误及已解出的 head；不包装错误，不保存 trailers/ended/failure 独立标志。 |
+| HTTPEncodedBytesHandler.write | NIO 编码输出；仅聚合有界 ByteBuffer，不接受 FileRegion，编码结果最多 128 KiB；promise 表示编码完成，不能替代真实网络写屏障。 |
+
+#### private 方法
+
+两个适配器均无 private 方法。
+
+decodeRequest 同时供主 handler 的一次完整头部探测，以及两个子 init 的完整请求验收使用。
+每次在 accepted EventLoop 创建局部 HTTPRequestDecoder、ByteToMessageHandler 和默认请求适配器，
+由 NIO 配对 decoder 生命周期；不伪造 EOF，头已完整但 body 未送入时允许返回 head。
+解码错误经 Output.failed 保留同次已经解出的 head 和首个原 Error，不包装、不另行路由，
+不向 accepted owner 发错误或生命周期事件。返回 empty/head/complete 或 failed，由调用方决定是否继续等待。
+codec、context 和 collector 仅存活于当前同步调用，结束即卸载释放，不跨网络事件或逐批重解累计前缀。
+编码同样局部使用真实 NIO encoder；临时适配器默认同步移除，编码完成并卸载后才向 Channel 写字节。
+encodeResponse 的 200 无 CL/TE/Connection/body；错误带 Content-Length:0、Connection:close。
+
+### 首请求交接与构造解析
+
+主 handler 收到完整且原始 UTF-8 合法的头后，仅调用一次 decodeRequest 解码头部。
+CONNECT 的正常 requestLength 为头长；主只用该长度判断可交接，不保存 head/decoder 或解码 body。
+初始缓冲不丢前缀，initialData 是 0..<writerIndex 全部字节，包含同批余量。
+Expect、TE/chunked、Upgrade、Trailer、CONNECT 非零 body、长度超限、语法错或 EOF 截断可提前交接，
+不能等待 Expect 客户端继续发送 body。非法原始头部 UTF-8 也立即交前缀，由 init 校验并保存失败。
+主只选择交接时机；语义错误由 init 校验，头部 codec 已产生的首个原 Error 通过 initialError 原样交接，
+initialVersion 从同次 Output.failed 的 head 取得支持版本，否则 HTTP/1.1，不为版本新增持久状态。
+确定总量超限时最多保留 64 KiB+1 的证据前缀，init 必须拒绝，不得截成合法 64 KiB。
+
+initialError 非 nil 时，init 直接保存同一错误及受支持的 initialVersion，不解码、不建模；
+正常路径忽略 initialVersion，先检查总量及原始头部严格 UTF-8，再局部 NIO 解码并取支持版本。
+随后唯一构造 HttpProtocol；对于 head 尚无 end 的前缀，先让模型识别 Expect 等不支持特征，
+再把剩余不完整情况判为截断。成功必须为 CONNECT、准确完整 end(nil)、空 body，且原始总长度
+恰为首个头边界，拒绝所有额外字节，包括 NIO 已消耗但尚未形成第二个 head 的尾部。
+模型/语法/容量错误都保存到 prepared；构造中禁止 fail 或任何 I/O，首次本地失败响应只由 start 发起。
+主 handler 的顺序是先写协议 state → init → 保存对象并清空首请求缓冲 → start，
+再交此前观察到的 EOF；prepared 不另存 EOF 标记。
+关闭若先于 start 则直接释放 prepared；重复 start 或 closed 后的 start 不重新回复或建连。
+这些共享 codec 已承担复用；不再增加子层增量请求方法、基类或会话容器。
 
 ## Core Logic
 
-1. 承接 Context 中待确认的完整请求交接：上游已选定本类，并将收齐、校验后的最终 CONNECT 目标交付一次。
-   上游保留版本及本地回复资格；本类不重复协议探测，也不把 `.httpConnect` 当作握手成功。
-2. 本类通过 Core 路由一次并创建下游。DIRECT 连接目标；PROXY 连接 Wire 端点，
-   使用 Wire 超时，完成 `start(handshake:)` 及启动写入。
-3. 本类将建立成功结果交回上游，由上游写完整 200。回复期间下游保持暂停业务读取；
-   回复写成后再激活隧道，不需要本类保存另一份早到业务缓冲。
-4. 上游通过 `upstream` 交付业务字节，下游回调处理返回字节；双向只做 DIRECT 透传或 Wire 编解码。
-   当前批次写入完成才续读来源；同步抛错及异步失败原样交 owner。
-5. 上游通过 `proxyInputClosed` 交付客户端 EOF；它与下游 EOF 都先处理已读数据，
-   按方向检查 Wire 完整性并排空对应写入，保留另一方向。
-   收尾要求及现有 NIO 关闭限制与 [SOCKS4 转发契约](Socks4Connection-DESIGN.md#core-logic) 一致。
-6. 最终结束或错误交回上游，由其决定本地回复及 accepted 的最终关闭；本类收到 `closeConnection`
-   后幂等清理下游，runtime 关闭也经该入口收敛。Core 不关闭 accepted，Wire 不拥有 Channel。
+```mermaid
+flowchart TD
+    A[主 handler 收齐首请求 或提前交接失败前缀] --> B[先写协议 state 再 init 保存 prepared]
+    B --> C[主 handler 安装对象后显式 start]
+    C --> D[一次选路 建连 Wire 启动写成]
+    D --> E[本地 200 完整写成]
+    D -. 早到下游字节 .-> F[buffer 有界暂存原字节]
+    E --> G[排出早到字节并双向转发]
+    F --> G
+    G --> H[真实写 tail 完成后续读 EOF 排空半关闭]
+    H --> I[accepted 结束 主 handler 清理]
+    C --> J[prepared 失败交 fail 一次本地响应]
+    G --> J
+    J --> I
+```
+
+请求总量限 64 KiB；init 拒绝同批余量，upstream 拒绝成功前的新业务。start 后只保留观察客户端提前数据及
+FIN 的必要观察许可；不主动读取下游。NIO 的 readEOF0 可能在 autoRead=false 时继续交付数据，
+因此不以“未发读许可”证明“不会收到字节”：早到下游原字节先按 64 KiB 总上限追加到唯一 buffer。
+200 写成后才 decode/转发这些字节；此前 EOF 也必须经过这条启动及回复屏障。
+
+业务通常按 read→write→read。已获许可或 EOF drain 的额外输入仍先检查当前 pendingBytes，
+追加到有界 tail，不能简单因 writing 状态拒绝合法输入；超限统一失败。每批输入最多 64 KiB。
+pendingBytes 是整批容量预留，包含等待链持有的输入、分段副本及最坏输出的 Data/Channel 两份；
+每方向预算 512 KiB，早到 buffer 及操作局部捕获也占用此预算，实际网络写完成才释放本批预留。
+Wire 每次输入最多 16 KiB；当前 Shadowsocks 数学上界为 start 325、encode 16,452、decode 32 KiB。
+整批编码输出上界为 65,808 字节，解码保守上界为 128 KiB；调用前先预留，不在 Wire 分配后补检查。
+预算不包括 Swift/NIO 元数据和 Wire 内部状态；后端强制边界仍待验收，不是进程 RSS 承诺。
+
+两向 EOF 按上述状态协调排空与输出 FIN；两向 ended 后才请求 accepted 整体结束。若 NIO 因既有输出 FIN
+在后续输入 EOF 时直接触发 accepted inactive，closeConnection(nil) 仅在下游 EOF 已验证、响应已排空
+并提交 accepted 输出 FIN、上行仍为 writing 时进入 finishing，沿原链最多排空 core.defaultTimeout。
+完成、失败或到期由本次唯一局部收尾回调直接置 closed、取空并关闭下游，不再次调用 closeConnection(nil)。
+finishing 中重复 nil 幂等，非 nil 错误立即终止；这是 nil 结束的有限例外，不能区分 runtime 关闭原因。
+其余 cleanup 先 closed，再取空并关闭资源。建立链的操作局部 Scheduled 覆盖拨号、启动及完整 200，
+使用 Wire timeout 或 DIRECT 的 Core timeout；链完成或 accepted 关闭取消。失败回复使用 Core timeout，
+完成、写失败或到期只上报原始首因一次。finishing 计时器不能因 accepted 已关闭立即取消；不新增计时器成员。
 
 ## Corners
 
-| 场景 | 必须保持的结果 |
+| 场景 | 必须结果 |
 | --- | --- |
-| HTTP 任意分片、CONNECT body、非法 Host 或额外握手字节 | 主 handler 在完整请求交接前按 HTTP SPEC 处理；不能以完整请求前提掩盖漏校验。 |
-| 200 写到一半失败 | 终止，不在已有响应后追加另一个错误响应。 |
-| 建立后下游立即 EOF，或没有业务数据 | 仍先完成本地成功回复，再正常结束；不跳过屏障。 |
-| 客户端完整请求后 FIN | 请求仍可建立及回复；后续仅结束相应方向。 |
-| 错误 / restart 与建立成功竞争 | 迟到资源关闭，不恢复转发；保留原始错误。 |
+| 任意首请求分片、非法 UTF-8、body、trailer、同批余量 | 分片由主 handler 定界；init 局部 NIO + 唯一模型校验，非法不出站；CONNECT CL:0 按模型允许。 |
+| 提前失败、Expect 等待、超限证据、构造期间关闭 | 不等待不可能完成的 body；原错误保留在 prepared，安装后 start 才回复；关闭先发生则不启动。 |
+| 启动失败、200 部分写后失败 | opening 可按 SPEC 回复；replying 起只上报原错，禁止追加第二个响应。 |
+| 零业务 FIN、早到下游数据+FIN、并发双 FIN | 启动/200、Wire 尾部与真实写 tail 屏障完整；数据不能被半关闭截断。 |
+| 慢写、EOF drain 持续交付、迟到建连 | 分配前按总量限额；无无限队列、无复活、无双重错误上报。 |
+| 错误回复本身失败、重复 cleanup | 原始首因只由唯一 fail 链上报；closed 重入无副作用。 |
 
-本轮验证文档边界与流程，不运行编译或网络测试。5 个基础成员不能独立证明半关闭和在途写安全；
-请求交接、激活及正常结束接口确认后，才能检查完整状态集合并实施代码。
-
-### 实施验收引用
-
-恢复 [HTTP 验收](../HTTP_PROXY_SPEC.md#s28) 与 [Wire 验收](../WIRES_SPEC.md#验收)，
-覆盖真实 NIO 解码、模型校验、提前业务拒绝、200 部分写入、成功前后截断及零业务 EOF。
-CONNECT Host 的端口/根点冲突由模型校验，不通过 DNS 比较；本地 200 与错误响应字段继续遵守
-[HTTP 错误契约](../HTTP_PROXY_SPEC.md#s23)。
+按 [HTTP 验收](../HTTP_PROXY_SPEC.md#s28)及 [Wire 验收](../WIRES_SPEC.md#验收)验证。
+本轮只改设计；后续迁移需成员/方法合同检查、包级 build/严格并发 build、ConnectionTests、全量测试及格式检查。
+模型迁移和真实 Wire 容量边界未通过前，局部夹具验证不能作为完整上线证据。
