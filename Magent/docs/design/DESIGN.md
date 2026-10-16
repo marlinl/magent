@@ -17,12 +17,46 @@ functional constraints and acceptance criteria.
   implementation constraint, not an implementation walkthrough: its name, argument labels and
   order, types and optionality, return type, `throws` / `async`, isolation, access level,
   `static` / `mutating`, overloads, and defaults must not change during implementation.
-- Group each owning type's method contract into `非 private 方法` and `private 方法`, in that
+- In member tables, write one member per row as `name: Type`, preserving the complete Swift type
+  and optionality. Explain what that member stores, how it is initialized, who may change it, and
+  when it is released. Do not combine names with `/`, commas, or a generic group label. Keep enum
+  state data and operation-local values separate from class members; name each stored value and
+  its type directly instead of combining class members and state data in one table.
+  Retain exact Swift declarations for access, ownership, mutability, and defaults.
+- Except for the abstract Future workflows described below, group each owning type's method
+  contract into `非 private 方法` and `private 方法`, in that
   order, with declarations and their responsibilities under the corresponding group. Classify by
   the method's own access declaration: `internal`, `public`, `fileprivate`, and omitted access
   belong to the non-private group; `static` does not change the group. Non-private does not mean
   public API. If one group is empty, state that it has no methods; do not change access levels
   or signatures just to fit the grouping.
+- Except for those Future workflows, keep peer shared-type contracts consistent with the
+  `ProxyConnection` presentation. Use the same heading depth and subsection order: `成员契约`, `非 private 方法`,
+  `private 方法`, then `安装与关闭约束`. Keep a short responsibility and scope statement before
+  these subsections. Write `无。` when a group is empty instead of omitting or renaming it.
+  Write `安装与关闭约束` as concise `-` bullet points, one rule per item; avoid long prose paragraphs.
+  Member tables use `成员 | 用途 | 生命周期`; exact member declarations appear once in the owning
+  type's declaration block. Show non-private methods inside that type's declaration block and put
+  each method's explanation in adjacent `///` comments. Do not mix that format with detached
+  signatures followed by separate responsibility tables for sibling types. Keep private methods
+  in their own group. Formatting changes must preserve signatures, members, and behavior.
+- Define an abstract Future workflow such as `TCPTransfer` as one
+  type contract with `成员契约`, `抽象方法`, `实现方法`, and `关键生命周期`, in that order;
+  these types have no private methods. Keep exact property and abstract-method declarations
+  in the protocol block, with adjacent `///` responsibility comments. Under `实现方法`, declare
+  each fixed method once with its responsibility comment, followed by ordered `-` bullets that
+  explain its concrete steps, completion callbacks, and failure handling. Keep callbacks within
+  those methods rather than adding private observation helpers. Define startup, batch completion,
+  EOF, and termination under `关键生命周期`; Core Logic connects the overall flow without
+  duplicating each method's steps.
+  Do not stop at signatures or leave shared read scheduling, batch aggregation, EOF ordering,
+  and drain checks inside an abstract finish method. A Swift protocol extension is an implementation
+  location, not a separate design component. Declare every shared state requirement explicitly;
+  do not invent read promises, queues, resource owners, or constructor context merely to fit an abstraction.
+- Each type's subsection describes only that type's responsibility, members, methods, and lifecycle.
+  Place file layout, shared execution and ownership rules, cross-type comparisons, and integration
+  constraints in a separate common subsection at the same heading level. Do not use one type's
+  subsection as the introduction or container for its sibling types.
 - Derive states from differences in accepted input, allowed operations, resource ownership, and
   termination behavior. State the initial state, legal transitions, and responsible methods.
   Preserve distinct protocol modes such as SOCKS5 TCP relay and UDP association; do not impose
@@ -40,19 +74,27 @@ functional constraints and acceptance criteria.
   then implement it. A design may keep a service-level dependency external when its API has not
   been designed; it must not invent a configuration parameter or placeholder API to fill the gap.
 - Focus on component purpose, caller contracts, workflows, integration, and edge cases.
-  Keep the component's identity distinct from its internal algorithm. Exclude algorithm explanations,
-  data-structure details, and implementation walkthroughs; refer to SPECs for those constraints.
+  Keep parsing and codec algorithm details in the applicable SPECs. Shared lifecycle workflows may
+  include concise pseudocode that fixes ordering, completion, and close decisions; do not replace
+  their concrete behavior with abstract method names alone.
 - Keep designs concise: define resource owners, meaningful states, completion/close ordering, and
-  exact method declarations once. Give each method its caller and responsibility in a compact table;
+  exact method declarations once. Give each method its caller and responsibility in the format
+  selected for its peer contracts;
   describe lifecycle transitions once instead of repeating the same flow per callback. Link to SPEC
   limits, parsing rules, error matrices, and acceptance vectors rather than copying them. Do not add
   types, layers, helpers, state cases, or configuration merely to make the document look complete.
 - Design the smallest necessary member set before implementation. Do not turn an inventory of
   existing implementation fields into the target contract. For the current Connection designs,
-  `MagentTCPConnection`, each concrete TCP Connection, and the existing
-  `Socks5UDPConnection` have at most six instance members. The main handler owns the first-request
+  `MagentTCPConnection`, `Socks5Connection`, both HTTP Connections, and the existing
+  `Socks5UDPConnection` have at most six instance members. `Socks4Connection` has exactly eleven:
+  it stores a non-optional parsed address, four TCPTransfer properties, and
+  one downstream capacity reservation alongside its channels, Core, Wire, and state. Startup promises
+  remain function-local; its initializing state carries only whether the reply has started;
+  see its [member contract](Socks4Connection-DESIGN.md#contract). The main handler owns the first-request
   buffer and the HTTP request length calculated after the head is complete; concrete initializers
-  parse that handoff without I/O,
+  parse that handoff without I/O. SOCKS4 initialization throws its original parsing error to the
+  main handler, which closes the accepted connection without installing an object or sending a reply;
+  only successful construction proceeds to installation,
   and `start(context:)` begins protocol work only after the main handler installs the owner. Computed properties, static storage, and new owner types
   must not be used to bypass this limit. Constants may stay as documented method-local values.
 - Prefer mutually exclusive protocol phases to independent Boolean flags for request acceptance,
@@ -127,8 +169,8 @@ Statuses below follow each document's own declaration. A target design does not 
 | Document | Status | Scope |
 | --- | --- | --- |
 | [MagentCore design](MagentCore-DESIGN.md) | Target design; implementation verification pending | Runtime-scoped rules, decision caching, node/Wire selection, and downstream Channel creation for Connection targets. |
-| [MagentTCPConnection design](MagentTCPConnection-DESIGN.md) | Target design; implementation verification pending | Mixed-protocol accepted TCP ownership, unique dispatch and restart-scoped cleanup. |
-| [Socks4Connection design](Socks4Connection-DESIGN.md) | Target design; six-member contract, source migration pending | Strict SOCKS4/4a CONNECT, reply barrier, Wire integration and half-close under the [SOCKS4 SPEC](../SOCKS4_PROXY_SPEC.md). |
+| [MagentTCPConnection design](MagentTCPConnection-DESIGN.md) | Target design; implementation verification pending | Mixed-protocol accepted TCP ownership, unique dispatch, restart-scoped cleanup, and the shared ProxyConnection / TCPTransfer contracts in the same document. |
+| [Socks4Connection design](Socks4Connection-DESIGN.md) | Target design; eleven-member contract, throwing init and function-local startup, source migration pending | Strict SOCKS4/4a CONNECT, two directional transfer futures, bounded pending input, reply ordering and half-close under the [SOCKS4 SPEC](../SOCKS4_PROXY_SPEC.md). |
 | [Socks5Connection design](Socks5Connection-DESIGN.md) | Target design; six-member contract, source migration pending | No-auth negotiation, TCP CONNECT and UDP resources owned by each control connection. |
 | [HttpConnectConnection design](HttpConnectConnection-DESIGN.md) | Target design; six-member contract, source migration pending | Model-based CONNECT validation, strict request ordering, success barrier and half-close. |
 | [HttpForwardConnection design](HttpForwardConnection-DESIGN.md) | Target design; six-member contract, source migration pending | One complete request, model-based rewrite, transparent response relay and cleanup. |

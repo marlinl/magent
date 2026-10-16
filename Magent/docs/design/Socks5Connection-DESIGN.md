@@ -1,6 +1,6 @@
 # Socks5Connection Product Design
 
-更新日期：2026-10-13。状态：目标设计；首 greeting 构造解析、显式 start 与六成员契约已修订，Swift 和测试尚待迁移。
+更新日期：2026-10-14。状态：目标设计；首 greeting 构造解析、显式 start 与六成员契约已修订，Swift 和测试尚待迁移。
 行为基线：[SOCKS5 SPEC](../SOCKS5_PROXY_SPEC.md)、[Wire SPEC](../WIRES_SPEC.md)、[MODELS SPEC](../MODELS_SPEC.md)。
 
 ## Context
@@ -85,16 +85,32 @@ Transfer 共 4 个阶段，无布尔成员。全部可变状态在 accepted Even
 | `tcpRelay / udpAssociated` | 按下述 TCP Transfer 或 UDP 生命周期处理后续数据与 EOF；不再解析首 greeting 或发握手回复。 |
 | `finishing / failing / closed` | 仅推进既有有界收尾、唯一失败操作或终态；不接收新工作，定义见后文。 |
 
-| 成员/关联值 | 初始化、修改与生命周期约束 |
-| --- | --- |
-| `proxyChannel/core` | 构造后不变；本对象不拥有 accepted/Core 的最终关闭权。 |
-| `state` | init 产生 prepared，start 消费其 Result；`consumeHandshake/writeReply` 推进命令与回复，装配完成进入 TCP/UDP 模式；EOF/写完成推进 Transfer，`fail/closeConnection` 负责终止。 |
-| `buffer` | 仅 requesting 累计当前 command，不再增量缓存 greeting。命令完整后清空，TCP 装配和回复期间复用为尚未解码的下游原始字节；进入 relay 后移交一次并清空，不另存解码业务缓存。 |
-| `wireChannel/wire` | 仅 TCP 装配设置；一次规则匹配、一次 Wire 选择，同一 Wire 决定端点、超时和编码状态。UDP 阶段恒为 nil。关闭时先取空再关闭资源。 |
-| `prepared` 的 Result 与三个握手阶段的 `dnsAddress` | Result 只活到 start 消费，不存为其他成员；DNS 随 prepared/replyingMethod/requesting 移动，选 TCP 后释放，选 UDP 后局部传入子对象装配。 |
-| UDP 阶段关联值 | 是本次关联唯一强 owner，不同时保留 TCP 资源。`fail/closeConnection` 取出并关闭，不额外设置 udpConnection 成员。 |
-| `Transfer.tail/pendingBytes` | 每方向仅一条串行操作链；预算在接收时预留，在对应操作完成后释放，涵盖等待链中的输入和最坏输出。保留这些必要持久状态，不伪称手动读取能消除在途记录。 |
-| `finishing.tail` | accepted 已失效后的唯一既有上行链；只允许该链有界收尾，不能接受新输入或续读。 |
+#### 类成员变量
+
+| 成员变量 | 用途 | 初始化、修改与生命周期 |
+| --- | --- | --- |
+| `proxyChannel: Channel` | 借用 accepted Channel，接收上行并发送本地回复。 | 构造注入后不变；最终关闭权属于主 handler。 |
+| `core: MagentCore` | 使用当前 runtime 的选路与下游装配能力。 | 构造注入后不变；本对象不关闭 Core。 |
+| `state: State` | 保存当前协议阶段及该阶段必需的数据。 | init 产生 prepared，start 消费其结果；consumeHandshake 和 writeReply 推进命令及回复，EOF 与写完成推进 Transfer，fail 和 closeConnection 负责终止。 |
+| `buffer: ByteBuffer` | 累计 command，之后复用为早期下游原始字节缓冲。 | 构造创建零容量缓冲；仅 requesting 增量累计 command。命令完整后清空，TCP 装配及回复期间保存尚未解码的下游字节；进入 relay 后移交一次并清空，不另存解码业务缓存。 |
+| `wireChannel: Channel?` | 持有本对象拥有的 TCP 下游 Channel。 | 初值 nil，仅 TCP 装配保存；UDP 阶段恒为 nil。关闭时先取空引用，再关闭资源。 |
+| `wire: Wire?` | 持有本次 TCP 连接选定的 Wire，统一决定端点、超时与编码状态。 | 初值 nil，一次规则匹配后至多选择一次；DIRECT 与 UDP 阶段为 nil。清理时取空并释放引用。 |
+
+#### 状态数据
+
+以下数据属于上方 State 或 Transfer 的具体状态，不是额外类成员。
+prepared 的结果与 UDP owner 在枚举中没有参数名，表中直接列出其类型，不另起名字。
+
+| 状态数据 | 所在状态 | 用途与生命周期 |
+| --- | --- | --- |
+| `Result<[UInt8], Error>` | State.prepared | 保存构造解析的方法列表或原始错误，仅活到 start 消费，不另存副本。 |
+| `dnsAddress: SocketAddress?` | State.prepared、replyingMethod、requesting | DNS 地址随握手阶段移动；选 TCP 后释放，选 UDP 后作为局部参数传入子对象装配，不另存父子成员。 |
+| `client: Transfer` | State.openingTCP、replyingConnect、tcpRelay | 表示客户端输入方向的许可、写链与 EOF 排空进度；随这些阶段转移，具体约束见下文。 |
+| `remote: Transfer` | State.openingTCP、replyingConnect、tcpRelay | 表示下游输入方向的许可、写链与 EOF 排空进度；随这些阶段转移，具体约束见下文。 |
+| `Socks5UDPConnection` | State.associating、replyingAssociate、udpAssociated | 强持有本次关联的唯一 UDP owner，不同时保留 TCP 资源；fail 或 closeConnection 取出并关闭，不额外设置 udpConnection 成员。 |
+| `tail: EventLoopFuture<Void>` | Transfer.writing、draining | 每方向唯一串行操作链；输入接入链尾，完成点按当前链身份推进状态，不以手动读取代替在途记录。 |
+| `pendingBytes: Int` | Transfer.writing、draining | 接收时预留等待链中的输入及最坏输出容量，对应操作完成后释放；与 tail 共同约束有界排空。 |
+| `tail: EventLoopFuture<Void>` | State.finishing | accepted 失效后的唯一既有上行链，只允许有界收尾，不接受新输入或续读。 |
 
 `openingTCP/replyingConnect` 中两个 Transfer 只允许 `reading/ended`，分别表示尚未观察到/已观察到
 对应输入 EOF；还未授权业务交付。Wire 的 `start`、启动写、成功回复由顺序 Future 链完成，
@@ -187,6 +203,24 @@ private final class Socks5UDPConnection: ChannelInboundHandler, @unchecked Senda
     private var backendWires: [SocketAddress: Wire?] = [:]
 }
 ```
+
+#### 类成员变量
+
+| 成员变量 | 用途 | 初始化、修改与生命周期 |
+| --- | --- | --- |
+| `owner: Socks5Connection?` | 弱引用父连接，借用其 Core，并向其报告关联失败。 | 构造注入弱引用，不延长父对象生命周期；父对象释放后自动为 nil。 |
+| `state: State` | 保存 UDP 装配、来源固定与关闭阶段。 | 构造置 preparing；openAssociation 推进 ready，activate 推进 awaitingClient，首个合法来源包推进 forwarding，closeConnection 置 closed。 |
+| `ipv4Channel: Channel?` | 持有关联自有的 IPv4 UDP relay。 | 初值 nil，装配成功后保存；迟到结果直接关闭。清理时先取空引用，再关闭 Channel。 |
+| `ipv6Channel: Channel?` | 持有关联自有的 IPv6 出站 Channel。 | 初值 nil，装配成功后保存；迟到结果直接关闭。清理时先取空引用，再关闭 Channel。 |
+| `dnsClient: DNSClient?` | 持有显式配置时使用的 UDP DIRECT 域名解析客户端。 | 初值 nil，仅有 DNS 配置且装配成功时保存；迟到结果直接关闭，清理时先取空再关闭，不保留 DNS 结果缓存。 |
+| `backendWires: [SocketAddress: Wire?]` | 记录实际后端及对应 Wire，区分 DIRECT 与未知后端。 | 初值空字典；合法单包发送前登记，最多 1024 项，不覆盖不同归属；关闭时清空并释放 Wire 引用。 |
+
+#### 状态数据
+
+| 状态数据 | 所在状态 | 用途与生命周期 |
+| --- | --- | --- |
+| `hint: SocketAddress` | preparing、ready、awaitingClient | 保存已经父对象校验并规范化的来源提示，随装配和激活阶段移动；首个完整合法且匹配的包固定来源后释放。 |
+| `client: SocketAddress` | forwarding | 保存首个合法包确定的客户端实际 IP:port；后续不重新绑定，关闭时随状态释放。 |
 
 #### 非 private 方法
 

@@ -1,6 +1,6 @@
 # HttpConnectConnection Product Design
 
-更新日期：2026-10-13。状态：**六成员目标设计；现有 Swift 尚未迁移，不代表上线验收通过**。
+更新日期：2026-10-14。状态：**六成员目标设计；现有 Swift 尚未迁移，不代表上线验收通过**。
 行为基线：[HTTP SPEC](../HTTP_PROXY_SPEC.md)、[Wire SPEC](../WIRES_SPEC.md)、[MODELS SPEC](../MODELS_SPEC.md)。
 
 ## Context
@@ -50,21 +50,37 @@ internal final class HttpConnectConnection: ChannelInboundHandler, ProxyConnecti
 ```
 
 这是完整实例成员集合：**6 个成员、0 个 Boolean 成员**。不增加静态/计算属性、位掩码、
-上下文对象或附加存储绕过限制。关联值也属于合同：仅保存当前阶段必需的版本、两向传输状态及
-建立期两个输入状态及真实写屏障。prepared 只短暂保存解析结果或原始错误；不添加独立请求、
-错误、codec、计时器字段或旧布尔标记。原始首请求只属于 init 局部参数，构造结束即释放。
+上下文对象或附加存储绕过限制。状态中只保存当前阶段必需的数据，具体字段列在下表；
+不添加独立请求、错误、codec、计时器字段或旧布尔标记。原始首请求只属于 init 局部参数，构造结束即释放。
 
-| 成员 / 关联值 | 初始化、变更入口与生命周期 |
+#### 类成员
+
+| 成员 | 用途、初始化、变更入口与生命周期 |
 | --- | --- |
-| `proxyChannel` / `core` | init 注入的强引用，连接内不替换；下游使用 accepted EventLoop。 |
-| `buffer` | init 用 accepted allocator 建空缓冲，只保存启动/回复前早到的下游原字节；不保存请求。屏障通过后取走并释放，closeConnection 清空。 |
-| `wireChannel` / `wire` | openTunnel 一次选路后赋值；Wire 同时决定端点、超时和流状态。迟到 Channel 在赋值前检查状态，不符合阶段则立即关闭。cleanup 先取空再关闭资源。 |
-| `state` | init 置 prepared；start 成功分支进入 opening，失败分支交 fail。启动成功进入 replying，200 真正写成进入 relay；fail 抢占 failing；closeConnection 进入 closed 或受限 finishing，终态不复活。 |
-| `prepared.result` | init 同步局部解码、最多构造一次 HttpProtocol，确认 CONNECT 无体且无余量；成功只保存模型，失败保存原 Error。start 取走结果后释放，重复 start 不重复启动。 |
-| `version` | prepared/opening 可本地回复；正常构造取支持的入站版本，否则 HTTP/1.1。initialError 非 nil 时取受支持的 initialVersion，否则 HTTP/1.1；进入 replying 前封闭失败响应资格。 |
-| `opening` / `replying` 的 `Transfer` | 仅允许 reading/ended，分别表示未见/已见输入 EOF。建立/200 的真实写屏障属于唯一建立链局部值，不保存为业务 tail。 |
-| `relay` 的 `Transfer` | upstream 指客户端→下游；downstream 指下游→客户端。writing 持有尚未完成的真实网络写 tail 及完整容量预留；draining 表示该方向已见 EOF，必须等待同一 tail；ended 表示输入已 EOF 且数据已排空，不单独表示 FIN 已提交。 |
-| `finishing.tail` | accepted 已失效后的原上行排空屏障，只能沿既有链完成；不再接收输入、建连或启动新的业务。 |
+| `proxyChannel: Channel` | init 注入的 accepted 强引用，连接内不替换；本类只借用，其最终关闭属于主 handler，下游使用其 EventLoop。 |
+| `core: MagentCore` | init 注入的所属运行周期 Core 强引用，连接内不替换；供选路、建连及取得默认期限使用。 |
+| `state: State` | init 置 prepared；start 成功分支进入 opening，失败分支交 fail。启动成功进入 replying，200 真正写成进入 relay；fail 抢占 failing；closeConnection 进入 closed 或受限 finishing，终态不复活。 |
+| `buffer: ByteBuffer` | init 用 accepted allocator 建空缓冲，只保存启动/回复前早到的下游原字节；不保存请求。屏障通过后取走并释放，closeConnection 清空。 |
+| `wireChannel: Channel?` | 初值 nil；openTunnel 建连成功后赋值，迟到 Channel 在赋值前检查状态，不符合阶段则立即关闭。cleanup 先取空再关闭资源。 |
+| `wire: Wire?` | 初值 nil；openTunnel 一次选路后赋值，DIRECT 保持 nil；同一 Wire 决定端点、超时和流状态。cleanup 取空并释放。 |
+
+#### 状态数据
+
+下列字段属于已声明的 State 或 Transfer，不是额外的类成员；无数据的状态见上述 enum 声明。
+
+| 字段 | 所属状态 | 用途、变更入口与生命周期 |
+| --- | --- | --- |
+| `version: HTTPVersion` | State.prepared、State.opening | 本地回复版本；正常构造取支持的入站版本，否则 HTTP/1.1。initialError 非 nil 时取受支持的 initialVersion，否则 HTTP/1.1；进入 replying 前封闭失败响应资格。 |
+| `result: Result<HttpProtocol, Error>` | State.prepared | init 同步局部解码、最多构造一次 HttpProtocol，确认 CONNECT 无体且无余量；成功只保存模型，失败保存原 Error。start 取走结果后释放，重复 start 不重复启动。 |
+| `upstream: Transfer` | State.opening、State.replying、State.relay | 客户端→下游的传输状态；建立与回复阶段只记录输入 EOF，relay 阶段按真实写入和 EOF 推进。 |
+| `downstream: Transfer` | State.opening、State.replying、State.relay | 下游→客户端的传输状态；建立与回复阶段只记录输入 EOF，relay 阶段按真实写入和 EOF 推进。 |
+| `tail: EventLoopFuture<Void>` | Transfer.writing、Transfer.draining | 尚未完成的真实网络写尾；writing 可有序追加，draining 已见该方向 EOF，必须等待同一尾链排空。 |
+| `pendingBytes: Int` | Transfer.writing、Transfer.draining | 未完成批次的完整容量预留；追加前预留，真实写完成后只释放本批占用，全部清零才结束等待。 |
+| `tail: EventLoopFuture<Void>` | State.finishing | accepted 已失效后的原上行排空屏障，只能沿既有链完成；不再接收输入、建连或启动新的业务。 |
+
+opening 和 replying 的 Transfer 仅允许 reading/ended，分别表示未见/已见输入 EOF；
+建立/200 的真实写屏障属于唯一建立链局部值，不保存为业务 tail。
+relay 的 ended 表示输入已 EOF 且数据已排空，不单独表示 FIN 已提交。
 
 reading 遇业务进入 writing，遇 EOF 完成适用校验后直接 ended；不为零业务制造空 Future。
 writing 可追加到同一有界 tail 或进入 draining。
@@ -142,6 +158,18 @@ internal final class HTTPEncodedBytesHandler: ChannelOutboundHandler, RemovableC
     internal private(set) var output: Result<ByteBuffer, Error>? = nil
 }
 ```
+
+#### HTTPRequestPartsHandler 类成员
+
+| 成员 | 用途、初始化、变更入口与生命周期 |
+| --- | --- |
+| `output: Output` | 初值 .empty；channelRead 收集当前局部解码结果，errorCaught 保留首个原始错误；当前同步 codec 操作结束后随适配器释放，不跨网络事件保存。 |
+
+#### HTTPEncodedBytesHandler 类成员
+
+| 成员 | 用途、初始化、变更入口与生命周期 |
+| --- | --- |
+| `output: Result<ByteBuffer, Error>?` | 初值 nil；write 聚合当前局部编码结果或保存原始错误；编码完成并卸载适配器后释放，不作为真实网络写屏障。 |
 
 #### 非 private 方法
 

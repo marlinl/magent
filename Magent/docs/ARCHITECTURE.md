@@ -196,9 +196,11 @@ concrete connection; current source still hands off after prefix detection:
 
 The first message is the full SOCKS4/4a request, SOCKS5 greeting, HTTP CONNECT
 request without a body, or HTTP forward request including its Content-Length
-body. Known-invalid or truncated SOCKS4/HTTP input is handed off early for a
-local failure reply. Initializers parse without I/O; after saving the one owner
-and clearing its buffer, the main handler calls `start(context:)` once. Only new
+body. Known-invalid or truncated SOCKS4/HTTP input is handed off early. SOCKS4 initialization
+throws the original parsing error to the main handler, which closes the accepted
+connection without installing an object or sending a reply; HTTP retains its
+local failure reply. Initializers parse without I/O; after successful construction,
+saving the one owner and clearing its buffer, the main handler calls `start(context:)` once. Only new
 bytes go to `upstream`. SOCKS5 command requests arrive after the method reply
 and remain incrementally parsed by the concrete connection.
 
@@ -426,6 +428,9 @@ failure for a known SPEC gap, is not evidence that the target behavior passes.
 `Socks4Connection` owns request validation, the local reply, and TCP tunnel.
 The target moves first-request accumulation into `MagentTCPConnection`; its
 initializer receives the complete request, or a prefix already known to fail.
+Successful construction stores a non-optional target address. Parsing failure
+throws to `MagentTCPConnection` for accepted-channel closure; it does not create
+a failed connection object, defer the error to `start`, or send a local reply.
 It supports CONNECT with a SOCKS4 IPv4 target or SOCKS4a domain target; it rejects
 BIND and provides no UDP command. USERID is consumed only to locate its NUL
 terminator, and SOCKS4a reads a separate NUL-terminated domain. The frontend must

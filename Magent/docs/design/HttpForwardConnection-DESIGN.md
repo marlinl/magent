@@ -1,6 +1,6 @@
 # HttpForwardConnection Product Design
 
-更新日期：2026-10-13。状态：**六成员目标设计；现有 Swift 尚未迁移，不代表上线验收通过**。
+更新日期：2026-10-14。状态：**六成员目标设计；现有 Swift 尚未迁移，不代表上线验收通过**。
 行为基线：[HTTP SPEC](../HTTP_PROXY_SPEC.md)、[Wire SPEC](../WIRES_SPEC.md)、[MODELS SPEC](../MODELS_SPEC.md)。
 
 ## Context
@@ -49,19 +49,37 @@ internal final class HttpForwardConnection: ChannelInboundHandler, ProxyConnecti
 ```
 
 这是完整实例成员集合：**6 个成员、0 个 Boolean 成员**。无静态/计算属性、位掩码或附加存储。
-关联值也是完整合同；prepared 只短暂保存一次解析结果或原 Error，两向 Transfer 只表示实际传输。
-不将旧字段集合藏入 State、codec、闭包共享盒子或新 owner。请求发送完成及响应资格由阶段和上行 tail 推导。
-首请求原字节只属于 init 局部参数，不再保存增量请求状态、扫描位置或完整请求副本。
+状态中的字段同样受合同约束，具体列在下表；prepared 只短暂保存一次解析结果或原 Error，
+两向 Transfer 只表示实际传输。不将旧字段集合藏入 State、codec、闭包共享盒子或新 owner。
+请求发送完成及响应资格由阶段和上行 tail 推导。首请求原字节只属于 init 局部参数，
+不再保存增量请求状态、扫描位置或完整请求副本。
 
-| 成员 / 关联值 | 初始化、变更入口与生命周期 |
+#### 类成员
+
+| 成员 | 用途、初始化、变更入口与生命周期 |
 | --- | --- |
-| `proxyChannel` / `core` | init 注入强引用，连接内不替换；下游与 accepted 共用 EventLoop。 |
-| `buffer` | init 创建空 ByteBuffer，只保存 Wire 启动前早到的下游原字节；不保存请求或 prepared.body 副本。启动通过后取走并释放，cleanup 清空。 |
-| `state` | init 置 prepared；start 成功分支进入 opening，失败分支交 fail。Wire 启动写成进入 awaitingResponse，首次提交响应前切 responding；fail 抢占 failing，cleanup 切 closed，禁止回退。 |
-| `prepared.result` | init 保存合法模型和唯一 body，或原始 Error。start 取出成功值移交唯一建立/发送链，随后释放阶段关联值；写成或失败后局部 body 也释放，不在 buffer 留副本。 |
-| `version` | 正常构造取支持的入站版本，否则 HTTP/1.1；initialError 非 nil 时取受支持的 initialVersion，否则 HTTP/1.1。prepared/opening/awaitingResponse 保存错误响应所需版本，responding 不再保留。 |
-| `Transfer` | opening 仅 reading/ended 记录输入 EOF，不表示请求已写成。awaitingResponse/responding 遵守 [CONNECT 传输约束](HttpConnectConnection-DESIGN.md#类型六个实例成员及状态)；上行 tail 覆盖唯一请求的 head/body/end 真正写成，下行 tail 覆盖真实 accepted 写入。 |
-| `wireChannel` / `wire` | openOutbound 一次选路后赋值；迟到 Channel 先验证阶段再接受，否则关闭。closeConnection 先 closed、取空再关闭；下游回调不得重复上报。 |
+| `proxyChannel: Channel` | init 注入的 accepted 强引用，连接内不替换；本类只借用，其最终关闭属于主 handler，下游与其共用 EventLoop。 |
+| `core: MagentCore` | init 注入的所属运行周期 Core 强引用，连接内不替换；供选路、建连及取得默认期限使用。 |
+| `state: State` | init 置 prepared；start 成功分支进入 opening，失败分支交 fail。Wire 启动写成进入 awaitingResponse，首次提交响应前切 responding；fail 抢占 failing，cleanup 切 closed，禁止回退。 |
+| `buffer: ByteBuffer` | init 创建空 ByteBuffer，只保存 Wire 启动前早到的下游原字节；不保存请求或 prepared.result 中 body 的副本。启动通过后取走并释放，cleanup 清空。 |
+| `wireChannel: Channel?` | 初值 nil；openOutbound 建连成功后赋值，迟到 Channel 先验证阶段再接受，否则关闭。closeConnection 先 closed、取空再关闭；下游回调不得重复上报。 |
+| `wire: Wire?` | 初值 nil；openOutbound 一次选路后赋值，DIRECT 保持 nil；本连接独占，用于启动和后续编解码。closeConnection 先 closed，再取空释放。 |
+
+#### 状态数据
+
+下列字段属于已声明的 State 或 Transfer，不是额外的类成员；无数据的状态见上述 enum 声明。
+
+| 字段 | 所属状态 | 用途、变更入口与生命周期 |
+| --- | --- | --- |
+| `version: HTTPVersion` | State.prepared、State.opening、State.awaitingResponse | 错误响应所需版本；正常构造取支持的入站版本，否则 HTTP/1.1。initialError 非 nil 时取受支持的 initialVersion，否则 HTTP/1.1；responding 不再保留。 |
+| `result: Result<(request: HttpProtocol, body: ByteBuffer), Error>` | State.prepared | init 保存合法模型和唯一 body，或原始 Error。start 取出成功值移交唯一建立/发送链，随后释放 prepared.result；写成或失败后局部 body 也释放，不在 buffer 留副本。 |
+| `upstream: Transfer` | State.opening、State.awaitingResponse、State.responding | 客户端→下游的传输状态；opening 仅 reading/ended 记录输入 EOF，不表示请求已写成。启动后 tail 覆盖唯一请求的 head/body/end 真正写成。 |
+| `downstream: Transfer` | State.opening、State.awaitingResponse、State.responding | 下游→客户端的传输状态；opening 仅 reading/ended 记录输入 EOF，启动后 tail 覆盖真实 accepted 写入。 |
+| `tail: EventLoopFuture<Void>` | Transfer.writing、Transfer.draining | 尚未完成的有序真实网络写尾；draining 已见该方向 EOF，必须等待同一尾链排空。 |
+| `pendingBytes: Int` | Transfer.writing、Transfer.draining | 未完成批次的完整容量预留；追加前预留，真实写完成后只释放本批占用，全部清零才结束等待。 |
+
+awaitingResponse 和 responding 的两个 Transfer 遵守
+[CONNECT 传输约束](HttpConnectConnection-DESIGN.md#类型六个实例成员及状态)。
 
 主 handler 在构造前收齐请求或判定截断，先安装并 start，再交此前观察到的 EOF；子层不续收请求 body。
 opening 的客户端 FIN 只记 ended；启动后的 FIN 将上行切 draining，等待整个请求真实写成。

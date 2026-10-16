@@ -1,6 +1,6 @@
 # MagentCore 产品设计
 
-更新日期：2026-10-10。状态：**目标设计**，按初始化只读配置与 Connection 所有权收敛接口；
+更新日期：2026-10-14。状态：**目标设计**，按初始化只读配置与 Connection 所有权收敛接口；
 不表示源码已完成迁移或通过验收。
 契约依据：[MODELS SPEC v0.4.3](../MODELS_SPEC.md#proxyrule)、
 [Wire SPEC v0.3.1](../WIRES_SPEC.md) 及 [架构](../ARCHITECTURE.md#core)。
@@ -51,13 +51,16 @@ internal final class MagentCore: @unchecked Sendable {
 private struct MagentRouter: Sendable {}
 ```
 
-| 数据 | 契约 |
+| 成员 | 用途、初始化与生命周期 |
 | --- | --- |
-| `defaultDecision`、`router` | 初始化后不变；规则为空或未命中才使用默认决策。 |
-| `nodes`、`udpWires` | `init` 成功时一次赋值，运行期只读；按 UUID 持有节点及可安全共享的数据报 Wire。 |
-| `addressNodes` | 仅为 `init` 的局部 endpoint 唯一性记录，不作为 Core 字段保留。 |
-| `routeCache` | 只缓存 `Decision`；沿用当前 capacity：空规则为 0，否则 4096，默认不过期。 |
-| `defaultTimeout` | 经 Magent 配置边界校验的正 Int64 毫秒；供 DIRECT TCP 和关联内 DNS 使用。 |
+| `defaultDecision: Decision` | 规则为空或未命中时使用的默认决策。init 注入并校验，初始化后不变。 |
+| `router: MagentRouter` | 当前运行周期的规则匹配器。init 根据规则创建，初始化后不变。 |
+| `routeCache: MagentCache<Decision>` | 规则匹配结果缓存，只缓存 Decision。init 创建，空规则时 capacity 为 0，否则为 4096，默认不过期；运行期间引用不替换。 |
+| `nodes: [UUID: ProxyNode]` | 按 UUID 保存的节点表。init 成功时一次赋值，运行期间只读。 |
+| `udpWires: [UUID: Wire]` | 按节点 UUID 保存的共享 UDP Wire。init 成功时一次赋值，运行期间不替换；各实例必须支持安全共享。 |
+| `defaultTimeout: Int64` | DIRECT TCP 与关联内 DNS 使用的超时毫秒数。init 接收已由 Magent 配置边界校验的正数，初始化后不变。 |
+
+`addressNodes` 仅为 init 内检查 endpoint 唯一性的局部记录，不是 Core 成员。
 
 Core 可供多个 accepted EventLoop 同时读取。发布后没有节点修改入口；缓存自行同步。
 TCP Wire 每次选择独立创建，随后只由所属 Connection 串行使用。共享 UDP Wire 必须满足
